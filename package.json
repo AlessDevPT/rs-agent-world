@@ -1,0 +1,30 @@
+{
+  "name": "agentworld",
+  "private": true,
+  "version": "0.0.0",
+  "description": "Universal AI agent monitoring and management platform",
+  "packageManager": "pnpm@9.12.3",
+  "workspaces": [
+    "apps/web",
+    "packages/sdk-typescript"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "dev": "npm run dev --workspace apps/web",
+    "build": "npm run build --workspace apps/web",
+    "lint": "npm run lint --workspace apps/web",
+    "typecheck": "npm run typecheck --workspace apps/web",
+    "test": "npm run test --workspace apps/web",
+    "infra:up": "docker compose -f infra/compose/docker-compose.yml up -d",
+    "infra:down": "docker compose -f infra/compose/docker-compose.yml down",
+    "infra:logs": "docker compose -f infra/compose/docker-compose.yml logs -f",
+    "api:venv": "python -m venv apps/api/.venv",
+    "api:install": "python scripts/api.py install",
+    "api:dev": "python scripts/api.py dev",
+    "api:test": "python scripts/api.py test",
+    "api:lint": "python scripts/api.py lint",
+    "verify": "npm run api:lint && npm run api:test && npm run lint && npm run typecheck"
+  }
+}
