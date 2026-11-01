@@ -19,6 +19,7 @@ as a side effect of creating a table.
 from __future__ import annotations
 
 import datetime as dt
+import re
 from enum import StrEnum
 from typing import Any, ClassVar
 from uuid import UUID
@@ -1298,6 +1299,168 @@ class AgentStatusHistory(Base):
     )
 
 
+# ----------------------------------------------------- Phase 2: append-only ---
+
+
+class Event(Base):
+    """The canonical event log: the replay source, and append-only.
+
+    Partitioned monthly by `received_at`, which forces two things worth
+    knowing. The primary key must contain the partition key, so it is
+    `(project_id, seq, received_at)` - which is also exactly the cursor
+    query's access path. And `UNIQUE (project_id, dedup_key)` is *not*
+    declarable here: a unique constraint on a partitioned table must include
+    the partition key, and including `received_at` would let the same
+    `dedup_key` through twice at different timestamps. The dedup index
+    therefore lives on each partition, created by
+    `agentworld_ensure_partitions`. The guarantee that follows is per project
+    **within a monthly partition** - see migration 0011 for why that is
+    adequate and where its edge is.
+
+    None of the resolved reference columns is a foreign key. This table
+    outlives the rows it points at, and a cascade would delete history along
+    with the entity it described.
+    """
+
+    __tablename__ = "events"
+
+    id: Mapped[UUID] = mapped_column(
+        sa.Uuid, nullable=False, server_default=sa.text("gen_random_uuid()")
+    )
+    workspace_id: Mapped[UUID] = mapped_column(sa.Uuid, nullable=False)
+    project_id: Mapped[UUID] = mapped_column(sa.Uuid, primary_key=True)
+    #: Per-project monotonic cursor, allocated inside the ingest transaction.
+    seq: Mapped[int] = mapped_column(sa.BigInteger, primary_key=True)
+    dedup_key: Mapped[str] = mapped_column(CITEXT, nullable=False)
+    type: Mapped[str] = mapped_column(nullable=False)
+    protocol_version: Mapped[str] = mapped_column(nullable=False)
+    #: The client's clock. Skew against `received_at` is recorded, never
+    #: silently corrected.
+    occurred_at: Mapped[dt.datetime] = mapped_column(nullable=False)
+    #: The server's clock, and the partition key.
+    received_at: Mapped[dt.datetime] = mapped_column(
+        primary_key=True, server_default=sa.text("now()")
+    )
+    subject_kind: Mapped[str] = mapped_column(nullable=False)
+    subject_ref: Mapped[str] = mapped_column(nullable=False)
+    agent_id: Mapped[UUID | None] = mapped_column(sa.Uuid)
+    task_id: Mapped[UUID | None] = mapped_column(sa.Uuid)
+    run_id: Mapped[UUID | None] = mapped_column(sa.Uuid)
+    execution_id: Mapped[UUID | None] = mapped_column(sa.Uuid)
+    execution_step_id: Mapped[UUID | None] = mapped_column(sa.Uuid)
+    correlation: Mapped[dict[str, Any]] = mapped_column(
+        nullable=False, server_default=sa.text("'{}'::jsonb")
+    )
+    severity: Mapped[enums.EventSeverity] = mapped_column(
+        pg_enum(enums.EventSeverity, "event_severity"),
+        nullable=False,
+        server_default=sa.text("'info'::event_severity"),
+    )
+    labels: Mapped[dict[str, Any]] = mapped_column(
+        nullable=False, server_default=sa.text("'{}'::jsonb")
+    )
+    payload: Mapped[dict[str, Any]] = mapped_column(
+        nullable=False, server_default=sa.text("'{}'::jsonb")
+    )
+
+    __table_args__ = (
+        sa.CheckConstraint("seq > 0", name="event_seq_is_positive"),
+        sa.Index("events_id_idx", "id"),
+        sa.Index("events_feed_idx", "project_id", sa.text("received_at DESC")),
+        sa.Index(
+            "events_agent_idx",
+            "agent_id",
+            sa.text("received_at DESC"),
+            postgresql_where=sa.text("agent_id IS NOT NULL"),
+        ),
+        sa.Index(
+            "events_execution_idx",
+            "execution_id",
+            "seq",
+            postgresql_where=sa.text("execution_id IS NOT NULL"),
+        ),
+        {"postgresql_partition_by": "RANGE (received_at)"},
+    )
+
+
+class Log(Base):
+    """Agent log lines. Append-only, partitioned monthly."""
+
+    __tablename__ = "logs"
+
+    id: Mapped[UUID] = mapped_column(
+        sa.Uuid, primary_key=True, server_default=sa.text("gen_random_uuid()")
+    )
+    workspace_id: Mapped[UUID] = mapped_column(sa.Uuid, nullable=False)
+    project_id: Mapped[UUID] = mapped_column(sa.Uuid, primary_key=True)
+    agent_id: Mapped[UUID | None] = mapped_column(sa.Uuid)
+    task_id: Mapped[UUID | None] = mapped_column(sa.Uuid)
+    run_id: Mapped[UUID | None] = mapped_column(sa.Uuid)
+    execution_step_id: Mapped[UUID | None] = mapped_column(sa.Uuid)
+    severity: Mapped[enums.EventSeverity] = mapped_column(
+        pg_enum(enums.EventSeverity, "event_severity"),
+        nullable=False,
+        server_default=sa.text("'info'::event_severity"),
+    )
+    message: Mapped[str] = mapped_column(nullable=False)
+    context: Mapped[dict[str, Any]] = mapped_column(
+        nullable=False, server_default=sa.text("'{}'::jsonb")
+    )
+    occurred_at: Mapped[dt.datetime] = mapped_column(nullable=False)
+    received_at: Mapped[dt.datetime] = mapped_column(
+        primary_key=True, server_default=sa.text("now()")
+    )
+
+    __table_args__ = (
+        sa.Index("logs_feed_idx", "project_id", sa.text("received_at DESC")),
+        sa.Index(
+            "logs_agent_idx",
+            "agent_id",
+            sa.text("received_at DESC"),
+            postgresql_where=sa.text("agent_id IS NOT NULL"),
+        ),
+        {"postgresql_partition_by": "RANGE (received_at)"},
+    )
+
+
+class MetricSample(Base):
+    """One numeric observation. Append-only, partitioned monthly.
+
+    `labels` is a fixed allow-list of low-cardinality names, enforced at
+    ingest: an unbounded label set is how a metrics table becomes
+    unqueryable, and no constraint here can prevent that.
+    """
+
+    __tablename__ = "metric_samples"
+
+    id: Mapped[UUID] = mapped_column(
+        sa.Uuid, primary_key=True, server_default=sa.text("gen_random_uuid()")
+    )
+    workspace_id: Mapped[UUID] = mapped_column(sa.Uuid, nullable=False)
+    project_id: Mapped[UUID] = mapped_column(sa.Uuid, primary_key=True)
+    agent_id: Mapped[UUID | None] = mapped_column(sa.Uuid)
+    name: Mapped[str] = mapped_column(nullable=False)
+    value: Mapped[float] = mapped_column(sa.Double, nullable=False)
+    unit: Mapped[str | None]
+    labels: Mapped[dict[str, Any]] = mapped_column(
+        nullable=False, server_default=sa.text("'{}'::jsonb")
+    )
+    occurred_at: Mapped[dt.datetime] = mapped_column(nullable=False)
+    received_at: Mapped[dt.datetime] = mapped_column(
+        primary_key=True, server_default=sa.text("now()")
+    )
+
+    __table_args__ = (
+        sa.Index(
+            "metric_samples_series_idx",
+            "project_id",
+            "name",
+            sa.text("received_at DESC"),
+        ),
+        {"postgresql_partition_by": "RANGE (received_at)"},
+    )
+
+
 #: Tables protected by row-level security in migration `0004_rls`.
 #: `test_rls.py` reads this and asserts the database agrees, so a new
 #: tenant-scoped table cannot be added without a decision about it being
@@ -1332,4 +1495,21 @@ RLS_PROTECTED_TABLES: tuple[str, ...] = (
     "runs",
     "run_steps",
     "agent_status_history",
+    # 0011 - the policy on a partitioned parent applies to its partitions
+    "events",
+    "logs",
+    "metric_samples",
 )
+
+#: Monthly partitions are named `<table>_y2026m11`, created by
+#: `agentworld_ensure_partitions` rather than by a migration. Anything
+#: comparing the models against a live database has to ignore them, or every
+#: run proposes dropping the lot - so `migrations/env.py` and
+#: `tests/integration/test_schema.py` both read this one predicate instead of
+#: each carrying its own regex and eventually disagreeing.
+_PARTITION_SUFFIX = re.compile(r"_y\d{4}m\d{2}$")
+
+
+def is_managed_partition(name: str | None) -> bool:
+    """Whether `name` is a partition maintained by the database function."""
+    return name is not None and _PARTITION_SUFFIX.search(name) is not None

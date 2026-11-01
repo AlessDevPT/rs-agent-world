@@ -21,7 +21,7 @@ from sqlalchemy.engine import Connection
 
 from agentworld.domain.enums import PG_ENUMS
 from agentworld.infra.db import Database
-from agentworld.repositories.models import Base
+from agentworld.repositories.models import Base, is_managed_partition
 
 pytestmark = pytest.mark.integration
 
@@ -98,7 +98,18 @@ async def test_the_models_match_the_migrated_schema(owner_database: Database) ->
     """
 
     def diff(connection: Connection) -> list[object]:
-        context = MigrationContext.configure(connection)
+        context = MigrationContext.configure(
+            connection,
+            # The same exclusion `migrations/env.py` applies, through the
+            # same predicate: monthly partitions are maintained by a database
+            # function, so without this every run reports nine tables to
+            # drop and the real differences drown in the noise.
+            opts={
+                "include_object": lambda _obj, name, type_, *_rest: (
+                    not (type_ == "table" and is_managed_partition(name))
+                )
+            },
+        )
         return list(compare_metadata(context, Base.metadata))
 
     async with owner_database.engine.connect() as conn:

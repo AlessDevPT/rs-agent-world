@@ -15,14 +15,13 @@ two code paths that can disagree about TLS, search_path or type handling.
 from __future__ import annotations
 
 import asyncio
-import re
 from logging.config import fileConfig
 
 from alembic import context
 from sqlalchemy.engine import Connection
 from sqlalchemy.ext.asyncio import async_engine_from_config, create_async_engine
 
-from agentworld.repositories.models import Base
+from agentworld.repositories.models import Base, is_managed_partition
 from agentworld.settings import Settings
 
 config = context.config
@@ -73,17 +72,12 @@ def _configure(connection: Connection) -> None:
     )
 
 
-#: Monthly partitions are named `<table>_y2026m11`. Phase 2 creates them from
-#: a database function rather than from migrations, so autogenerate has to
-#: ignore them or every run would propose dropping the lot.
-_PARTITION_SUFFIX = re.compile(r"_y\d{4}m\d{2}$")
-
-
 def _include_object(obj: object, name: str | None, type_: str, *_args: object) -> bool:
-    is_partition = (
-        type_ == "table" and name is not None and _PARTITION_SUFFIX.search(name) is not None
-    )
-    return not is_partition
+    # Monthly partitions are created by `agentworld_ensure_partitions`, not by
+    # a migration, so autogenerate must leave them alone or every run would
+    # propose dropping the lot. The predicate is shared with the schema drift
+    # test rather than duplicated, so the two cannot disagree.
+    return not (type_ == "table" and is_managed_partition(name))
 
 
 def run_migrations_offline() -> None:

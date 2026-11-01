@@ -206,7 +206,7 @@ More useful than the matrix, because an absent action cannot be granted by mista
 | `credential.read_secret` | The whole point. There is no role that can read credential material — not owner, not a platform operator | Rotate it, or read `display_hint` |
 | `agent.set_status` | State is derived. An agent's status comes from folded events, so a human cannot assert "this agent is working" | `agent.pause`, or emit an event |
 | `execution.edit` | An execution is a record of what happened. Editing it would make the audit trail fiction | Cancel it and run a new one |
-| `event.delete`, `event.update` | `events` is append-only *by privilege*: the application role holds `SELECT, INSERT` only | Retention drops whole partitions |
+| `event.delete`, `event.update` | `events` is append-only *by privilege*: the application role holds `SELECT, INSERT` on the three partitioned **parents** and no privilege at all on any partition — see the note below | Retention drops whole partitions |
 | `audit_log.delete`, `audit_log.update` | Same, and already enforced in Phase 1 | Nothing |
 | `step.force_succeed` | Marking a step done that never ran would let a workflow report a result it never produced | Retry it, or fail it and branch |
 | `approval.decide_on_behalf_of` | An approval is accountability. Delegation needs a model of who may act for whom | A second approver — deferred to v1.1 |
@@ -216,6 +216,19 @@ More useful than the matrix, because an absent action cannot be granted by mista
 
 That last row is worth dwelling on: it is what makes the approval gate structural. If an
 API could create a dispatch, approvals would be advisory again.
+
+**One correction from implementing migration 0011.** A partition inherits neither its
+parent's privileges nor its parent's row-level security policy, and the default
+privileges set in migration 0005 hand every newly created table `SELECT, INSERT`. So
+revoking the write verbs on `events` alone would have left `UPDATE events_y2026m11`
+open — and, worse, `SELECT * FROM events_y2026m11` would have returned **every tenant's**
+events, because the tenant policy on the parent does not apply to a query that names a
+partition. Verified rather than assumed: a partition needs no privileges of its own to be
+used through its parent, so `agentworld_ensure_partitions` revokes `ALL` on every
+partition it creates. Tenant isolation on these three tables therefore rests on one
+invariant — *the application role holds no privilege on any partition* — which
+`test_append_only.py` asserts over every partition, so a later grant fails a test rather
+than leaking data.
 
 ## 4. Conditional and composite rules
 

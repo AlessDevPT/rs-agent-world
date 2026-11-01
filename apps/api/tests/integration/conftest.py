@@ -40,7 +40,14 @@ TEST_DATABASE = "agentworld_test"
 PEPPER = "integration-test-pepper"
 
 #: Every table migration 0003 creates, for truncation between tests.
-ALL_TABLES = "api_keys, audit_log, projects, workspace_members, workspaces, users"
+#: CASCADE reaches everything that references `projects`, which covers the
+#: Phase 2 definition and execution tables - but *not* the append-only tables:
+#: those deliberately carry no foreign key to `projects`, so they have to be
+#: named here or event rows would leak from one test into the next.
+ALL_TABLES = (
+    "api_keys, audit_log, projects, workspace_members, workspaces, users, "
+    "events, logs, metric_samples"
+)
 
 
 def _swap_database(url: str, name: str) -> str:
