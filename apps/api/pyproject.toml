@@ -8,14 +8,23 @@ dependencies = [
     "uvicorn[standard]>=0.32.0",
     "pydantic>=2.9.0",
     "pydantic-settings>=2.6.0",
+    "email-validator>=2.2.0",
     "structlog>=24.4.0",
+    "sqlalchemy[asyncio]>=2.0.36",
+    "asyncpg>=0.30.0",
+    "alembic>=1.14.0",
+    # [crypto] pulls in `cryptography`, without which PyJWT silently refuses
+    # RS256 and every Supabase token would fail to verify.
+    "pyjwt[crypto]>=2.9.0",
+    "argon2-cffi>=23.1.0",
+    "httpx>=0.27.0",
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest>=8.3.0",
+    "pytest-asyncio>=0.24.0",
     "pytest-cov>=6.0.0",
-    "httpx>=0.27.0",
     "ruff>=0.7.0",
     "mypy>=1.13.0",
     "import-linter>=2.1",
@@ -45,6 +54,13 @@ ignore = ["B008"]  # FastAPI's Depends() in defaults is the documented idiom
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = ["S101"]
 
+[tool.ruff.lint.isort]
+# `helpers` is the integration tests' own module (a conftest cannot be
+# imported from a test file, so the shared types live beside it). Without
+# this, isort files it under third-party and then disagrees with itself about
+# where it belongs.
+known-first-party = ["agentworld", "helpers"]
+
 # --------------------------------------------------------------------- mypy ---
 [tool.mypy]
 python_version = "3.12"
@@ -61,6 +77,14 @@ disallow_untyped_defs = false
 testpaths = ["tests"]
 pythonpath = ["src"]
 addopts = "-q --strict-markers --strict-config"
+asyncio_mode = "auto"
+# Fixtures share the test's own loop. The one session-scoped fixture that
+# needs a longer-lived loop asks for it explicitly with `loop_scope`, because
+# it creates and disposes its own engines; everything else holds connections
+# that must live on the same loop as the test using them. Setting this to
+# "session" globally puts function fixtures on a different loop from the test
+# and asyncpg fails with "attached to a different loop".
+asyncio_default_fixture_loop_scope = "function"
 markers = [
     "integration: needs Postgres and Redis",
 ]
@@ -129,3 +153,18 @@ forbidden_modules = [
     "agentworld.services",
     "sqlalchemy",
 ]
+
+[[tool.importlinter.contracts]]
+# Persistence belongs in repositories. A service that reaches for `select()`
+# is a service that has started doing its own querying, which is how tenant
+# filters end up scattered and then forgotten.
+name = "Services orchestrate; only repositories speak SQL"
+type = "forbidden"
+source_modules = ["agentworld.services"]
+forbidden_modules = ["sqlalchemy", "asyncpg", "alembic"]
+# Direct imports only. Services import repositories, and repositories import
+# SQLAlchemy, so the default (transitive) reading of this contract is one no
+# layered design could ever satisfy - the first run reported six violations
+# that were all just "a service imports a repository". What the rule is
+# actually for is a service reaching for `select()` itself.
+allow_indirect_imports = true

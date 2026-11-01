@@ -30,7 +30,14 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
     log_format: Literal["console", "json"] = "console"
 
-    database_url: str = "postgresql+asyncpg://agentworld:dev@localhost:5432/agentworld"
+    #: The application's own connection. This role must NOT be a superuser
+    #: and must NOT hold BYPASSRLS, or migration 0004's row-level security
+    #: policies are silently inert. `test_rls.py` asserts that at runtime.
+    database_url: str = "postgresql+asyncpg://agentworld_app:app@localhost:5432/agentworld"
+    #: The schema owner, used only by `alembic upgrade`. Empty means "the same
+    #: role as the application", which is a valid single-role deployment:
+    #: FORCE ROW LEVEL SECURITY covers an owner, just not a superuser.
+    migration_database_url: str = ""
     redis_url: str = "redis://localhost:6379/0"
 
     event_bus: EventBusKind = "inprocess"
@@ -49,6 +56,10 @@ class Settings(BaseSettings):
     cors_origins: str = "http://localhost:3000"
 
     otel_exporter_otlp_endpoint: str = ""
+
+    @property
+    def effective_migration_url(self) -> str:
+        return self.migration_database_url or self.database_url
 
     @property
     def is_deployed(self) -> bool:

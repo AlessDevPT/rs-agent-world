@@ -87,7 +87,7 @@ have no workspace, returns `"needs_onboarding": true`.
 | `PATCH` | `/v1/workspaces/{id}` | admin+ | |
 | `DELETE` | `/v1/workspaces/{id}` | owner | Soft delete; a 7-day grace period before purge. |
 | `GET` | `/v1/workspaces/{id}/members` | viewer+ | |
-| `POST` | `/v1/workspaces/{id}/members` | admin+ | Invite by email. |
+| `POST` | `/v1/workspaces/{id}/members` | admin+ | Add by email. See the limitation below. |
 | `PATCH` | `/v1/workspaces/{id}/members/{user_id}` | admin+ | Change role. Owner cannot be demoted by an admin. |
 | `DELETE` | `/v1/workspaces/{id}/members/{user_id}` | admin+, or self | |
 
@@ -101,6 +101,25 @@ Role capabilities:
 | Manage API keys, integrations, webhooks | — | — | yes | yes |
 | Manage members | — | — | yes | yes |
 | Delete workspace, transfer ownership | — | — | — | yes |
+
+Three rules are about the state of a workspace rather than about roles, so they are not in
+the table:
+
+- An admin may not demote the owner. They are told to ask for a transfer.
+- Promoting someone to owner **is** a transfer: the acting owner steps down in the same
+  transaction, because a partial unique index permits exactly one owner per workspace.
+- The owner cannot leave or be removed. A workspace with no owner could never be deleted
+  by anyone, which would make it permanent by accident.
+
+Nobody may grant a role that outranks their own, which would otherwise be privilege
+escalation by proxy. Removing *yourself* needs no role at all: a viewer can leave without
+an admin's help.
+
+**Limitation — adding a member requires them to have signed up.** `POST .../members` adds
+an existing user by email and returns `404` for an address with no account. Inviting
+someone who has not yet signed up needs a pending-invitation table and an email path, and
+AgentWorld has neither yet; an invitation row nobody can receive would be worse than an
+honest 404. Tracked in `docs/05-ROADMAP.md`.
 
 ### 3.3 Projects
 
@@ -234,10 +253,41 @@ explains its current state.
   "expires_at": "2027-10-31T00:00:00Z" }
 
 // 201 response — `key` appears exactly once, in this response, ever
-{ "id": "k_7f...", "prefix": "aw_live_8f2c1a",
-  "key": "aw_live_8f2c1a.s3cr3t-half-shown-once",
+{ "id": "k_7f...", "prefix": "aw_live_8f2c1a3d5e70",
+  "key": "aw_live_8f2c1a3d5e70.s3cr3t-half-shown-once",
   "name": "EU workers", "scope": "ingest", "created_at": "..." }
 ```
+
+**The format** is `aw_<env>_<random>.<secret>`. The prefix before the `.` is public,
+stored in clear, shown in the UI and the handle you revoke by; the secret after it is
+Argon2id-hashed with a pepper and is not recoverable from the server. The secret is
+URL-safe base64 and so contains no `.`, which makes the first `.` unambiguously the
+separator.
+
+**Scopes.** `ingest` must be pinned to a project — an unpinned ingest key could emit
+events into every project in the workspace, which is the blast radius the scope exists to
+limit. `control` needs no project. `full` satisfies both; the two narrow scopes do not
+satisfy each other. No key of any scope may perform control-plane *management*: a key that
+can mint keys turns one leak into permanent access.
+
+**The `agent_key_allowlist`** supports a single trailing `*` and nothing else. A pattern
+with a `*` elsewhere is rejected at mint time rather than treated as a literal: an
+allowlist that looks like a wildcard and behaves like a literal appears to permit a family
+of agents while permitting none, which is the worst failure mode a security control can
+have. `null` means any agent in the pinned project; `["*"]` means the same thing
+explicitly.
+
+**The environment label is enforced.** A key minted against a deployed environment says
+`live`, anything else says `test`, and a key whose label does not match the server it is
+presented to is refused. A development key pasted into production fails loudly instead of
+quietly working.
+
+**Every rejection is the same rejection.** Wrong secret, unknown prefix, malformed,
+revoked, expired, wrong environment and wrong plane all return one `401` with one message;
+which it was goes to the server log. The checks are also ordered so that holding a valid
+secret is a precondition for learning anything at all — including whether a key was once
+real. An unknown prefix still pays for one Argon2id verification against a dummy hash, so
+it cannot be told apart by latency either.
 
 ### 3.8 Integrations and webhooks
 
@@ -335,7 +385,22 @@ Semantics:
   arrival by comparing `occurred_at` against the state row's last-applied timestamp and
   ignoring stale transitions.
 
-### 4.2 Other ingest endpoints
+### 4.2 `GET /v1/self/key`
+
+What this key is, as the key itself can see it. The first call an integrator makes after
+minting one, and the answer to "is this working and what may it do".
+
+```json
+{ "api_key_id": "...", "workspace_id": "...", "project_id": "...",
+  "scope": "ingest", "rate_limit_rps": 50, "agent_key_allowlist": ["etl-worker-eu-*"] }
+```
+
+Deliberately no name, no creator and no timestamps: those belong to the human who minted
+it, and an agent holding the key has no business enumerating facts about the workspace it
+sits in. `GET /v1/self` proper — the calling agent's own row — arrives with agents in
+Phase 2.
+
+### 4.3 Other ingest endpoints
 
 | Method | Path | Notes |
 |--------|------|-------|
@@ -350,7 +415,7 @@ Semantics:
 `POST /v1/self/tasks/claim` is the one place an agent changes state without an event —
 and it still writes a `task.assigned` event internally, so the audit trail stays complete.
 
-### 4.3 Adapter inbound
+### 4.4 Adapter inbound
 
 `POST /v1/hooks/{integration_id}` — raw body passed to the adapter's `verify` then
 `normalise`, and the resulting canonical events go through the identical ingest pipeline.

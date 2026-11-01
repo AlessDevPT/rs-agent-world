@@ -52,6 +52,8 @@ CI fails if `domain/` imports SQLAlchemy.
 **Build**
 
 - Migrations `0001`–`0003` (extensions, enums, tenancy).
+- The non-superuser application role and its grants (`0005`), without which the RLS
+  below is silently inert.
 - Supabase JWT verification: JWKS fetch and cache, RS256, audience and expiry checks,
   behind the `AuthProvider` interface.
 - `GET/PATCH /v1/me` with the `users` mirror upsert and `needs_onboarding`.
@@ -59,7 +61,7 @@ CI fails if `domain/` imports SQLAlchemy.
 - Projects CRUD.
 - API keys: mint, Argon2id hash with pepper, prefix lookup, scopes, allowlist, revoke.
 - `audit_log` writes on every mutating control-plane call.
-- RLS migration (`0008` brought forward) plus the session variable in `infra/db.py`.
+- RLS migration (brought forward to `0004`) plus the session variable in `infra/db.py`.
 - Web: Supabase login/callback, workspace switcher, project list, create-project form,
   API-key page with the show-once secret dialog.
 
@@ -72,6 +74,13 @@ CI fails if `domain/` imports SQLAlchemy.
 
 **Done when** a new user can sign up, create a workspace and project, and hold an API key
 whose plaintext the server cannot recover.
+
+**Deferred out of this phase, deliberately:** pending invitations for people who have not
+signed up yet. The schema in `02-DATABASE.md` has no invitations table, and an invitation
+is not a row — it is a token, an expiry, an accept flow and an email, and AgentWorld has
+no mail path. `POST /v1/workspaces/{id}/members` therefore adds an *existing* user by
+email and 404s an unknown address, which is honest; a stored invitation nobody could
+receive would not be. Earliest v1.1, with the alerting work that brings email with it.
 
 ---
 
@@ -288,6 +297,7 @@ oversights.
 
 | Deferred | Why | Earliest |
 |----------|-----|----------|
+| Pending invitations for users who have not signed up | Needs a token, an expiry, an accept flow and a mail path; adding an existing user by email covers the common case | v1.1 |
 | Alerting rules and notifications (email, Slack, PagerDuty) | Needs a rule engine; webhooks cover the urgent case | v1.1 |
 | Cost and token analytics | Generic metric ingest already stores the data; the UI can wait | v1.1 |
 | Agent-to-agent coordination | Changes the protocol from observational to transactional | v2 |

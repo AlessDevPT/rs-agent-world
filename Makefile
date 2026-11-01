@@ -1,5 +1,5 @@
 .DEFAULT_GOAL := help
-.PHONY: help bootstrap dev infra-up infra-down test test-api test-web lint lint-api lint-web format verify clean
+.PHONY: help bootstrap dev infra-up infra-down migrate revision test test-api test-web lint lint-api lint-web format verify clean
 
 PY := python
 COMPOSE := docker compose -f infra/compose/docker-compose.yml
@@ -12,6 +12,7 @@ bootstrap: ## Install everything and start local infrastructure
 	$(PY) scripts/api.py install
 	npm install
 	$(COMPOSE) up -d
+	$(PY) scripts/api.py migrate
 	@echo "ready - run 'make dev'"
 
 infra-up: ## Start Postgres + Redis
@@ -19,6 +20,12 @@ infra-up: ## Start Postgres + Redis
 
 infra-down: ## Stop Postgres + Redis
 	$(COMPOSE) down
+
+migrate: ## Apply database migrations (as the schema owner)
+	$(PY) scripts/api.py migrate
+
+revision: ## Autogenerate a migration - always read what it produced
+	$(PY) scripts/api.py revision $(m)
 
 dev: ## Run API and web together (two terminals is usually nicer)
 	$(PY) scripts/api.py dev & npm run dev

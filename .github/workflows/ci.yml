@@ -17,29 +17,50 @@ jobs:
   api:
     name: API - lint, types, architecture, tests
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: apps/api
+    env:
+      # The application connects as the non-superuser role; migrations connect
+      # as the owner. Keeping them apart is what makes the row-level security
+      # policies real rather than decorative - a superuser bypasses them all,
+      # FORCE included, and the isolation tests would pass without the
+      # database doing anything.
+      DATABASE_URL: postgresql+asyncpg://agentworld_app:app@localhost:5432/agentworld
+      MIGRATION_DATABASE_URL: postgresql+asyncpg://agentworld:dev@localhost:5432/agentworld
+      # Without this the integration tests skip when Postgres is missing,
+      # which is right for a contributor with no Docker and a silent hole in
+      # CI. Here, a skip is a failure.
+      AGENTWORLD_REQUIRE_INTEGRATION: "1"
     steps:
       - uses: actions/checkout@v4
+
+      # docker compose rather than a `services:` container, so the init script
+      # that creates the application role runs exactly as it does locally.
+      # A service container cannot mount it, which would mean CI and a
+      # developer's machine differed on the one thing these tests check.
+      - name: Start Postgres
+        run: docker compose -f infra/compose/docker-compose.yml up -d --wait postgres
 
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: pip
+          cache-dependency-path: apps/api/pyproject.toml
 
       - name: Install
+        working-directory: apps/api
         run: |
           python -m pip install --upgrade pip
           pip install -e ".[dev]"
 
       - name: ruff check
+        working-directory: apps/api
         run: ruff check .
 
       - name: ruff format
+        working-directory: apps/api
         run: ruff format --check .
 
       - name: mypy (strict)
+        working-directory: apps/api
         run: mypy src
 
       # The contracts that keep the domain layer provider-free (G1) and the
@@ -47,10 +68,20 @@ jobs:
       # importlinter.cli` exits 0 without evaluating anything, which looks
       # exactly like a pass.
       - name: Architecture contracts
+        working-directory: apps/api
         run: lint-imports
 
+      - name: Migrations apply from scratch
+        working-directory: apps/api
+        run: alembic upgrade head
+
       - name: pytest
+        working-directory: apps/api
         run: pytest --cov --cov-report=term-missing
+
+      - name: Stop Postgres
+        if: always()
+        run: docker compose -f infra/compose/docker-compose.yml down -v
 
   web:
     name: Web - lint, types, tests, build
@@ -86,6 +117,20 @@ jobs:
 
       - name: Both services healthy
         run: docker compose -f infra/compose/docker-compose.yml ps
+
+      - name: The application role exists and cannot bypass RLS
+        run: |
+          docker compose -f infra/compose/docker-compose.yml exec -T postgres \
+            psql -U agentworld -d agentworld -v ON_ERROR_STOP=1 -c \
+            "DO \$\$ BEGIN
+               IF NOT EXISTS (
+                 SELECT 1 FROM pg_roles
+                 WHERE rolname = 'agentworld_app'
+                   AND NOT rolsuper AND NOT rolbypassrls
+               ) THEN
+                 RAISE EXCEPTION 'agentworld_app is missing, or can bypass RLS';
+               END IF;
+             END \$\$;"
 
       - name: Tear down
         if: always()

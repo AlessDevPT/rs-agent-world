@@ -11,6 +11,10 @@ services:
       - "5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
+      # Runs once, on first initialisation of pgdata. Creates the
+      # non-superuser role the API connects as - see the script for why that
+      # is not optional.
+      - ./postgres-init:/docker-entrypoint-initdb.d:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U agentworld -d agentworld"]
       interval: 5s

@@ -33,6 +33,26 @@ class NotFoundError(DomainError):
     title = "Not found"
 
 
+class AuthenticationFailedError(DomainError):
+    """No usable credential was presented, or it did not verify.
+
+    One error for every cause - expired, wrong signature, wrong audience,
+    revoked key, malformed header, credential for the other plane. The caller
+    learns only that authentication failed; which of those it was goes to the
+    logs. An error that distinguishes them is a probing oracle.
+
+    `challenge` becomes the `WWW-Authenticate` response header, so the 401
+    says which scheme the endpoint actually wants.
+    """
+
+    code = "authentication_failed"
+    title = "Authentication failed"
+
+    def __init__(self, detail: str, *, challenge: str | None = None, **context: Any) -> None:
+        super().__init__(detail, **context)
+        self.challenge = challenge
+
+
 class PermissionDeniedError(DomainError):
     code = "permission_denied"
     title = "Permission denied"

@@ -56,6 +56,31 @@ def task_test() -> int:
     return run([str(venv_bin("python")), "-m", "pytest", *sys.argv[2:]])
 
 
+def task_migrate() -> int:
+    """Apply migrations, as the schema owner.
+
+    Alembic reads MIGRATION_DATABASE_URL (falling back to DATABASE_URL), not
+    a url in alembic.ini, so there is one answer to "which database" shared
+    with the application. Extra arguments are passed through, so
+    `npm run api:migrate -- downgrade -1` works.
+    """
+    args = sys.argv[2:] or ["upgrade", "head"]
+    return run([str(venv_bin("python")), "-m", "alembic", *args])
+
+
+def task_revision() -> int:
+    """Autogenerate a migration against the current database.
+
+    Always read what it produces: autogenerate cannot see citext, partial
+    indexes, check constraints or RLS policies, and will happily propose
+    dropping things it does not understand.
+    """
+    message = " ".join(sys.argv[2:]) or "change"
+    return run(
+        [str(venv_bin("python")), "-m", "alembic", "revision", "--autogenerate", "-m", message]
+    )
+
+
 def task_lint() -> int:
     py = str(venv_bin("python"))
     worst = 0
@@ -81,6 +106,8 @@ def task_format() -> int:
 TASKS = {
     "install": task_install,
     "dev": task_dev,
+    "migrate": task_migrate,
+    "revision": task_revision,
     "test": task_test,
     "lint": task_lint,
     "format": task_format,

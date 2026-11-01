@@ -12,19 +12,26 @@ backend event; nothing is simulated.
 
 ## Status
 
-**Phase 0 complete** — the skeleton runs, and the architecture contracts that protect
-the design are live and verified. Phase 1 (tenancy and auth) is next.
+**Phase 1 complete (backend)** — multi-tenant, authenticated, and isolated at two
+independent layers. Phase 2 (the agent protocol and event ingest) is next: the core of
+the product, and the first phase where an agent appears.
 
 | Phase | State |
 |-------|-------|
 | 0 — Foundations | done |
-| 1 — Tenancy and auth | next |
-| 2–8 | see [the roadmap](docs/05-ROADMAP.md) |
+| 1 — Tenancy and auth | done |
+| 2 — Protocol and ingest | next |
+| 3–8 | see [the roadmap](docs/05-ROADMAP.md) |
 
-What works today: the API boots and serves `/healthz`, `/readyz` and `/v1/meta`; every
-error is an RFC 9457 problem document carrying a request id; the web shell renders and
-reports its live connection to the API; `docker compose` brings up Postgres and Redis.
-No agents, no events, no island yet.
+What works today, end to end over HTTP: a user authenticates with a Supabase JWT, is
+mirrored locally by their first `GET /v1/me`, creates a workspace and projects, invites
+members with roles, and mints API keys whose plaintext the server cannot recover. Agents
+can present a key to `GET /v1/self/key` and be told what they are allowed to do. Every
+error is an RFC 9457 problem document carrying a request id, and every mutation writes an
+audit row in the same transaction as the change.
+
+No agents, no events, no island yet — and no web UI for any of the above, which is the
+remaining half of Phase 1.
 
 ## Quick start
 
@@ -33,6 +40,7 @@ cp .env.example .env
 npm run api:install     # creates apps/api/.venv and installs the API
 npm install             # installs the web workspace
 npm run infra:up        # Postgres + Redis
+npm run api:migrate     # apply migrations, as the schema owner
 ```
 
 Then in two terminals:
@@ -99,17 +107,27 @@ Four properties the whole design is arranged to protect:
 4. **The island is a projection.** Deleting the entire visual layer changes no backend
    behaviour and breaks no backend test.
 
-Properties 1 and 4 are mechanically enforced as of Phase 0, not left to discipline:
+These are mechanically enforced, not left to discipline:
 
-| Guarantee | Enforced by | Verified |
-|-----------|-------------|----------|
+| Guarantee | Enforced by | Verified by |
+|-----------|-------------|-------------|
 | `domain/` imports no framework or provider SDK | import-linter contract + a pytest AST guard | planting `import anthropic` fails both |
 | Dependencies point inward only | import-linter layers contract | — |
+| Only repositories speak SQL | import-linter forbidden contract (direct imports) | — |
 | Adapters never touch persistence | import-linter forbidden contract | — |
 | Nothing outside `world/` imports Phaser | eslint `no-restricted-imports` | planting the import fails lint |
 | `world/projector` stays pure | eslint, scoped to that directory | planting `import react` fails lint |
+| A tenant cannot see another's data | `TenantScope` in the type signature **and** PostgreSQL RLS | every endpoint called with a foreign id returns 404 |
+| RLS is not silently inert | the app connects as a non-superuser without `BYPASSRLS` | asserted before any other RLS test runs |
+| The audit log cannot be rewritten | `SELECT, INSERT` grants and nothing more | `UPDATE` and `DELETE` are refused by the database |
+| Exactly one owner per workspace | partial unique index | a second owner insert is refused |
+| A key secret is unrecoverable | Argon2id with a pepper, never stored in clear | every text column searched for the plaintext |
+| Each role can do exactly what the spec says | one `authorize()` call, one table | every endpoint × every role, over HTTP |
+| Models, migrations and enums agree | Alembic `compare_metadata` + a `pg_enum` comparison | runs against a freshly migrated database |
 
 ## Next step
 
-Phase 1: tenancy and auth — the schema's tenancy tables, Supabase JWT verification,
-workspaces and projects, Argon2id-hashed API keys, and row-level security from the start.
+Phase 2: the agent protocol and event ingest — the canonical event envelope, the
+append-only partitioned event log, the reducers that are the only writers of current
+state, and the replay-equivalence test that keeps event sourcing honest. By the end of it
+the whole product works through `curl`, with no frontend in existence.

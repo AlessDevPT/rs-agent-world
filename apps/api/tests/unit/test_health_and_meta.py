@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from agentworld.api.deps import get_database
 from agentworld.domain.protocol.version import PROTOCOL_VERSION
 
 
@@ -18,12 +20,52 @@ def test_healthz_touches_no_dependency(client: TestClient) -> None:
         assert client.get("/healthz").status_code == 200
 
 
-def test_readyz_reports_checks(client: TestClient) -> None:
-    r = client.get("/readyz")
+def test_readyz_reports_a_healthy_dependency(app: FastAPI, client: TestClient) -> None:
+    """Readiness with a stubbed database.
+
+    `/readyz` grew a real Postgres check in Phase 1, which quietly turned this
+    into a test that needed a running database to pass - a unit test with an
+    infrastructure dependency, failing for a reason that had nothing to do
+    with the logic it covers. Overriding the dependency keeps it about the
+    logic; `tests/integration/test_tenancy_api.py` asserts the same endpoint
+    against a real Postgres.
+    """
+    app.dependency_overrides[get_database] = lambda: _StubDatabase(reachable=True)
+    try:
+        r = client.get("/readyz")
+    finally:
+        app.dependency_overrides.pop(get_database, None)
+
     assert r.status_code == 200
-    body = r.json()
-    assert body["status"] == "ready"
-    assert isinstance(body["checks"], dict)
+    assert r.json() == {"status": "ready", "checks": {"postgres": "ok"}}
+
+
+def test_readyz_is_degraded_when_a_dependency_is_down(
+    app: FastAPI, client: TestClient
+) -> None:
+    """503, and it says which dependency.
+
+    A readiness probe that only says "not ready" sends whoever is paged to
+    read logs; one that names the dependency does not.
+    """
+    app.dependency_overrides[get_database] = lambda: _StubDatabase(reachable=False)
+    try:
+        r = client.get("/readyz")
+    finally:
+        app.dependency_overrides.pop(get_database, None)
+
+    assert r.status_code == 503
+    assert r.json() == {"status": "degraded", "checks": {"postgres": "unreachable"}}
+
+
+class _StubDatabase:
+    """Just enough of `Database` for the readiness check to call `ping`."""
+
+    def __init__(self, *, reachable: bool) -> None:
+        self._reachable = reachable
+
+    async def ping(self) -> bool:
+        return self._reachable
 
 
 def test_meta_reports_protocol_version_separately(client: TestClient) -> None:

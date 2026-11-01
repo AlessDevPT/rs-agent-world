@@ -221,19 +221,40 @@ a JSONPath mapping config), `langgraph`, `openai-assistants`, `anthropic-sdk`.
 | | Control plane | Ingest plane |
 |---|---|---|
 | Principal | Human user | Agent / machine |
-| Credential | Supabase Auth JWT (RS256, verified against cached JWKS) | API key `aw_<env>_<prefix>_<secret>` |
+| Credential | Supabase Auth JWT (RS256/ES256, verified against cached JWKS) | API key `aw_<env>_<random>.<secret>` |
 | Carried in | `Authorization: Bearer <jwt>` | `X-AgentWorld-Key: <key>` |
 | Scope | Workspace membership and role | Pinned to one project, optional agent-key allowlist |
 | Can do | Everything the role allows, including key management | Ingest events, read own agent/task rows, claim tasks |
 | Cannot do | — | Enumerate other agents, read other projects, mint keys |
 
-Keys are stored as Argon2id hashes. Only `prefix` (`aw_live_8f2c1a`) is queryable, and the
-prefix is what the UI shows. A leaked key is revocable individually, not per project.
-Rate limits are per key (token bucket in Redis).
+Keys are stored as Argon2id hashes of a peppered secret. Only `prefix`
+(`aw_live_8f2c1a3d5e70`) is queryable, and the prefix is what the UI shows. A leaked key is
+revocable individually, not per project. Rate limits are per key (token bucket in Redis).
+
+JWT verification is entirely local: the JWKS document is cached, so an outage of the
+identity provider does not take the API down with it, and a token check costs one signature
+verification rather than a network round trip. The accepted algorithm list is fixed to the
+asymmetric ones — taking the algorithm from the token's own header is the JWT confusion
+attack, where a forger signs `alg: HS256` with the published *public* key and a lenient
+verifier accepts it as a valid HMAC. An unknown `kid` does prompt one refetch, so rotation
+works without a restart, but at most one per cooldown window: unauthenticated callers
+choose that `kid`, and without the cap a stream of forged tokens becomes a
+denial-of-service amplifier aimed at the identity provider.
 
 Authorization is a single `authorize(principal, action, resource)` call in the service
 layer rather than scattered route checks, and every mutating control-plane call writes an
-`audit_log` row.
+`audit_log` row — in the same transaction as the change it describes, so a rolled-back
+mutation leaves no claim that it happened and a successful one cannot fail to be recorded.
+
+`authorize` also decides 404 against 403: a principal with no membership in the resource's
+workspace gets `NotFoundError`, because a 403 would confirm to a stranger that the
+workspace exists and that they guessed its id. Once membership is established the
+distinction is safe to make, and a 403 naming the required role is far more useful.
+
+The two principal types are separate classes rather than one with a `kind` field, so a
+control-plane function cannot accept an agent's key: the type checker refuses it before any
+test does. `authorize` additionally fails closed for any key principal, so the guarantee
+does not rest on the routing table staying correct.
 
 ### 5.5 Frontend (`apps/web`, Next.js App Router + TypeScript)
 

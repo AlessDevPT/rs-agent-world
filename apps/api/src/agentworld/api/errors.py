@@ -21,6 +21,7 @@ CONTENT_TYPE = "application/problem+json"
 
 _STATUS_BY_ERROR: dict[type[domain_errors.DomainError], int] = {
     domain_errors.ValidationFailedError: 422,
+    domain_errors.AuthenticationFailedError: 401,
     domain_errors.NotFoundError: 404,
     domain_errors.PermissionDeniedError: 403,
     domain_errors.ConflictError: 409,
@@ -98,6 +99,11 @@ def register_error_handlers(app: FastAPI) -> None:
         headers = None
         if isinstance(exc, domain_errors.RateLimitedError):
             headers = {"Retry-After": str(exc.retry_after_seconds)}
+        elif isinstance(exc, domain_errors.AuthenticationFailedError) and exc.challenge:
+            # RFC 9110: a 401 states the scheme it wants. The ingest plane
+            # uses a custom header rather than Authorization, so the two
+            # planes send different challenges.
+            headers = {"WWW-Authenticate": exc.challenge}
         if status >= 500:
             log.error("domain_error", code=exc.code, detail=exc.detail, **exc.context)
         return problem(

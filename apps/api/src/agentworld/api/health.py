@@ -7,10 +7,13 @@ answers "should traffic come here" and does check dependencies.
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Annotated, Literal
 
-from fastapi import APIRouter, Response
+from fastapi import APIRouter, Depends, Response
 from pydantic import BaseModel
+
+from agentworld.api.deps import get_database
+from agentworld.infra.db import Database
 
 router = APIRouter(tags=["health"])
 
@@ -30,11 +33,14 @@ async def healthz() -> Health:
 
 
 @router.get("/readyz", response_model=Readiness, summary="Readiness")
-async def readyz(response: Response) -> Readiness:
-    # Phase 0 has no dependencies wired yet. Each is added here as it lands
-    # (Postgres in Phase 1, Redis in Phase 4) and reports by name, so a
-    # degraded readiness says which dependency is at fault.
-    checks: dict[str, str] = {}
+async def readyz(
+    response: Response, database: Annotated[Database, Depends(get_database)]
+) -> Readiness:
+    # Each dependency is added here as it lands and reports by name, so a
+    # degraded readiness says which one is at fault. Redis joins in Phase 4.
+    checks: dict[str, str] = {
+        "postgres": "ok" if await database.ping() else "unreachable",
+    }
     degraded = [name for name, state in checks.items() if state != "ok"]
     if degraded:
         response.status_code = 503
