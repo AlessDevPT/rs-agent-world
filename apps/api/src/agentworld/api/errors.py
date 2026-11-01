@@ -6,7 +6,8 @@ FastAPI and Starlette raise themselves. Clients get one parser, not three.
 
 from __future__ import annotations
 
-from typing import Any
+from collections.abc import Mapping
+from typing import Any, Final
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
@@ -54,6 +55,7 @@ def problem(
     detail: str,
     errors: list[dict[str, Any]] | None = None,
     headers: dict[str, str] | None = None,
+    locator: Mapping[str, Any] | None = None,
 ) -> JSONResponse:
     body: dict[str, Any] = {
         "type": f"{PROBLEM_BASE_URL}/{code}",
@@ -65,7 +67,36 @@ def problem(
         body["instance"] = rid
     if errors:
         body["errors"] = errors
+    if locator:
+        body.update(locator)
     return JSONResponse(status_code=status, content=body, headers=headers, media_type=CONTENT_TYPE)
+
+
+#: The only context keys a problem document carries. They say *where* in the
+#: request the problem is, which is the one thing a caller cannot work out for
+#: themselves - and nothing about what the server knows.
+#:
+#: Deliberately not the whole of `DomainError.context`. That is written for
+#: logs, where the trust boundary is different, and splatting it into a
+#: response would make every future error author's choice of keyword a
+#: disclosure decision they did not know they were taking. `value` is left out
+#: for the same reason it looks tempting: the caller already sent it, so
+#: echoing it adds nothing and creates a reflection surface.
+LOCATOR_KEYS: Final = ("field", "index")
+
+
+def _locator(exc: domain_errors.DomainError) -> dict[str, Any]:
+    """Where in the request the problem is, when the error knows.
+
+    This exists because of the ingest plane. A caller posting 500 events and
+    told only "an occurred_at is an ISO-8601 timestamp" has to bisect their
+    own batch to find out which one - and the parser already knew.
+    """
+    return {
+        key: exc.context[key]
+        for key in LOCATOR_KEYS
+        if key in exc.context and exc.context[key] is not None
+    }
 
 
 def _json_pointer(loc: tuple[int | str, ...], code: str) -> str:
@@ -112,6 +143,7 @@ def register_error_handlers(app: FastAPI) -> None:
             title=exc.title,
             detail=exc.detail,
             headers=headers,
+            locator=_locator(exc),
         )
 
     @app.exception_handler(RequestValidationError)

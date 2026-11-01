@@ -139,12 +139,27 @@ def _agent_status_for(name: str, payload: Mapping[str, Any]) -> AgentStatus | No
 
 
 def _declared(payload: Mapping[str, Any]) -> dict[str, Any]:
-    """The parts of a registration a worker is entitled to assert."""
+    """The parts of a registration a worker is entitled to assert.
+
+    The shapes are not interchangeable, which an earlier version of this
+    function got wrong: `agents.capabilities` is `text[]` and the other two
+    are `jsonb`, so a producer sending an object for capabilities would have
+    failed the whole ingest transaction with a type error rather than being
+    quietly ignored. Anything of the wrong shape is dropped - a registration
+    is a worker describing itself, and a malformed self-description should
+    not take the batch down with it.
+    """
     declared: dict[str, Any] = {}
-    for field in ("capabilities", "labels", "runtime"):
+
+    capabilities = payload.get("capabilities")
+    if isinstance(capabilities, list) and all(isinstance(entry, str) for entry in capabilities):
+        declared["capabilities"] = capabilities
+
+    for field in ("labels", "runtime"):
         value = payload.get(field)
-        if isinstance(value, Mapping | list):
-            declared[field] = value
+        if isinstance(value, Mapping):
+            declared[field] = dict(value)
+
     ttl = payload.get("heartbeat_ttl_seconds")
     if isinstance(ttl, int) and not isinstance(ttl, bool) and 0 < ttl <= 86_400:
         declared["heartbeat_ttl_seconds"] = ttl

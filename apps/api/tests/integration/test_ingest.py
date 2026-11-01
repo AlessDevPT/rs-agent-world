@@ -1,0 +1,632 @@
+"""Ingest, end to end over HTTP, and the promises it has to keep.
+
+The acceptance criteria from the roadmap live here: the same batch ingested
+three times yields one event per `dedup_key`; re-folding the stored log
+reproduces the state exactly; and folding creates no dispatch rows at all.
+
+The replay test is the one worth reading. It rebuilds envelopes from the
+`events` rows rather than reusing the objects that were posted, so it asserts
+something stronger than "fold is deterministic": that the stored row carries
+everything a replay needs. A column we forgot to persist would pass a
+determinism test and fail this one.
+"""
+
+from __future__ import annotations
+
+import datetime as dt
+import uuid
+from typing import Any
+
+import pytest
+from fastapi.testclient import TestClient
+from sqlalchemy import text
+
+from agentworld.domain.protocol import PROTOCOL_VERSION
+from agentworld.infra.db import Database
+from helpers import Actor
+
+pytestmark = pytest.mark.integration
+
+KEY_HEADER = "X-AgentWorld-Key"
+
+#: The derived tables a replay must rebuild from the log alone.
+DERIVED_TABLES = (
+    "agents",
+    "agent_status_history",
+    "tasks",
+    "runs",
+    "run_steps",
+    "workflow_executions",
+    "execution_steps",
+)
+
+
+class Fixture:
+    """A workspace, a project, an ingest key, and two registered agents."""
+
+    def __init__(self, client: TestClient, actor: Actor, **key_overrides: Any) -> None:
+        self.workspace = client.post(
+            "/v1/workspaces", json={"name": "Ingest"}, headers=actor.headers
+        ).json()
+        self.project = client.post(
+            f"/v1/workspaces/{self.workspace['id']}/projects",
+            json={"name": "Island"},
+            headers=actor.headers,
+        ).json()
+        body: dict[str, Any] = {
+            "name": "Worker",
+            "scope": "ingest",
+            "project_id": self.project["id"],
+        }
+        body.update(key_overrides)
+        minted = client.post(
+            f"/v1/workspaces/{self.workspace['id']}/api-keys",
+            json=body,
+            headers=actor.headers,
+        )
+        assert minted.status_code == 201, minted.text
+        self.key = str(minted.json()["key"])
+
+    @property
+    def headers(self) -> dict[str, str]:
+        return {KEY_HEADER: self.key}
+
+    @property
+    def project_id(self) -> uuid.UUID:
+        return uuid.UUID(self.project["id"])
+
+    @property
+    def workspace_id(self) -> uuid.UUID:
+        return uuid.UUID(self.workspace["id"])
+
+
+@pytest.fixture
+def ingest(client: TestClient, actor: Actor) -> Fixture:
+    return Fixture(client, actor)
+
+
+@pytest.fixture
+async def agents(owner_database: Database, ingest: Fixture) -> dict[str, uuid.UUID]:
+    """Two agents, because an agent row is configuration and not an event.
+
+    `agent.registered` announces a worker for an agent someone already
+    created; nothing in the protocol can create one, which is the property
+    that stops a replay re-creating a definition.
+    """
+    created: dict[str, uuid.UUID] = {}
+    async with owner_database.session() as session:
+        for agent_key in ("researcher", "writer"):
+            agent_id = uuid.uuid4()
+            await session.execute(
+                text(
+                    "INSERT INTO agents (id, workspace_id, project_id, agent_key, "
+                    " interaction_mode, display_name) "
+                    "VALUES (:i, :w, :p, :key, 'managed', :name)"
+                ),
+                {
+                    "i": agent_id,
+                    "w": ingest.workspace_id,
+                    "p": ingest.project_id,
+                    "key": agent_key,
+                    "name": agent_key.title(),
+                },
+            )
+            created[agent_key] = agent_id
+    return created
+
+
+def event(**overrides: Any) -> dict[str, Any]:
+    base: dict[str, Any] = {
+        "dedup_key": f"e-{uuid.uuid4()}",
+        "type": "agent.heartbeat",
+        "protocol_version": PROTOCOL_VERSION,
+        "occurred_at": dt.datetime.now(dt.UTC).isoformat(),
+        "subject": {"kind": "agent", "ref": "researcher"},
+    }
+    base.update(overrides)
+    return base
+
+
+def post(client: TestClient, fixture: Fixture, *events: dict[str, Any]) -> Any:
+    return client.post("/v1/ingest/events", json={"events": list(events)}, headers=fixture.headers)
+
+
+# ------------------------------------------------------------- the happy path ---
+
+
+async def test_an_event_is_stored_and_folded(
+    client: TestClient, ingest: Fixture, agents: dict[str, uuid.UUID], owner_database: Database
+) -> None:
+    # A fixed instant in the recent past: fixed so the assertion below can
+    # compare it exactly, past because dating it ahead of the server is what
+    # the skew check exists to refuse.
+    occurred = (dt.datetime.now(dt.UTC) - dt.timedelta(minutes=5)).replace(microsecond=0)
+    response = post(
+        client,
+        ingest,
+        event(dedup_key="hb-1", occurred_at=occurred.isoformat()),
+    )
+    assert response.status_code == 202, response.text
+    body = response.json()
+    assert body == {
+        "accepted": 1,
+        "duplicates": 0,
+        "highest_seq": 1,
+        "outcomes": [{"dedup_key": "hb-1", "accepted": True, "seq": 1, "rows_changed": 1}],
+    }
+
+    async with owner_database.session() as session:
+        stored = (
+            await session.execute(
+                text(
+                    "SELECT seq, type, agent_id, subject_ref, received_at > occurred_at "
+                    "FROM events WHERE dedup_key = 'hb-1'"
+                )
+            )
+        ).one()
+        heartbeat = (
+            await session.execute(
+                text("SELECT last_heartbeat_at FROM agents WHERE agent_key = 'researcher'")
+            )
+        ).scalar_one()
+
+    assert stored[0] == 1
+    assert stored[1] == "agent.heartbeat"
+    assert stored[2] == agents["researcher"], "the agent_key resolved to a row"
+    assert stored[4] is True, "the server's clock is recorded separately"
+    assert heartbeat == occurred, "folded from the event's own time, not now()"
+
+
+async def test_the_sequence_is_per_project_and_gapless(
+    client: TestClient, ingest: Fixture, agents: dict[str, uuid.UUID]
+) -> None:
+    """What WebSocket resume and cursor pagination read."""
+    first = post(client, ingest, event(), event(), event()).json()
+    second = post(client, ingest, event()).json()
+
+    assert [o["seq"] for o in first["outcomes"]] == [1, 2, 3]
+    assert second["outcomes"][0]["seq"] == 4
+    assert second["highest_seq"] == 4
+
+
+# ------------------------------------------------------------------- dedup ---
+
+
+async def test_the_same_batch_three_times_yields_one_event_each(
+    client: TestClient, ingest: Fixture, agents: dict[str, uuid.UUID], owner_database: Database
+) -> None:
+    """The roadmap's acceptance criterion, verbatim."""
+    batch = [event(dedup_key="a"), event(dedup_key="b")]
+
+    first = client.post("/v1/ingest/events", json={"events": batch}, headers=ingest.headers).json()
+    assert (first["accepted"], first["duplicates"]) == (2, 0)
+
+    for _ in range(2):
+        again = client.post(
+            "/v1/ingest/events", json={"events": batch}, headers=ingest.headers
+        ).json()
+        assert (again["accepted"], again["duplicates"]) == (0, 2)
+        assert again["highest_seq"] is None, "a duplicate consumes no sequence number"
+
+    async with owner_database.session() as session:
+        count = (await session.execute(text("SELECT count(*) FROM events"))).scalar_one()
+    assert count == 2
+
+
+async def test_a_duplicate_within_one_batch_is_refused(
+    client: TestClient, ingest: Fixture, agents: dict[str, uuid.UUID]
+) -> None:
+    """The per-event check runs against what is committed, so it cannot see
+    the earlier event in its own transaction. Two rows with one key would be
+    a dedup guarantee that silently stopped holding."""
+    response = post(client, ingest, event(dedup_key="same"), event(dedup_key="same"))
+    assert response.status_code == 422
+    assert response.json()["detail"] == "Two events in this batch share a dedup_key"
+
+
+async def test_a_failed_batch_writes_nothing(
+    client: TestClient, ingest: Fixture, agents: dict[str, uuid.UUID], owner_database: Database
+) -> None:
+    """All-or-nothing, so a retry of the whole batch is simply correct."""
+    response = post(client, ingest, event(dedup_key="good"), event(severity="nonsense"))
+    assert response.status_code == 422
+
+    async with owner_database.session() as session:
+        count = (await session.execute(text("SELECT count(*) FROM events"))).scalar_one()
+    assert count == 0, "the valid event in the batch was not written either"
+
+
+# ------------------------------------------------------- promise 7 at runtime ---
+
+
+async def test_folding_a_workflow_trace_creates_no_dispatches(
+    client: TestClient, ingest: Fixture, agents: dict[str, uuid.UUID], owner_database: Database
+) -> None:
+    """The structural argument is in `test_reducers.py`; this is the live one.
+
+    Every event below is one the orchestrator would have written *after*
+    deciding. Folding them must reproduce what was decided and decide nothing
+    itself - no dispatch row, which is the only thing that can cause work.
+    """
+    execution = str(uuid.uuid4())
+    trace = [
+        event(
+            dedup_key="x-1",
+            type="workflow.execution_started",
+            subject={"kind": "workflow_execution", "ref": execution},
+        ),
+        event(
+            dedup_key="x-2",
+            type="workflow.step_dispatched",
+            subject={"kind": "execution_step", "ref": f"{execution}:research"},
+            correlation={"execution_ref": execution, "agent_key": "researcher"},
+        ),
+        event(
+            dedup_key="x-3",
+            type="workflow.step_succeeded",
+            subject={"kind": "execution_step", "ref": f"{execution}:research"},
+            correlation={"execution_ref": execution},
+        ),
+    ]
+    assert post(client, ingest, *trace).status_code == 202
+
+    async with owner_database.session() as session:
+        dispatches = (await session.execute(text("SELECT count(*) FROM dispatches"))).scalar_one()
+        events = (await session.execute(text("SELECT count(*) FROM events"))).scalar_one()
+    assert events == 3
+    assert dispatches == 0, "folding the log caused work"
+
+
+# ------------------------------------------------------- replay equivalence ---
+
+
+#: The two tables whose rows folding *creates* rather than updates. Their
+#: primary keys come from a sequence and `gen_random_uuid()`, so a replay
+#: necessarily mints different ones - identity is not derived state, and a
+#: test that demanded it match would be asserting that `TRUNCATE` resets a
+#: sequence rather than anything about the log. Every other table keeps its
+#: id in the comparison, because those rows are not recreated and a changed
+#: id there would be a real defect.
+APPENDED_TABLES = ("agent_status_history", "run_steps")
+
+
+async def _snapshot(database: Database) -> dict[str, list[str]]:
+    """Every derived row, as comparable strings.
+
+    Sorted rather than ordered by a key, so the comparison is about content
+    and not about insertion order - which a replay is also entitled to
+    differ on.
+    """
+    snapshot: dict[str, list[str]] = {}
+    async with database.session() as session:
+        for table in DERIVED_TABLES:
+            # A fixed literal list, not user input.
+            column = "to_jsonb(t) - 'id'" if table in APPENDED_TABLES else "to_jsonb(t)"
+            rows = (await session.execute(text(f"SELECT {column} FROM {table} t"))).scalars()
+            snapshot[table] = sorted(str(row) for row in rows)
+    return snapshot
+
+
+async def test_refolding_the_stored_log_reproduces_the_state(
+    client: TestClient, ingest: Fixture, agents: dict[str, uuid.UUID], owner_database: Database
+) -> None:
+    """Replay equivalence, against the stored rows rather than the objects sent.
+
+    This is what makes the event log worth having: the derived tables can be
+    thrown away and rebuilt. The envelopes are reconstructed from `events`, so
+    a field that was never persisted would break this and nothing else.
+    """
+    from agentworld.domain.protocol import parse_envelope
+    from agentworld.domain.reducers import fold
+    from agentworld.repositories.base import TenantScope
+    from agentworld.repositories.derived import DerivedStateRepository
+
+    stream = [
+        event(dedup_key="r-1", type="agent.registered", payload={"capabilities": ["search"]}),
+        event(
+            dedup_key="r-2",
+            type="agent.status_changed",
+            payload={"status": "working", "reason": "picked up a task"},
+        ),
+        event(
+            dedup_key="r-3",
+            type="run.started",
+            subject={"kind": "run", "ref": "run-1"},
+        ),
+        event(
+            dedup_key="r-4",
+            type="agent.paused",
+            payload={"reason": "operator"},
+        ),
+    ]
+    assert post(client, ingest, *stream).status_code == 202
+    before = await _snapshot(owner_database)
+    assert before["agent_status_history"], "the fixture should have produced history"
+
+    # Throw the derived state away - everything except the agent rows, which
+    # are configuration and were never derived from the log.
+    async with owner_database.session() as session:
+        await session.execute(text("TRUNCATE agent_status_history, run_steps, runs CASCADE"))
+        # `registered_at` is NOT NULL - it is set when the agent row is
+        # created and then moved by `agent.registered` - so it gets a
+        # sentinel rather than a null. If the replay fails to overwrite it,
+        # the comparison below sees the year 2000 and says so.
+        await session.execute(
+            text(
+                "UPDATE agents SET status = 'provisioning', status_reason = NULL, "
+                " last_event_at = NULL, last_heartbeat_at = NULL, "
+                " registered_at = '2000-01-01T00:00:00Z', "
+                " capabilities = '{}'::text[] "
+                # Only the agent the log actually talks about. Replay rebuilds
+                # what the events describe; an agent no event mentions keeps
+                # whatever it had, and resetting it here would be asking the
+                # log to restore something it never recorded.
+                "WHERE agent_key = 'researcher'"
+            )
+        )
+
+    # Replay: rebuild each envelope from its stored row and fold it again.
+    scope = TenantScope(workspace_id=ingest.workspace_id, project_id=ingest.project_id)
+    async with owner_database.session() as session:
+        rows = (
+            await session.execute(
+                text(
+                    "SELECT id, dedup_key, type, protocol_version, occurred_at, "
+                    "       subject_kind, subject_ref, correlation, severity, labels, payload "
+                    "  FROM events WHERE project_id = :p ORDER BY seq"
+                ),
+                {"p": ingest.project_id},
+            )
+        ).all()
+        derived = DerivedStateRepository(session, scope)
+
+        for row in rows:
+            envelope = parse_envelope(
+                {
+                    "dedup_key": row.dedup_key,
+                    "type": row.type,
+                    "protocol_version": row.protocol_version,
+                    "occurred_at": row.occurred_at,
+                    "subject": {"kind": row.subject_kind, "ref": row.subject_ref},
+                    "correlation": row.correlation,
+                    "severity": row.severity,
+                    "labels": row.labels,
+                    "payload": row.payload,
+                }
+            )
+            for mutation in fold(envelope):
+                await derived.apply(mutation, event_id=row.id)
+
+    after = await _snapshot(owner_database)
+    _assert_same(before, after)
+
+
+def _assert_same(before: dict[str, list[str]], after: dict[str, list[str]]) -> None:
+    """Compare snapshots and say *which column* moved.
+
+    A bare `==` on two dicts of long json strings produces a diff pytest
+    truncates, which turns a one-column regression into a bisect.
+    """
+    import ast
+
+    for table in DERIVED_TABLES:
+        old_rows, new_rows = before[table], after[table]
+        assert len(old_rows) == len(new_rows), (
+            f"{table}: replay produced {len(new_rows)} rows, not {len(old_rows)}"
+        )
+        for old_row, new_row in zip(old_rows, new_rows, strict=True):
+            old_dict = ast.literal_eval(old_row)
+            new_dict = ast.literal_eval(new_row)
+            differing = {
+                key: (old_dict.get(key), new_dict.get(key))
+                for key in old_dict.keys() | new_dict.keys()
+                if old_dict.get(key) != new_dict.get(key)
+            }
+            assert not differing, f"{table}: replay changed {differing}"
+
+
+# ------------------------------------------------------------------- limits ---
+
+
+async def test_an_empty_batch_is_refused(client: TestClient, ingest: Fixture) -> None:
+    response = client.post("/v1/ingest/events", json={"events": []}, headers=ingest.headers)
+    assert response.status_code == 422
+
+
+async def test_a_clock_set_far_in_the_future_is_refused(
+    client: TestClient, ingest: Fixture, agents: dict[str, uuid.UUID]
+) -> None:
+    """Otherwise the events sort before everything real for an hour, and a
+    cursor that has passed them never returns them."""
+    ahead = dt.datetime.now(dt.UTC) + dt.timedelta(hours=1)
+    response = post(client, ingest, event(occurred_at=ahead.isoformat()))
+    assert response.status_code == 422
+    assert "clock" in response.json()["detail"]
+
+
+async def test_a_clock_running_behind_is_accepted(
+    client: TestClient, ingest: Fixture, agents: dict[str, uuid.UUID]
+) -> None:
+    """Being late is normal: an event takes time to arrive."""
+    behind = dt.datetime.now(dt.UTC) - dt.timedelta(days=2)
+    assert post(client, ingest, event(occurred_at=behind.isoformat())).status_code == 202
+
+
+async def test_a_malformed_event_names_its_position_in_the_batch(
+    client: TestClient, ingest: Fixture, agents: dict[str, uuid.UUID]
+) -> None:
+    """An integrator sending 500 events needs to know which one."""
+    response = post(client, ingest, event(), event(occurred_at="not a date"))
+    assert response.status_code == 422
+    assert response.json().get("index") == 1
+
+
+# -------------------------------------------------------------- the key plane ---
+
+
+async def test_a_control_token_cannot_ingest(
+    client: TestClient, ingest: Fixture, actor: Actor
+) -> None:
+    assert post_with(client, actor.headers, event()).status_code == 401
+
+
+def post_with(client: TestClient, headers: dict[str, str], *events: dict[str, Any]) -> Any:
+    return client.post("/v1/ingest/events", json={"events": list(events)}, headers=headers)
+
+
+async def test_a_key_may_not_speak_for_an_agent_outside_its_allowlist(
+    client: TestClient, actor: Actor, owner_database: Database
+) -> None:
+    """A key leaked from one worker must not become any other worker."""
+    restricted = Fixture(client, actor, agent_key_allowlist=["researcher"])
+    async with owner_database.session() as session:
+        for agent_key in ("researcher", "writer"):
+            await session.execute(
+                text(
+                    "INSERT INTO agents (id, workspace_id, project_id, agent_key, "
+                    " interaction_mode, display_name) "
+                    "VALUES (:i, :w, :p, :key, 'managed', :name)"
+                ),
+                {
+                    "i": uuid.uuid4(),
+                    "w": restricted.workspace_id,
+                    "p": restricted.project_id,
+                    "key": agent_key,
+                    "name": agent_key.title(),
+                },
+            )
+
+    assert (
+        post(client, restricted, event(subject={"kind": "agent", "ref": "researcher"})).status_code
+        == 202
+    )
+
+    denied = post(client, restricted, event(subject={"kind": "agent", "ref": "writer"}))
+    assert denied.status_code == 403
+    assert "writer" in denied.json()["detail"]
+
+
+async def test_events_land_in_the_keys_own_project(
+    client: TestClient,
+    actor: Actor,
+    make_actor: Any,
+    ingest: Fixture,
+    agents: dict[str, uuid.UUID],
+    owner_database: Database,
+) -> None:
+    """The project comes from the key, never from the request body.
+
+    So there is no field for a caller to set to someone else's project -
+    which is the shape that makes the whole plane safe to hand out.
+    """
+    assert post(client, ingest, event(project_id=str(uuid.uuid4()))).status_code == 202
+
+    async with owner_database.session() as session:
+        project_id = (await session.execute(text("SELECT project_id FROM events"))).scalar_one()
+    assert project_id == ingest.project_id
+
+
+# ------------------------------------------------------- heartbeat, logs, metrics ---
+
+
+async def test_heartbeat_moves_the_agents_clock(
+    client: TestClient, ingest: Fixture, agents: dict[str, uuid.UUID], owner_database: Database
+) -> None:
+    response = client.post(
+        "/v1/ingest/heartbeat", json={"agent_key": "researcher"}, headers=ingest.headers
+    )
+    assert response.status_code == 202
+    assert response.json()["accepted"] == 1
+
+    async with owner_database.session() as session:
+        beat = (
+            await session.execute(
+                text("SELECT last_heartbeat_at FROM agents WHERE agent_key = 'researcher'")
+            )
+        ).scalar_one()
+    assert beat is not None
+
+
+async def test_two_heartbeats_in_one_second_are_one_fact(
+    client: TestClient, ingest: Fixture, agents: dict[str, uuid.UUID]
+) -> None:
+    body = {"agent_key": "researcher"}
+    first = client.post("/v1/ingest/heartbeat", json=body, headers=ingest.headers).json()
+    second = client.post("/v1/ingest/heartbeat", json=body, headers=ingest.headers).json()
+    assert first["accepted"] == 1
+    assert second["duplicates"] == 1, "a retry within the second is not a second heartbeat"
+
+
+async def test_logs_are_stored_and_change_no_state(
+    client: TestClient, ingest: Fixture, agents: dict[str, uuid.UUID], owner_database: Database
+) -> None:
+    response = client.post(
+        "/v1/ingest/logs",
+        json={
+            "agent_key": "researcher",
+            "lines": [
+                {
+                    "message": "searching for competitors",
+                    "occurred_at": dt.datetime.now(dt.UTC).isoformat(),
+                    "severity": "info",
+                },
+                {
+                    "message": "rate limited, backing off",
+                    "occurred_at": dt.datetime.now(dt.UTC).isoformat(),
+                    "severity": "warning",
+                },
+            ],
+        },
+        headers=ingest.headers,
+    )
+    assert response.status_code == 202
+    assert response.json() == {"accepted": 2}
+
+    async with owner_database.session() as session:
+        stored = (await session.execute(text("SELECT count(*), count(agent_id) FROM logs"))).one()
+        events = (await session.execute(text("SELECT count(*) FROM events"))).scalar_one()
+    assert stored == (2, 2), "both lines stored, both correlated to the agent"
+    assert events == 0, "a log line is output, not an event"
+
+
+async def test_metrics_are_stored(
+    client: TestClient, ingest: Fixture, agents: dict[str, uuid.UUID], owner_database: Database
+) -> None:
+    response = client.post(
+        "/v1/ingest/metrics",
+        json={
+            "agent_key": "researcher",
+            "samples": [
+                {
+                    "name": "tokens_used",
+                    "value": 8421,
+                    "unit": "tokens",
+                    "occurred_at": dt.datetime.now(dt.UTC).isoformat(),
+                    "labels": {"model": "sonnet"},
+                }
+            ],
+        },
+        headers=ingest.headers,
+    )
+    assert response.status_code == 202
+
+    async with owner_database.session() as session:
+        value, unit = (await session.execute(text("SELECT value, unit FROM metric_samples"))).one()
+    assert (value, unit) == (8421.0, "tokens")
+
+
+# ---------------------------------------------------------------------- RLS ---
+
+
+async def test_one_projects_events_are_invisible_to_another_tenant(
+    client: TestClient, ingest: Fixture, agents: dict[str, uuid.UUID], database: Database
+) -> None:
+    assert post(client, ingest, event(dedup_key="private")).status_code == 202
+
+    async with database.session(visible_workspaces=[uuid.uuid4()]) as session:
+        count = (await session.execute(text("SELECT count(*) FROM events"))).scalar_one()
+    assert count == 0
+
+    async with database.session(visible_workspaces=[ingest.workspace_id]) as session:
+        count = (await session.execute(text("SELECT count(*) FROM events"))).scalar_one()
+    assert count == 1

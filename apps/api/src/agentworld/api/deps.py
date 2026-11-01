@@ -30,6 +30,7 @@ from agentworld.services.api_keys import CHALLENGE as KEY_CHALLENGE
 from agentworld.services.api_keys import ApiKeyService
 from agentworld.services.context import CallContext
 from agentworld.services.identity import IdentityService, resolve_principal
+from agentworld.services.ingest import IngestService
 from agentworld.services.projects import ProjectService
 from agentworld.services.workspaces import WorkspaceService
 from agentworld.settings import Settings
@@ -206,6 +207,20 @@ def get_project_service(factory: FactoryDep) -> ProjectService:
     return ProjectService(factory)
 
 
+def get_ingest_service(factory: FactoryDep, settings: SettingsDep) -> IngestService:
+    """The batch limits are settings, because they are an operator's call.
+
+    A fleet of chatty agents and a handful of careful ones want different
+    numbers, and both are reasonable. What is not reasonable is an unbounded
+    batch, which is why there is no "0 means unlimited".
+    """
+    return IngestService(
+        factory,
+        max_batch_events=settings.ingest_max_batch_events,
+        max_future_skew_seconds=settings.ingest_max_future_skew_seconds,
+    )
+
+
 def get_api_key_service(factory: FactoryDep, settings: SettingsDep) -> ApiKeyService:
     return ApiKeyService(factory, pepper=settings.api_key_pepper, environment=settings.environment)
 
@@ -214,3 +229,4 @@ IdentityServiceDep = Annotated[IdentityService, Depends(get_identity_service)]
 WorkspaceServiceDep = Annotated[WorkspaceService, Depends(get_workspace_service)]
 ProjectServiceDep = Annotated[ProjectService, Depends(get_project_service)]
 ApiKeyServiceDep = Annotated[ApiKeyService, Depends(get_api_key_service)]
+IngestServiceDep = Annotated[IngestService, Depends(get_ingest_service)]

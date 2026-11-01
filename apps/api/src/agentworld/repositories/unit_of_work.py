@@ -28,6 +28,8 @@ from agentworld.infra.db import Database
 from agentworld.repositories.api_keys import ApiKeyRepository, ApiKeyUnscopedRepository
 from agentworld.repositories.audit import AuditLogRepository
 from agentworld.repositories.base import TenantScope
+from agentworld.repositories.derived import DerivedStateRepository
+from agentworld.repositories.events import EventRepository, TelemetryRepository
 from agentworld.repositories.projects import ProjectLookupRepository, ProjectRepository
 from agentworld.repositories.users import (
     MemberListRepository,
@@ -95,6 +97,18 @@ class UnitOfWork:
 
     def audit(self, scope: TenantScope) -> AuditLogRepository:
         return AuditLogRepository(self._session, scope)
+
+    def events(self, scope: TenantScope) -> EventRepository:
+        """Appending events. Needs `scope.project_id`, and says so."""
+        return EventRepository(self._session, scope)
+
+    def telemetry(self, scope: TenantScope) -> TelemetryRepository:
+        """Logs and metric samples, which are not events - see its docstring."""
+        return TelemetryRepository(self._session, scope)
+
+    def derived(self, scope: TenantScope) -> DerivedStateRepository:
+        """The tables a folded event may change - and no others."""
+        return DerivedStateRepository(self._session, scope)
 
 
 class UnitOfWorkFactory:

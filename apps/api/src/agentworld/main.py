@@ -22,7 +22,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from agentworld.api.errors import register_error_handlers
 from agentworld.api.health import router as health_router
 from agentworld.api.middleware import RequestContextMiddleware
-from agentworld.api.v1 import api_keys, me, projects, self_, workspaces
+from agentworld.api.v1 import api_keys, ingest, me, projects, self_, workspaces
 from agentworld.api.v1.meta import API_VERSION
 from agentworld.api.v1.meta import router as meta_router
 from agentworld.infra.auth.provider import AuthProvider
@@ -131,6 +131,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(api_keys.workspace_router)
     app.include_router(api_keys.router)
     app.include_router(self_.router)
+    app.include_router(ingest.router)
 
     return app
 

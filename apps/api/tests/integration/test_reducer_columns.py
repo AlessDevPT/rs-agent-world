@@ -13,6 +13,7 @@ still writes, which is the direction that will actually happen.
 from __future__ import annotations
 
 import datetime as dt
+from decimal import Decimal
 from typing import Any
 
 import pytest
@@ -167,3 +168,64 @@ async def test_the_reducers_leave_the_repository_owned_fields_alone(
         )
     }
     assert written & REPOSITORY_OWNED == set()
+
+
+#: What a Python value may be, per PostgreSQL type. `jsonb` takes anything
+#: JSON-shaped, which is why it is absent: there is nothing to check.
+COMPATIBLE: dict[str, tuple[type, ...]] = {
+    "ARRAY": (list, tuple),
+    "timestamp with time zone": (dt.datetime,),
+    "integer": (int,),
+    "bigint": (int,),
+    "smallint": (int,),
+    "double precision": (int, float),
+    "numeric": (int, float, Decimal),
+    "text": (str,),
+    "boolean": (bool,),
+    "USER-DEFINED": (str,),  # a native enum, and every one of ours is a StrEnum
+}
+
+
+async def test_every_value_a_reducer_writes_fits_its_column(
+    owner_database: Database,
+) -> None:
+    """Names are not enough, which a real bug proved.
+
+    `agents.capabilities` is `text[]` while `labels` and `runtime` are
+    `jsonb`, and a reducer that treated all three alike would have written an
+    object into an array column - failing the whole ingest transaction with a
+    type error rather than ignoring one malformed field. The name-only check
+    above passed it happily.
+    """
+    async with owner_database.session() as session:
+        types = {
+            f"{table}.{column}": data_type
+            for table, column, data_type in (
+                await session.execute(
+                    text(
+                        "SELECT table_name, column_name, data_type "
+                        "  FROM information_schema.columns "
+                        " WHERE table_schema = 'public' AND table_name = ANY (:tables)"
+                    ),
+                    {"tables": [member.value for member in MutationTarget]},
+                )
+            ).all()
+        }
+
+    offenders: list[str] = []
+    for event_type, mutation in _fold_everything():
+        written = mutation.deltas if isinstance(mutation, Increment) else mutation.fields
+        for field, value in written.items():
+            qualified = f"{mutation.target.value}.{field}"
+            allowed = COMPATIBLE.get(types[qualified])
+            # None (clearing a column) and jsonb (takes anything) both pass.
+            if allowed is None or value is None:
+                continue
+            if not isinstance(value, allowed):
+                offenders.append(
+                    f"{event_type} -> {qualified} is {types[qualified]}, got {type(value).__name__}"
+                )
+
+    assert offenders == [], "a reducer writes a value its column cannot hold: " + ", ".join(
+        offenders
+    )

@@ -1473,6 +1473,34 @@ class MetricSample(Base):
     )
 
 
+class ProjectEventCursor(Base):
+    """Where a project's next `events.seq` comes from.
+
+    One row per project, locked `FOR UPDATE` while an event is appended, which
+    serialises a project's ingest and is what makes the cursor gapless and
+    ordered. Migration 0015 has the reasoning and the cost.
+    """
+
+    __tablename__ = "project_event_cursors"
+
+    workspace_id: Mapped[UUID] = mapped_column(sa.Uuid, nullable=False)
+    project_id: Mapped[UUID] = mapped_column(sa.Uuid, primary_key=True)
+    #: The number the *next* event gets, so it starts at 1.
+    next_seq: Mapped[int] = mapped_column(sa.BigInteger, nullable=False, server_default="1")
+    updated_at: Mapped[dt.datetime] = _created_at()
+
+    __table_args__ = (
+        _project_fk("project_event_cursors"),
+        sa.ForeignKeyConstraint(
+            ["workspace_id"],
+            ["workspaces.id"],
+            name="project_event_cursors_workspace_id_fkey",
+            ondelete="CASCADE",
+        ),
+        sa.CheckConstraint("next_seq > 0", name="next_seq_is_positive"),
+    )
+
+
 # ---------------------------------------------------- Phase 2: presentation ---
 #
 # Where a building sits, how big it is, what it looks like, how a road is
@@ -1704,6 +1732,8 @@ RLS_PROTECTED_TABLES: tuple[str, ...] = (
     "world_districts",
     "world_nodes",
     "world_routes",
+    # 0015
+    "project_event_cursors",
 )
 
 #: Monthly partitions are named `<table>_y2026m11`, created by
