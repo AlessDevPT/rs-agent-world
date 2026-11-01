@@ -1,10 +1,13 @@
 # Gap analysis: monitoring platform → ecosystem builder
 
-> Proposal, 2026-11-01. Nothing here is implemented. On approval these documents are
-> merged into `docs/01`–`05`, which still describe the previous product direction and
-> remain the contract the code was written against until then.
+> Proposal, 2026-11-01, revised after the refinement brief. Nothing here is implemented.
+> On approval these documents are merged into `docs/01`–`05`, which still describe the
+> previous product direction and remain the contract the code was written against until
+> then.
 
 Deliverables 1–3 of the revision brief: what exists, what survives, what has to change.
+The decision list in §4 now runs to C14; C12–C14 came from the refinement brief and are
+marked.
 
 ## 1. What the repository actually contains
 
@@ -171,7 +174,7 @@ for nothing. Listed because "preserve good architectural decisions" needs to nam
 | K15 | Provider SDKs forbidden in `domain/`, enforced by import-linter | **Non-negotiable now that AgentWorld calls providers.** Extended in `03-API-AND-FRONTEND.md` §2 |
 | K16 | Adapters translate payloads and never touch persistence | Unchanged |
 | K17 | The island is a projection; `project()` is pure and Phaser-free | **Kept, and extended rather than replaced.** See `03-API-AND-FRONTEND.md` §5 |
-| K18 | Presentation tables touched by no reducer, no adapter, no SDK | Unchanged; the table's key widens |
+| K18 | Presentation tables touched by no reducer, adapter or SDK | **Unchanged, and strengthened.** Two tables become four, none holding execution state (C12) |
 | K19 | RFC 9457 problem details everywhere, request id in logs, audit and `instance` | Unchanged |
 | K20 | Cursor pagination; no offsets on a moving stream | Unchanged |
 | K21 | Protocol compatibility promises 1–6, including "a headless integration never opening the web app stays fully functional" | **Unchanged and now harder-won.** Promise 6 is what stops the builder becoming mandatory |
@@ -334,18 +337,83 @@ is a frontend concern and not a second API.
 
 **Cost to built code:** the Phase 1 web app is the shell this sits inside. Additive.
 
-### C11 — The roadmap reorders from horizontal to vertical
+### C11 — The roadmap reorders into three parallel tracks
 
 **Now:** all protocol, then all control plane, then all realtime, then UI, then island.
 Nothing demonstrable until Phase 6.
 
-**Change:** foundations, then one narrow end-to-end thread that actually runs, then widen.
+**Change:** a foundation track, a visual track and a builder track running in parallel,
+with early prototypes of both differentiators and a full end-to-end demonstration at the
+end of Phase 4 — about week eight.
 
 **Why:** the product's claim is "agents collaborate and produce a result". A horizontal
-build cannot show that until almost everything exists, and cannot discover that the
-orchestration model is wrong until it is expensive to change.
+build cannot show that until almost everything exists, cannot discover that the
+orchestration model is wrong until it is expensive to change, and — as the refinement
+brief puts it — spends months on backend infrastructure without testing the actual user
+experience.
 
-**Cost to built code:** none. Set out in `04-ROADMAP-AND-MVP.md`.
+**Cost:** roughly four weeks of calendar time, accounted for line by line in
+`04-ROADMAP-AND-MVP.md` §1. **Cost to built code:** none.
+
+### C12 — Visual state becomes its own persisted model  *(refinement brief, item 6)*
+
+**Now:** `world_placements`, keyed on `agent_id`, holding a tile and a sprite choice.
+
+**Change:** four tables — `world_layouts`, `world_districts`, `world_nodes`,
+`world_routes` — holding position, size, appearance, grouping and visual routing for every
+kind of object, and **no column that mirrors execution state**.
+
+**Why:** two concrete failures. If position lived on `agents`, dragging a building would be
+a domain write needing the permission that edits an agent and appearing in the audit trail
+as a configuration change. And if a node's existence were derived from execution state, the
+island would empty itself exactly when something went wrong — whereas a shuttered building
+is the information the user needs.
+
+A district also stops being a project. The original proposal mapped the brief's "projects or
+districts" onto `projects` alone; a district is now a visual region *within* one project's
+island, so an ecosystem can be grouped visually without creating a second tenancy boundary.
+
+**Cost to built code:** none — the table does not exist yet. It widens
+`docs/02-DATABASE.md` §6 from two tables to four.
+
+### C13 — Both differentiators get early prototypes on final architecture  *(items 1, 2, 7)*
+
+**Now:** island at Phase 8, conversational builder at Phase 9.
+
+**Change:** an island prototype at Phases 3–4 rendering real backend objects, and a
+capability-limited builder prototype at Phase 4, both on the architecture the complete
+versions use. The complete versions stay late.
+
+**Why:** they are the product's differentiators and the plan must not leave them untested
+until week twenty. The constraint that makes this safe rather than wasteful is that neither
+prototype gets its own architecture: the island is built on the real
+`projector` / `interpreter` / `dispatch` split from its first commit and never has a mock
+data path, and the builder uses the final plan schema with a `BuilderCapability` enum
+restricting only *which object kinds* it may propose. Phase 10's acceptance criteria
+include the Phase 4 builder tests passing unmodified.
+
+**Cost to built code:** none. Costs calendar time, accounted for in
+`04-ROADMAP-AND-MVP.md` §1.
+
+### C14 — A permission matrix, not a count  *(item 5)*
+
+**Now:** this document's first draft said "approximately 45 new authorization rules".
+
+**Change:** a worked matrix of 57 new actions (72 total) with scope, required role and a
+sensitivity flag per action — plus, more usefully, the nine actions that deliberately **do
+not exist**, the three whose required role is conditional, and the five that are `admin`
+rather than `member` with the reason for each. In `05-PERMISSIONS.md`.
+
+**Why:** the count went *up* because least privilege means splitting actions rather than
+merging them. `integration.read` is a `member`; `integration.read_config`, which exposes
+endpoints and scopes, is an `admin`. And the matrix surfaced one genuine vulnerability that
+a flat list would have hidden: `agents.dispatch.url` is a URL AgentWorld makes outbound
+requests to, which is a server-side request forgery vector, so `agent.configure` is `admin`
+and the URL is checked against a deny-list at request time rather than only at save time.
+
+**Cost to built code:** additive rows in the existing `MINIMUM_ROLE` table. The two Phase 1
+tests that keep it honest — `test_every_action_has_a_minimum_role` and
+`test_the_matrix_covers_every_mutating_route` — generalise without modification.
 
 ## 5. Two decisions this revision deliberately does *not* make
 

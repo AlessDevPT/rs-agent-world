@@ -1,435 +1,632 @@
-# Revised roadmap, MVP and deferrals
+# Revised roadmap, milestones, MVP and deferrals
 
-> Proposal, 2026-11-01. Deliverables 10 and 11.
+> Proposal, 2026-11-01, revised after the refinement brief. Deliverables 10 and 11 of the
+> original brief; deliverables 1–8 of the refinement.
 
-## 1. Why the ordering changes
+## 1. What changed in this revision, and what it costs
 
-The previous roadmap was **horizontal**: all of the protocol, then all of the control
-plane, then all of realtime, then the UI, then the island. For an observability product
-that was right — the protocol was the product, and the dashboard was a view of it.
+The first version of this roadmap was **sequential**: foundations, then a thin execution
+slice, then widen, with the island at Phase 8 and the conversational builder at Phase 9.
+Its defence was that both are *writers* or *projections* of the domain model, and building
+either before the model settles means building it twice.
 
-For this product it fails in two ways. Nothing is demonstrable until Phase 6, so the
-first time anyone sees whether agents collaborating is any good is after most of the
-budget. And the orchestration model — the part most likely to be wrong — is not exercised
-until everything is built around it.
+That reasoning holds, and it is not the whole picture. Both are also the product's
+differentiators, and a plan where nobody touches either until week 20 validates the
+backend while leaving the actual user experience untested. The refinement brief is right
+about that.
 
-So the revision goes **vertical**: foundations that cannot be avoided, then one narrow
-thread that actually runs end to end, then widen it.
+So the roadmap now runs **three tracks in parallel**, with early prototypes of both
+differentiators:
 
-One ordering principle from the previous roadmap is kept, because it is still correct:
+| Track | What | Where it appears |
+|-------|------|------------------|
+| **A — Foundation** | model, protocol, orchestration, execution, security | Phases 2–7, 11 |
+| **B — Visual** | workspace pages and the island | island I1 at Phase 3, I2 at Phase 4, full at 8–9 |
+| **C — Builder** | conversational ecosystem creation | prototype at Phase 4, complete at Phase 10 |
 
-> The protocol and the execution core are built and proved **before** anything visual.
-> That is the only ordering under which "the island is a projection" can be verified
-> rather than hoped for.
+### The trade-off, stated plainly
 
-The island therefore remains late (Phase 8), and by then the whole product works through
-`curl`. The conversational builder is later still (Phase 9), because it *writes* the domain
-model and building it before the model settles means building it twice.
+**Cost: roughly four weeks.** 24–30 weeks to the MVP, against 20–26 for the sequential
+plan. The extra is real and breaks down as:
 
-| Phase | Theme | Est. | Demonstrable outcome |
-|-------|-------|------|---------------------|
-| 0 ✅ | Foundations | done | skeleton, boundaries enforced |
-| 1 ✅ | Tenancy and auth | done | sign in, workspace, project, API key |
-| 2 | Domain model and protocol | 1.5–2 w | the whole ecosystem exists as data; replay is proved |
-| 3 | **The vertical slice** | 2–3 w | **one managed agent runs one step, triggered by hand** |
-| 4 | Real workflows | 2–3 w | multi-step, parallel, conditions, retries, timeouts |
-| 5 | Approvals, tools, integrations | 2–3 w | a gated Slack post through MCP; credentials encrypted |
-| 6 | External agents and triggers | 1.5–2 w | a Python worker outside AgentWorld does a step; 07:00 schedule fires |
-| 7 | The workspace | 2.5–3 w | the whole product usable in a browser, no island |
-| 8 | The island | 3–4 w | Build Mode creates, Live Mode watches |
-| 9 | The conversational builder | 2–3 w | one sentence becomes a working ecosystem |
-| 10 | Hardening and launch | 2–3 w | load-tested, secured, documented, deployed |
+| Source | Cost | Why it is not avoidable |
+|--------|------|------------------------|
+| The island is touched twice | +1.5 w | The prototype is built on the final `projector` / `interpreter` / `dispatch` split, so none of it is thrown away — but Phase 9 still needs most of its budget for animation, interventions and performance |
+| The builder is touched twice | +1 w | Phase 10 adds capabilities to an enum and tool definitions to a prompt. The plan schema, the propose/apply split and the permission model are final from Phase 4, so the rework is narrow but not zero |
+| Minimal web pages needed early | +1 w | The island at I1 opens the real agent form, so a Simple-mode agent form exists in Phase 3 instead of Phase 8. Phase 8 then refines rather than creates |
+| Parallel-track context switching | +0.5 w | One developer alternating between Postgres and Phaser in a week pays a real tax |
 
-Roughly 20–26 weeks to v1. **MVP is reached at the end of Phase 9**; Phases 7–9 are what
-make it usable by the brief's intended audience.
+**Gain: a demonstrable product at about week 8 instead of week 20.** The user-facing
+interaction model is validated before fifteen more weeks are spent behind it, and the
+builder's assumptions about the domain model are tested while the model is still cheap to
+change. Three specific risks move from "discovered late" to "discovered early":
+
+- whether a beginner can understand an ecosystem spatially at all,
+- whether the domain model is shaped the way a natural-language request decomposes,
+- whether the island and the plain pages can stay in sync as two views of one model.
+
+Two things were considered and **rejected**:
+
+- **Starting the island before the domain model (Phase 2).** There would be nothing real to
+  render, so it would be built against a mock and then rebuilt. The prototype is worth
+  shipping early precisely *because* it renders real backend objects; a mocked island
+  validates nothing.
+- **Pulling the complete builder forward.** It writes workflows, integrations, triggers,
+  knowledge and grants. Those do not exist until Phase 7, so it would be written against a
+  model that changes under it — which is the original objection, still correct.
+
+One ordering principle from the first version survives unchanged, because the refinement
+brief does not contradict it and it is what keeps the island honest:
+
+> The island renders **real backend objects from the first commit of it**. There is no
+> phase in which it has its own state, its own mock, or its own source of truth.
+
+## 2. Phases
+
+| Phase | Theme | Track | Est. | Milestone |
+|-------|-------|-------|------|-----------|
+| 0 ✅ | Foundations | A | done | |
+| 1 ✅ | Tenancy and auth | A | done | **M0** |
+| 2 | Core model and protocol | A | 2–2.5 w | |
+| 3 | Execution core + island skeleton | A, B | 3 w | |
+| 4 | **The vertical slice** | A, B, C | 3 w | **M1** |
+| 5 | Real workflows | A | 2.5 w | |
+| 6 | Approvals, tools, integrations | A | 3 w | **M2** |
+| 7 | External agents and triggers | A | 2 w | **M3** |
+| 8 | Full workspace | B | 2.5–3 w | |
+| 9 | Full island | B | 3 w | **M4** |
+| 10 | Complete builder | C | 2.5 w | **M5 — MVP** |
+| 11 | Hardening and launch | — | 2.5 w | **M6** |
 
 ---
 
-## Phase 2 — Domain model and protocol
+### Phase 2 — Core model and protocol  *(Track A, 2–2.5 w)*
 
-The unavoidable foundation. No execution yet; this phase makes the ecosystem *expressible*
-and proves the event pipeline honest.
+Makes the ecosystem expressible and proves the event pipeline honest. No execution yet.
 
 **Build**
-- Migrations `0006`–`0010`: agents (with `interaction_mode`), model_profiles, workflows,
-  workflow_versions, workflow_steps, workflow_edges, connections, tools, integrations,
-  credentials, knowledge_sources, knowledge_documents, triggers, workflow_executions,
-  execution_steps, approvals, dispatches, tasks, runs, run_steps, agent_status_history,
-  and the partitioned `events` / `logs` / `metric_samples` with the maintenance function.
-- Every new tenant table into `RLS_PROTECTED_TABLES`; `events`/`logs` granted
+- Migrations `0006`–`0010`: `credentials`, `model_profiles`, `agents`, `connections`,
+  `workflows`, `workflow_versions`, `workflow_steps`, `workflow_edges`,
+  `workflow_executions`, `execution_steps`, `dispatches`, `tasks`, `runs`, `run_steps`,
+  `agent_status_history`, partitioned `events` / `logs` / `metric_samples`, and the four
+  presentation tables.
+  *Deferred to their own phases:* `tools`, `integrations`, `knowledge_*`, `triggers`,
+  `approvals`.
+- Every new tenant table into `RLS_PROTECTED_TABLES`; `events` and `logs` granted
   `SELECT, INSERT` only, as `audit_log` already is.
 - `domain/protocol/envelope.py` + `types.py`: `subject`, `correlation`, the full registry.
-- Reducers for `agent.*`, `task.*`, `run.*`, `tool.*`, `workflow.*`, `approval.*`.
+- Reducers for `agent.*`, `task.*`, `run.*`, `tool.*`, `workflow.*`.
 - `services/ingest.py`: validate → resolve refs → dedupe → append → fold → publish, with
-  per-project `seq` allocated inside the transaction.
-- `POST /v1/ingest/events` with partial success; `/heartbeat`, `/logs`, `/metrics`.
-- CRUD for every definition object, with `authorize()` rows and audit rows.
-- `POST /v1/workflows/{id}/validate` and `domain/orchestration/validate.py`.
+  per-project `seq` inside the transaction.
+- `POST /v1/ingest/events`, `/heartbeat`, `/logs`, `/metrics`.
+- Definition CRUD: agents, model profiles, connections, workflows and drafts.
+- `domain/orchestration/validate.py` and `POST /v1/workflows/{id}/validate`.
 - `domain/expressions/` — the evaluator, fuzzed.
+- The permission matrix rows for everything above (`05-PERMISSIONS.md`).
 
-**Tests** — this is where the budget goes, as before.
-- Reducer unit tests, table-driven, one case per event type including stale and
-  out-of-order.
-- **Replay equivalence**: ingest a recorded stream, snapshot state, truncate current-state
-  tables, replay, assert byte-identical.
-- **Promise 7**: replay with the dispatch workers running; assert **zero** `dispatches`
-  rows are created. The test that makes orchestration safe to add in Phase 3.
-- Idempotency: the same batch three times yields one event per `dedup_key`.
-- Validation: every finding code has a test producing it, including `observed_agent_assigned`,
-  `tool_not_granted`, `cycle` and `unreachable_step`.
-- Expression evaluator: no attribute escape, no unbounded recursion, no I/O.
-- Tenant isolation extended to every new endpoint — the existing conformance test, widened.
-- Schema drift and enum drift against a freshly migrated database.
+**Acceptance criteria**
+- [ ] An ecosystem — two agents, a connection, a draft workflow — is created through the
+      API, and `GET` returns it.
+- [ ] `validate` produces every documented finding code, each with a test, including
+      `observed_agent_assigned`, `tool_not_granted`, `cycle` and `unreachable_step`.
+- [ ] **Replay equivalence:** ingest a recorded stream, snapshot state, truncate
+      current-state tables, replay, assert byte-identical.
+- [ ] **Protocol promise 7:** the same replay with dispatch workers running creates
+      **zero** `dispatches` rows.
+- [ ] The same batch ingested three times yields one event per `dedup_key`.
+- [ ] Reducer table-driven tests pass for every event type, including stale and
+      out-of-order delivery.
+- [ ] The expression evaluator resists attribute escape, unbounded recursion and I/O.
+- [ ] Tenant isolation: every new endpoint returns 404 for a foreign id, and the owner
+      succeeds on the same call. The coverage guard fails if a route is missing from the
+      table.
+- [ ] Schema and enum drift tests pass against a freshly migrated database.
+- [ ] The presentation tables have no execution-state columns (the forbidden-name test).
 
-**Done when** an ecosystem — agents, a workflow, connections, a trigger — can be created
-through the API, `validate` explains exactly why an unrunnable one will not run, and replay
-reproduces state while causing nothing.
-
-**Affects Phase 0/1:** additively. New enums, ~45 new `Action` members, new tables in
-`RLS_PROTECTED_TABLES`, one `ALTER TYPE agent_status ADD VALUE 'paused'`. No existing code
-changes behaviour.
+**Affects Phase 0/1:** additively. New enums, new `Action` rows, new tables in
+`RLS_PROTECTED_TABLES`, one `ALTER TYPE agent_status ADD VALUE 'paused'`. No existing
+behaviour changes.
 
 ---
 
-## Phase 3 — The vertical slice
+### Phase 3 — Execution core + island skeleton  *(Tracks A and B, 3 w)*
 
-The most important phase in this roadmap. One managed agent, one single-step workflow, run
-by hand, with a real LLM call. Deliberately narrow: no parallelism, no conditions, no
-approvals, no tools, no UI beyond what proves it worked.
+The first phase where something runs, and the first where something is visible.
 
-**Build**
-- `infra/providers/`: `base.py` Protocol, `anthropic.py`, registry. One provider.
-- `infra/secrets/`: `SecretStore`, envelope encryption, `CREDENTIAL_MASTER_KEY` required
-  outside local and test.
+**Build — Track A**
+- `infra/secrets/`: `SecretStore`, envelope encryption, AAD binding, KEK map and rotation;
+  `Settings` fails fast without `CREDENTIAL_KEKS` outside local and test.
+- `infra/providers/`: `base.py` Protocol, `anthropic.py`, registry. **The
+  OpenAI-compatible implementation is the last task of this phase**, written specifically
+  to prove the Protocol is not shaped around one vendor while the first one is still fresh.
 - `domain/orchestration/advance.py` + `decisions.py` — the pure decision function.
 - `services/executions.py` — apply decisions in one transaction: event + state + outbox.
-- `workers/step_runner.py` — claim a `managed_agent_turn`, call the provider, emit the run
-  trace, report `workflow.step_succeeded`.
-- `workers/dispatch_reaper.py` — leases, backoff, dead-lettering.
+- `workers/step_runner.py`, `workers/dispatch_reaper.py`.
 - `POST /v1/workflows/{id}/run`, `GET /v1/executions/{id}`.
-- The two new import-linter contracts from `03-API-AND-FRONTEND.md` §2, each verified by
-  planting a violation.
+- `infra/event_bus.py` + the WebSocket gateway: snapshot, deltas, cursors, `resume`,
+  `resync_required`.
+- The two new import-linter contracts, each verified by planting a violation.
 
-**Tests**
-- `advance()` unit tests with no database: ready-step selection, idempotency under repeated
-  calls, terminal detection.
-- Outbox: a double `advance` produces one dispatch (constraint violation, not two calls).
-- Crash recovery: kill the worker mid-dispatch; the lease expires and the step completes.
-- Provider failure: 429 then success — one step, two attempts, one output.
-- A recorded execution replayed produces identical state and zero dispatches.
+**Build — Track B: island milestone I1**
+- `world/types.ts`, `projector/projectBuild` + `projectLive`, `interpreter/`, `dispatch/`,
+  `phaser/`, `bridge/` — the final architecture, minimal content.
+- Static isometric grid, one sprite per `building_kind`, agents placed from `world_nodes`.
+- Click to select → inspector panel → **the real agent form in Simple mode**.
+- Status rendered from live WebSocket deltas.
+- Build / Live toggle, distinct from the start: Build allows select; Live is read-only.
+- Minimal pages: agent list and form, execution detail.
 
-**Done when** `POST /v1/workflows/{id}/run` on a one-step workflow calls Anthropic, writes
-a run trace, completes the execution, and `GET /v1/executions/{id}` shows it — all through
-`curl`, with no frontend.
-
-**Affects Phase 0/1:** `Settings` gains `CREDENTIAL_MASTER_KEY` with the same fail-fast
-validator `API_KEY_PEPPER` has. Nothing else.
+**Acceptance criteria**
+- [ ] `POST /v1/workflows/{id}/run` on a one-step workflow calls a real provider, writes a
+      run trace, and completes — through `curl`, with no frontend.
+- [ ] `advance()` unit tests pass with no database and no network; called twice on identical
+      state it returns identical decisions.
+- [ ] A double `advance` produces **one** dispatch; the loser hits the unique constraint.
+- [ ] A worker killed mid-dispatch: the lease expires and the step completes exactly once.
+- [ ] A 429 then success: one step, two attempts, one output.
+- [ ] A credential row copied into another workspace at the SQL level cannot be decrypted.
+- [ ] KEK rotation re-wraps every DEK with no plaintext access and no `ciphertext` change.
+- [ ] **The island displays real agents** from the backend, with their real statuses, and
+      opens the real configuration form. No mock data path exists in the codebase.
+- [ ] An agent going `offline` stays visible and renders shuttered.
+- [ ] Deleting `world/phaser/` leaves the backend suite and the non-world web suite green.
+- [ ] Planting `import anthropic` in `services/` fails the new import contract.
 
 ---
 
-## Phase 4 — Real workflows
+### Phase 4 — The vertical slice  *(Tracks A, B and C, 3 w)* → **M1**
+
+The milestone the refinement brief asks for. Everything here is narrow in each dimension
+and complete end to end.
+
+**Build — Track A**
+- Multi-step sequential execution: step output → next step input via `input_mapping`.
+- A `delegate` connection compiles to a two-step `workflow_version`. **A "team" is not a
+  new entity and not a second execution path** — one orchestrator, always.
+- `agent.test`, `execution.cancel`.
+
+**Build — Track B: island milestone I2**
+- Add objects: drag from a palette → `CreateAgent` → the ordinary `POST`.
+- Move objects: drag → `MovePlacement` → `PUT …/world/nodes/…`.
+- Connections drawn from `connections`, routed per `world_routes`; create by dragging
+  building to building.
+- Live Mode: the executing step's building lit, its name on the banner.
+- Broken connections drawn dashed and amber with the `validate` finding as the tooltip.
+
+**Build — Track C: builder prototype**
+- `services/builder.py` with the final plan schema and propose/apply split.
+- `BuilderCapability` limited to `CREATE_AGENT`, `CREATE_CONNECTION`, `CREATE_TEAM`.
+- Plan rendered as a list and previewed on the island.
+- Apply in one transaction, leaving workflows unpublished.
+- Per-plan object caps, per-session rate limits, `builder.apply` bounded by the caller's
+  own permissions and refused **at plan time**.
+
+**M1 — the demonstration**
+
+> A user types *"I want a researcher that finds competitor news and a writer that turns it
+> into a short brief."* AgentWorld proposes two agents and the connection between them,
+> explains what it will create, and creates nothing yet. The user confirms. Two buildings
+> appear on the island with a road between them. The user drags one to a better spot and
+> opens it to read its instructions. They press Run. The researcher's building lights up,
+> its status goes to `working`, the road carries the handoff, the writer runs, and the
+> result is on screen — with every status change arriving over the WebSocket from a real
+> folded event.
+
+**Acceptance criteria**
+- [ ] The sentence above produces a plan containing exactly two agents and one connection.
+- [ ] Nothing is created until `apply`; rejecting the plan leaves the project empty.
+- [ ] Applying creates the objects in **one transaction**; an induced failure mid-apply
+      leaves nothing behind.
+- [ ] The applied objects appear on the island and in the agents list without a reload.
+- [ ] The two-step execution completes, the second agent's input is the first's output, and
+      both status transitions are visible live.
+- [ ] A "team" execution runs on the same `advance()` as a hand-built workflow — asserted
+      by there being one orchestrator entry point in the codebase.
+- [ ] Moving a building produces **no** row in `events` and **no** row in `audit_log`.
+- [ ] A `viewer` can watch the island and cannot move anything.
+- [ ] The builder asked for a workflow with branches explains that it cannot do that yet
+      and what to do instead — it does not attempt it.
+- [ ] A `member` whose plan would require an admin action is told at plan time, naming the
+      action.
+- [ ] The whole demo is reproducible from a script in `docs/demo/`.
+
+---
+
+### Phase 5 — Real workflows  *(Track A, 2.5 w)*
 
 **Build**
-- Step kinds: `condition`, `transform`, `wait`; parallel fan-out and join.
-- `input_mapping` evaluation; step outputs addressable as `$.steps.<key>.output`.
-- Retry with backoff, `max_attempts`, `timeout_seconds`, `on_failure` ∈ fail/continue/route.
-- `workers/timeout_sweeper.py`.
+- Step kinds `condition`, `transform`, `wait`; parallel fan-out and join.
+- Retry with jittered backoff, `max_attempts`, `timeout_seconds`, `on_failure`
+  ∈ fail/continue/route.
+- `workers/timeout_sweeper.py`; the full dispatch state machine including `dead` and
+  `needs_review`.
 - Draft/publish versioning; running executions pinned to their version.
 - Cancel, pause, resume, single-step retry.
-- `connections` of kind `delegate` — agent-to-agent handoff as a real step assignment.
 
-**Tests**
-- A diamond graph (fan-out, two branches, join) completes once, with the join seeing both.
-- A condition routing to either branch; the unchosen branch's steps become `skipped`.
-- Editing a workflow mid-execution does not change the running copy.
-- A step that times out while its agent is still working: the late report is dropped as a
-  duplicate, not applied.
-- Cancel: pending dispatches cancelled, in-flight work marked cancelled when it reports.
-- 20 concurrent executions of the same workflow interleave without cross-contamination.
-
-**Done when** a four-step workflow with a branch and a retry runs to completion, and a
-deliberately failed step behaves per each `on_failure` policy.
+**Acceptance criteria**
+- [ ] A diamond graph completes once, and the join sees both branches.
+- [ ] A condition routes to one branch; the other branch's steps become `skipped`.
+- [ ] Editing a workflow mid-execution does not change the running copy.
+- [ ] A step that times out while its agent is still working: the late report is dropped as
+      a duplicate.
+- [ ] A 422 goes to `dead` on the first attempt, with no second request made.
+- [ ] 100 simulated retries do not share a wake-up instant (jitter).
+- [ ] Every `dead` dispatch has a corresponding `workflow.step_failed` event.
+- [ ] **No-stuck-executions invariant:** after a randomised fault-injection run — killed
+      workers, provider errors, expired leases, cancellations — no execution remains in a
+      live state with no live dispatch, no pending approval and no terminal step. Asserted
+      by a query.
+- [ ] A worker killed mid-call on a `consequential` dispatch leaves it `needs_review`, and
+      **no worker or timer retries it**.
+- [ ] 20 concurrent executions of one workflow do not cross-contaminate.
 
 ---
 
-## Phase 5 — Approvals, tools, integrations
+### Phase 6 — Approvals, tools, integrations  *(Track A, 3 w)* → **M2**
 
 **Build**
-- `approvals` as a gate: `RequestApproval`, the decide endpoint, `approval.*` events,
-  expiry worker. **No dispatch exists until granted** — the structural property.
+- `approvals` table and the gate: `RequestApproval`, the decide endpoint, `approval.*`
+  events, the expiry worker, `required_role` per approval.
 - `infra/tools/`: `base.py`, `executor.py`, builtins (`http_request`, `web_search`,
-  `knowledge_search`), and `mcp_client.py`.
-- Tool discovery and refresh from an MCP server; `tools` rows with `source='mcp'`.
+  `knowledge_search`), `mcp_client.py`.
+- MCP tool discovery and refresh; `tools` rows with `source='mcp'`.
 - `side_effect` classification; `consequential` defaults to requiring approval.
-- OAuth2 flow: start, callback, token storage, refresh; Slack as the first integration.
-- Secret redaction: `secret_fields` on tool schemas, enforced before persist and publish.
-- Knowledge v1: upload, text extraction, PostgreSQL full-text `knowledge_search`.
+- OAuth2: start, callback, token storage, refresh. **Slack** as the first integration.
+- Secret redaction: the `Secret` wrapper, the structlog scrubber, `secret_fields` on tool
+  schemas, sanitised errors, allow-listed metric labels.
+- Knowledge v1: upload, extraction, PostgreSQL full-text `knowledge_search`.
+- `connection.create` elevation to admin for `consequential` grants.
 
-**Tests**
-- A `consequential` tool with no granted approval produces **no dispatch row** — asserted
-  on the table, not on a response.
-- Denying an approval fails the step per policy; granting resumes and dispatches once.
-- An approval mid-turn parks the dispatch and restores the message history on grant.
-- A revoked `grant_tool` connection takes effect on the next call, mid-run.
-- **A known secret appears in no `events`, `logs`, `execution_steps` or `dispatches` row** —
-  the same shape as the Phase 1 test that searched every text column for a key plaintext.
-- OAuth refresh on an expired token, without re-prompting the user.
-- MCP: tools discovered, invoked, and a server going away degrades to a clear tool error.
+**M2 — a gated external action.** A workflow drafts a message, stops, and posts to Slack
+only after a human grants it.
 
-**Done when** a workflow drafts a message, stops for approval, and posts to Slack only
-after a human grants it — and the credential is unreadable in every log and every event.
+**Acceptance criteria**
+- [ ] A `consequential` tool with no granted approval produces **no dispatch row** —
+      asserted against the table, not a response.
+- [ ] Denying fails the step per policy; granting resumes and dispatches **once**.
+- [ ] An approval mid-turn parks the dispatch and restores the message history on grant.
+- [ ] A revoked `grant_tool` connection takes effect on the next call, mid-run.
+- [ ] **The canary test:** a credential whose secret is a unique string is used by a
+      failing-then-succeeding workflow. The string appears in no table row, no log line, no
+      `events` payload, no WebSocket frame, no problem document and no metric label.
+- [ ] A revoked credential cannot be decrypted; the failing step names `credential_revoked`.
+- [ ] A referenced credential cannot be deleted; the `409` lists the referents.
+- [ ] A deleted credential's row holds no key material, and audit rows still resolve.
+- [ ] No schema in the OpenAPI document reachable from a credentials response has a
+      secret-shaped property.
+- [ ] OAuth refresh happens on an expired token without re-prompting.
+- [ ] An MCP server disappearing degrades to a clear tool error, not a hung step.
+- [ ] A `member` cannot grant an agent a `consequential` tool.
 
 ---
 
-## Phase 6 — External agents and triggers
+### Phase 7 — External agents and triggers  *(Track A, 2 w)* → **M3**
 
 **Build**
-- `dispatchable` agents: `agent_push` (signed POST) and `agent_task_offer` (claim/poll,
-  `FOR UPDATE SKIP LOCKED`), `GET /v1/self/*`.
-- Commands for dispatchable agents: capability-gated, `409` when not advertised.
-- `observed` agents: ingest-only, refused for step assignment.
-- Triggers: `scheduler` worker, `schedule` with cron and timezone, `webhook` with its token
-  plane, `integration_event`, `workflow_completed`.
-- `heartbeat_sweeper`: agents past TTL → `offline` with a synthetic status event.
-- `packages/sdk-python` — thin: client, heartbeat, buffered flush, retry with jitter,
-  `run()` context manager, command polling. Never raises into caller control flow.
+- `dispatchable` agents: `agent_push` (signed POST, with the SSRF deny-list enforced at
+  request time) and `agent_task_offer` (claim/poll with `FOR UPDATE SKIP LOCKED`).
+- `GET /v1/self/*`; capability-gated commands; `observed` agents refused for step
+  assignment.
+- `triggers` table, the `scheduler` worker, cron with timezone, the webhook token plane,
+  `integration_event`, `workflow_completed`.
+- `heartbeat_sweeper`.
+- `packages/sdk-python` — thin, never raising into caller control flow, forwarding
+  `X-AgentWorld-Idempotency-Key`.
 
-**Tests**
-- A Python worker outside AgentWorld completes a workflow step, via push and via poll.
-- An `observed` agent assigned a step: `422` naming the mode, and `validate` says so first.
-- A trigger firing twice in one minute yields one execution (`idempotency_key`).
-- A webhook token is rate-limited and can start only its own workflow.
-- A bash-and-curl agent completes a step in CI, which proves "no SDK required" is true.
-- SDK parity: the same lifecycle through the SDK and through raw HTTP produces identical
-  event streams.
+**M3 — a credible private beta.** Scheduled, collaborative, gated, with external workers.
 
-**Done when** a scheduled workflow at 07:00 hands a step to a worker running on a laptop
-behind a firewall, and the whole run is visible over `curl`.
+**Acceptance criteria**
+- [ ] A Python worker outside AgentWorld completes a step, via push and via poll.
+- [ ] An `observed` agent assigned a step: `422` naming the mode, and `validate` says so
+      first.
+- [ ] A trigger firing twice in a minute yields one execution (`idempotency_key`).
+- [ ] A webhook token is rate-limited and can start only its own workflow.
+- [ ] A bash-and-curl agent completes a step in CI — "no SDK required" is true.
+- [ ] SDK and raw HTTP produce identical event streams for the same lifecycle.
+- [ ] `agent.configure` pointing `dispatch.url` at a loopback, link-local or private
+      address is refused at save time **and** at request time.
+- [ ] A dispatchable agent that never reports is resolved by the step timeout.
 
 ---
 
-## Phase 7 — The workspace
+### Phase 8 — Full workspace  *(Track B, 2.5–3 w)*
 
 **Build**
 - TypeScript client generated from `/openapi.json`, replacing the hand-written one.
-- Realtime client: ticket refresh, backoff, cursor resume, a Zustand store.
-- Lists and detail pages for agents, workflows, executions, approvals, integrations,
-  knowledge, triggers.
-- The workflow editor: a left-to-right DAG canvas with a step inspector and inline
-  `validate` findings.
-- The execution timeline: steps, inputs, outputs, events, retry.
-- The approval queue, decided inline.
-- Simple/Advanced on every form, driven by one field-level schema; the copy lint over the
-  simple-mode catalogue.
+- Lists and detail pages for every object; the DAG workflow editor with inline `validate`
+  findings; the execution timeline; the approval queue.
+- Simple/Advanced on every form from one field-level schema; the copy lint over the
+  Simple-mode string catalogue.
 - Guided integration connect, including OAuth.
 
-**Tests**
-- Store reducer unit tests for every delta frame type.
-- Playwright: create two agents → build a three-step workflow → publish → run → approve →
-  see it complete, without a page reload.
-- A `publishable: false` workflow cannot be started from the UI, and says what is missing.
-- Keyboard and screen-reader pass on the approval queue and the workflow editor.
-
-**Done when** the whole product is usable in a browser with **no island**, and shipping
-here would be a credible v0.
+**Acceptance criteria**
+- [ ] Playwright: create two agents → build a three-step workflow → publish → run →
+      approve → see it complete, with no reload.
+- [ ] A `publishable: false` workflow cannot be started from the UI and says what is
+      missing.
+- [ ] Every object is fully manageable **without opening the island**.
+- [ ] Simple mode writes no value Advanced cannot display.
+- [ ] The Simple-mode catalogue contains none of: LLM, token, temperature, prompt, schema,
+      webhook.
+- [ ] Keyboard and screen-reader pass on the approval queue and the workflow editor.
 
 ---
 
-## Phase 8 — The island
+### Phase 9 — Full island  *(Track B, 3 w)* → **M4**
 
-Only now, against a backend that does not know it exists.
+Extends I2; replaces nothing.
 
 **Build**
-- `world/types.ts`, `projector/` (`projectBuild`, `projectLive`), `interpreter/`
-  (`interpret`), `dispatch/`, `phaser/`, `bridge/`.
-- `world_placements` widened to `(project_id, node_kind, node_id)`; migration `0011`;
-  deterministic autolayout on creation.
-- Phaser: isometric tilemap, camera (pan, pinch, wheel, bounds), depth sorting.
-- Buildings and characters per kind; idle, walk, work, alert, slump animations.
-- Build Mode: the gesture table from `03-API-AND-FRONTEND.md` §5, broken lines for invalid
-  connections, unlit factories for unpublishable workflows.
-- Live Mode: the animation table, driven by `recent: Event[]`.
+- The animation table from `03-API-AND-FRONTEND.md` §5, driven by `recent: Event[]`.
 - Interventions from the island: approve, retry, cancel, answer.
-- Object pooling, an animation budget, and a static island under
-  `prefers-reduced-motion`.
+- Districts, route editing, themes, landmark placement.
+- Object pooling, an animation budget, a static island under `prefers-reduced-motion`.
 
-**Tests**
-- Projector unit tests: every status and event type maps to the documented visual state,
-  with no Phaser imported.
-- Determinism: the same state and layout always produce the same `WorldState`.
-- `interpret()` unit tests: every gesture produces the documented `Intent`, with no canvas.
-- **The isolation test**: the backend suite and the non-world web suite stay green with
-  `world/phaser/` removed from the build.
-- Playwright: ingest `workflow.step_dispatched` and assert the scene receives a `walk_to`
-  for that entity.
-- A 50-agent, 20-events/second soak above 50 fps on a mid-range laptop.
-
-**Done when** a stranger can watch the island and correctly describe what the agents are
-doing, every animation traces to a row in `events`, and Build Mode creates real objects
-without the island being the source of truth.
+**Acceptance criteria**
+- [ ] Projector unit tests: every status and every event type maps to the documented visual
+      state, with no Phaser imported.
+- [ ] Determinism: identical state and layout always produce an identical `WorldState`.
+- [ ] `interpret()` tests: every gesture produces the documented `Intent`, with no canvas.
+- [ ] **The isolation test:** backend and non-world web suites stay green with
+      `world/phaser/` removed.
+- [ ] Playwright: ingesting `workflow.step_dispatched` makes the scene receive a `walk_to`
+      for that entity.
+- [ ] 50 agents at 20 events/second stays above 50 fps on a mid-range laptop.
+- [ ] Every animation on screen traces to a row in `events` — audited by a test that
+      asserts the projector has no timer and no random source.
+- [ ] A stranger watching the island can describe what the agents are doing.
 
 ---
 
-## Phase 9 — The conversational builder
+### Phase 10 — Complete builder  *(Track C, 2.5 w)* → **M5, the MVP**
 
 **Build**
-- `services/builder.py`: sessions, the propose/apply split, domain schemas as tool
-  definitions.
-- Plan rendering: as a list, and as a preview on the island.
-- Reuse detection over existing agents, tools, integrations and knowledge.
-- `requires_consent` for every consequential grant; per-plan object caps; per-session rate
-  limits.
+- Enable the remaining `BuilderCapability` members: workflows, triggers, integrations,
+  knowledge, tool grants, modifying what exists.
+- Reuse detection across existing agents, tools, integrations and knowledge, with the
+  reason shown.
+- `requires_consent` for every consequential grant.
 - Conversational revision of a plan before apply.
-- Apply in one transaction, leaving workflows unpublished and triggers disabled.
 
-**Tests**
-- The brief's own sentence produces a plan that passes `validate` and, once published,
-  runs.
-- A plan is never applied without an explicit `apply`.
-- The builder cannot create a credential, widen a grant, enable a trigger or publish.
-- A `member` applying an integration-creating plan is refused *at plan time*, with the
-  reason, not at apply.
-- A prompt-injected document in a knowledge source cannot cause the builder to grant a
-  tool — the builder's inputs are data, not instructions.
-- 400 agents in one sentence hits the cap and says so.
-
-**Done when** one sentence becomes a working ecosystem the user can inspect, edit, publish
-and run — and nothing was activated without them saying so.
+**Acceptance criteria**
+- [ ] The refinement brief's own sentence — research, hand off, approve, publish — produces
+      a plan that passes `validate` and, once published, runs.
+- [ ] The builder cannot create a credential, widen an existing grant, enable a trigger or
+      publish a workflow.
+- [ ] A prompt-injected document in a knowledge source cannot make the builder grant a
+      tool: its inputs are data, not instructions.
+- [ ] 400 agents in one sentence hits the cap and says so.
+- [ ] Modifying an existing ecosystem conversationally produces a plan that shows a diff,
+      not a replacement.
+- [ ] Nothing in Phase 10 changed the plan schema, the apply transaction or the permission
+      model — asserted by the Phase 4 builder tests still passing unmodified.
 
 ---
 
-## Phase 10 — Hardening and launch
+### Phase 11 — Hardening and launch  *(2.5 w)* → **M6**
 
 **Build**
 - Load test: 100 agents, 50 concurrent executions, 1,000 events/s. Publish p50/p95/p99 for
-  ingest, decision latency and dispatch pickup, and DB growth.
-- Query tuning from `pg_stat_statements`; partition rollover verified across a month
-  boundary; retention jobs verified.
+  ingest, decision latency and dispatch pickup, plus DB growth.
+- Query tuning from `pg_stat_statements`; partition rollover across a month boundary;
+  retention jobs.
 - Security pass: dependency audit, secrets scan, credential rotation runbook, CORS and
-  WebSocket origin review, expression-evaluator fuzzing, a documented abuse path, **a
-  prompt-injection review of every place model output reaches a tool call**.
+  WebSocket origin review, expression-evaluator fuzzing, SSRF deny-list review, and **a
+  prompt-injection review of every path where model output reaches a tool call**.
 - Per-key and per-workspace rate limits and execution quotas.
-- Observability: dashboards for ingest rate, decision latency, dispatch queue depth, lease
-  expiries, approval age, provider errors and spend.
+- Observability: the signals in `02-ORCHESTRATION.md` §8, with their alert thresholds.
 - Operations: deployment manifests, migration runbook, backup and restore **rehearsed**.
-- Docs: a five-minute quickstart, the protocol reference, tool and provider authoring
-  guides, self-hosting.
+- Docs: five-minute quickstart, protocol reference, tool and provider authoring guides,
+  self-hosting.
 
-**Done when** the quickstart works for someone who has never seen the repo, and the
-load-test numbers are published rather than assumed.
+**Acceptance criteria**
+- [ ] The quickstart works for someone who has never seen the repo.
+- [ ] Load-test numbers are published, not assumed.
+- [ ] Backup and restore has been performed, not just configured.
+- [ ] Every alert in the observability table fires in a drill.
 
----
-
-## 2. Dependencies
+## 3. Dependencies between the tracks
 
 ```
-2 (model + protocol)
-└── 3 (vertical slice: provider, orchestrator, outbox)
-    ├── 4 (real workflows)
-    │   ├── 5 (approvals, tools, integrations)
-    │   │   └── 6 (external agents, triggers)
-    │   │       └── 7 (workspace)  ──┬── 8 (island)
-    │   │                            └── 9 (builder)   ← needs 2–7; 8 only for the preview
-    └──────────────────────────────────────────── 10 (hardening)
+        Track A (foundation)          Track B (visual)         Track C (builder)
+        ────────────────────          ────────────────         ─────────────────
+P2   core model + protocol ─────┬──────────┐
+                                │          │
+P3   execution core + WS ───────┼───► island I1 (renders real agents)
+                                │          │
+P4   multi-step + delegate ─────┴───► island I2 ◄──── builder prototype ──► M1
+                                              ▲              │
+P5   real workflows                           │              │ (plan preview
+                                              │              │  uses I2)
+P6   approvals, tools, Slack ──► M2           │              │
+                                              │              │
+P7   external agents, triggers ──► M3         │              │
+          │                                   │              │
+P8        └──────────────► full workspace ────┘              │
+                                   │                         │
+P9                                 └──► full island ──► M4   │
+                                                 │           │
+P10                                              └──► complete builder ──► M5 = MVP
+                                                                  │
+P11                                               hardening ──────┴──► M6
 ```
 
-Phases 8 and 9 can run in parallel after 7 — they share no files, as the previous roadmap
-observed about its own 5–7. Phase 6 could precede 5 if an external-agent demo is needed
-earlier; nothing in 5 depends on it.
+Hard dependencies, the ones that cannot be reordered:
 
-## 3. MVP
+| Dependency | Why |
+|------------|-----|
+| B needs A's model and WebSocket | the island renders real objects from the first commit; there is no mock path |
+| C needs A's definition CRUD and `validate` | the builder is a client of the ordinary services and must not propose what cannot run |
+| C's preview needs B's I2 | a plan shown as a diagram needs a diagram to show it on; without I2 the prototype falls back to the list view, which is a usable degradation |
+| Phase 8 before Phase 9 | the plain workspace must be proved usable before the island gets its polish, or the island becomes load-bearing |
+| Phase 10 after Phase 7 | the complete builder writes triggers and integrations, which do not exist until then |
+| Phase 6 before Phase 7 is **soft** | nothing in approvals or tools depends on external agents. Swap them if an external-agent demo is needed sooner |
 
-The brief's MVP list, mapped to where each item lands:
+## 4. Milestones
 
-| MVP requirement | Phase | How it is demonstrated |
+| | End of | What it proves | Shippable as |
+|---|--------|----------------|--------------|
+| **M0** | Phase 1 ✅ | multi-tenant, authenticated, isolated | nothing user-facing |
+| **M1** | Phase 4 | **the product concept works end to end** | an internal demo |
+| **M2** | Phase 6 | consequential actions are really gated | a design-partner preview |
+| **M3** | Phase 7 | external agents and unattended schedules | a credible private beta |
+| **M4** | Phase 9 | the island is a real workspace | a public beta |
+| **M5** | Phase 10 | one sentence builds a working ecosystem | **the MVP / v1** |
+| **M6** | Phase 11 | it survives load, failure and an operator | general availability |
+
+M1 is where the plan stops being a bet. If the demo at M1 is unconvincing, the cheapest
+moment to change direction is there — about eight weeks in, with the domain model written
+and almost nothing built on top of it.
+
+## 5. Revised MVP
+
+The MVP is **M5**, at the end of Phase 10.
+
+| MVP requirement | Lands | Demonstrated by |
 |---|---|---|
 | Authentication, workspace and project management | **1 ✅** | done |
-| At least two agents | 3 | two managed agents with different roles |
-| Ability to connect agents | 4 | `delegate` connection; researcher → writer |
-| One executable multi-step workflow | 4 | four steps, a branch, a retry |
-| At least one working integration or tool | 5 | Slack via MCP, plus `web_search` builtin |
-| At least one trigger | 6 | weekday 07:00 schedule |
-| Human approval for a workflow step | 5 | the gate before posting |
-| Live execution status | 7 | the execution timeline, live over WebSocket |
-| Interactive island, Build and Live | 8 | the gesture and animation tables |
-| Conversational builder for a simple ecosystem | 9 | the brief's own sentence |
-| **A real end-to-end demonstration** | **9** | below |
+| At least two agents | 3 | two managed agents with distinct roles |
+| Ability to connect agents | 4 | a `delegate` connection, compiled to a real workflow |
+| One executable multi-step workflow | 5 | four steps, a branch, a retry |
+| At least one working integration or tool | 6 | Slack via MCP, plus the `web_search` builtin |
+| At least one trigger | 7 | a weekday 07:00 schedule |
+| Human approval for a workflow step | 6 | the gate before posting |
+| Live execution status | 3 (API), 8 (UI) | the execution timeline, live over WebSocket |
+| Interactive island, Build and Live | 4 (prototype), 9 (full) | the gesture and animation tables |
+| Conversational builder | 4 (prototype), 10 (full) | the refinement brief's own sentence |
+| **A real end-to-end demonstration** | **4 (M1), 10 (full)** | below |
 
-### The demonstration
+### The v1 demonstration
 
 > It is 07:00 on a Tuesday. A schedule fires. The *Competitor researcher* walks out of its
-> workshop, the library lights up as it searches the web, and a crate of findings travels
-> the road to the *Brief writer*'s studio. The writer produces an article. The crate stops
-> at the town hall and the bell rings: an approval is pending, and nothing has been
-> published. Ada opens the queue, reads the draft, and approves it. The gate lifts, the
-> crate reaches the Slack portal, and the brief appears in `#market-intel`.
+> workshop, the library lights up as it searches, and a crate of findings travels the road
+> to the *Brief writer*'s studio. The writer produces an article. The crate stops at the
+> town hall and the bell rings: an approval is pending and nothing has been published. Ada
+> opens the queue, reads the draft, approves it. The gate lifts, the crate reaches the Slack
+> portal, and the brief appears in `#market-intel`.
 >
 > The whole ecosystem was created from one sentence the day before. Every animation above
 > corresponds to a row in `events`. Replaying those rows reproduces the final state and
 > posts nothing.
 
-That last sentence is the one worth keeping, because it is the difference between this
-product and a demo.
+The abbreviated version of this — two agents, one handoff, no approval, no schedule, no
+animation — is **M1 at week eight**.
 
-## 4. Initial supported scope
+## 6. Timeline and scope assumptions
 
-The brief asks for a realistic scope rather than everything. In v1:
+The estimate is 24–30 weeks to M5, and it assumes:
+
+| Assumption | If it breaks |
+|-----------|--------------|
+| One developer, effectively full time | the range scales close to linearly; the parallel tracks do not shorten with one person, they only reorder risk |
+| Anthropic plus one OpenAI-compatible provider, nothing else | each additional provider is ~2 days once the Protocol is proved |
+| Slack, generic REST/webhook and MCP; no other bespoke integration | each OAuth integration is 3–5 days plus any app-review wait, which is calendar time rather than work |
+| Supabase Auth stays the identity provider | swapping it is ~1 week behind the existing `AuthProvider` interface |
+| One PostgreSQL, no broker, no Kubernetes before Phase 11 | introducing any of them early adds a week and an operational surface |
+| Phaser for the island | the prototype at I1 is the point at which that choice is cheap to revisit |
+| Art is placeholder until Phase 9 | commissioned art is calendar time, not developer time; start it at Phase 6 if it is wanted for M4 |
+| No compliance or certification work in v1 | SOC 2 or similar is its own project |
+
+**The honest lever on the timeline is §7's scope table, not the phase list.** Compressing
+phases produces the same work with less testing, and the two things this product cannot
+afford to ship untested are the approval gate and tenant isolation.
+
+## 7. Initial supported scope
 
 | | In v1 | Not in v1 |
 |---|---|---|
-| **Providers** | Anthropic, OpenAI-compatible (one interface) | Gemini, Bedrock, Vertex, local models |
+| **Providers** | Anthropic, OpenAI-compatible | Gemini, Bedrock, Vertex, local models |
 | **Agent modes** | managed, dispatchable (push and poll), observed | per-framework adapters (LangGraph, Assistants, CrewAI) |
 | **Workflow features** | sequence, parallel fan-out/join, condition, transform, wait, approval, retry, timeout, `on_failure` | loops, map-over-collection, sub-workflows, dynamic agent selection, compensation |
-| **Connections** | `grant_tool`, `grant_knowledge`, `delegate`, `trigger`, `publish` | typed channels, message queues between agents |
-| **Tools** | builtins (`http_request`, `web_search`, `knowledge_search`), MCP, integration-provided | a bespoke adapter per SaaS product |
+| **Connections** | `grant_tool`, `grant_knowledge`, `delegate`, `trigger`, `publish` | typed channels, queues between agents |
+| **Tools** | builtins, MCP, integration-provided | a bespoke adapter per SaaS product |
 | **Integrations** | Slack, generic REST, generic webhook, MCP servers | Gmail, Drive, Notion, GitHub, Discord, databases |
 | **Triggers** | manual, schedule, webhook, integration_event, workflow_completed | email arrival, file watch, DB change capture |
 | **Knowledge** | uploaded files, extraction, full-text search | pgvector, folder sync, DB sources, re-ranking |
-| **Approvals** | per step, per tool, per connection; role-gated; expiry | multi-approver, quorum, delegation, escalation |
-| **Island** | one project, Build and Live | multi-project world, multiplayer cursors, custom assets |
+| **Approvals** | per step, per tool, per connection; role-gated; expiry | multi-approver, quorum, delegation, escalation, four-eyes |
+| **Builder** | agents, connections, teams (P4); workflows, triggers, integrations, knowledge, grants, modification (P10) | debugging an existing ecosystem conversationally, cost estimation, A/B proposals |
+| **Island** | one project, Build and Live, districts | multi-project world, multiplayer cursors, custom assets |
 
-The pattern is one reliable instance of each category rather than many incomplete ones —
-the brief's *"Prefer one or two reliable agent execution approaches initially rather than
-many incomplete adapters."* Each row's right-hand column is reachable without
-architectural change: a provider is a file, an integration is a credential plus discovery,
-a workflow feature is a `Decision` variant.
+One reliable instance of each category rather than many incomplete ones. Each right-hand
+cell is reachable without architectural change: a provider is a file, an integration is a
+credential plus discovery, a workflow feature is a `Decision` variant, a builder capability
+is an enum member.
 
-## 5. Deliberately deferred past v1
+## 8. Security and reliability requirements, by phase
 
-Each is a real feature, listed so it is a decision rather than an oversight.
+Consolidated from `01-DOMAIN-AND-PROTOCOL.md` §6 and §10, `02-ORCHESTRATION.md` §8, and
+`05-PERMISSIONS.md`. Each is a gate on the phase it lands in, not a Phase 11 cleanup.
+
+| Requirement | Phase | Specified in |
+|-------------|-------|--------------|
+| Every new tenant table under RLS, with the non-bypassing-role guard | 2 | 00 §3 K7 |
+| Append-only enforced by privilege on `events` and `logs` | 2 | 01 §1 |
+| Permission matrix total over actions; route coverage guard | 2 | 05 §6 |
+| Tenant isolation 404 on every new endpoint, with a coverage guard | 2 | 05 §6 |
+| Presentation tables hold no execution state | 2 | 01 §10 |
+| Replay causes no work (protocol promise 7) | 2 | 01 §9 |
+| Expression evaluator cannot escape its scope | 2 | 02 §4 |
+| Envelope encryption with AAD tenant binding | 3 | 01 §6 |
+| KEK rotation without plaintext access | 3 | 01 §6 |
+| Fail-fast settings for `CREDENTIAL_KEKS` | 3 | 01 §6 |
+| Provider SDKs confined to `infra/providers` | 3 | 03 §2 |
+| Orchestration imports no I/O | 3 | 03 §2 |
+| Idempotent dispatch, three layers | 3 | 02 §3 |
+| Lease-based crash recovery | 3 | 02 §8 |
+| Retry classification: terminal errors not retried | 5 | 02 §8 |
+| Dead letters always resolve their step | 5 | 02 §8 |
+| No-stuck-executions invariant under fault injection | 5 | 02 §8 |
+| `needs_review` for ambiguous consequential work | 5 | 02 §8 |
+| Approval gate is the absence of a dispatch | 6 | 02 §7 |
+| Secret redaction in logs, events, errors, telemetry | 6 | 01 §6 |
+| The canary test | 6 | 01 §6 |
+| Revocation and deletion behaviour | 6 | 01 §6 |
+| No secret-shaped property in the OpenAPI document | 6 | 01 §6 |
+| Consequential grants require admin | 6 | 05 §4 |
+| SSRF deny-list on `dispatch.url`, enforced at request time | 7 | 05 §5 |
+| Webhook token rate limits | 7 | 03 §1 |
+| Builder bounded by the caller's permissions, at plan time | 4 | 05 §4 |
+| Builder inputs are data, not instructions | 10 | 04 §P10 |
+| Prompt-injection review of model-output-to-tool-call paths | 11 | 04 §P11 |
+| Load, quota and rate-limit verification | 11 | 04 §P11 |
+| Rehearsed backup and restore | 11 | 04 §P11 |
+
+## 9. Deliberately deferred past v1
 
 | Deferred | Why | Earliest |
 |----------|-----|---------|
-| Loops and map-over-collection in workflows | Turns an orchestrator into a workflow language; needs iteration state, fan-out limits and partial-failure semantics | v1.1 |
-| Sub-workflows | Needs nested cancellation and approval inheritance | v1.1 |
-| Per-service integration adapters (Gmail, Drive, Notion, GitHub) | Each is OAuth scopes, API quirks and app review. MCP covers most of the demand for one implementation | v1.1, demand-ordered |
-| pgvector knowledge retrieval | Full-text is adequate at first-user document volumes; swapping it is behind the `knowledge_search` tool | v1.1 |
+| Loops and map-over-collection | Turns an orchestrator into a workflow language: iteration state, fan-out limits, partial-failure semantics | v1.1 |
+| Sub-workflows | Nested cancellation and approval inheritance | v1.1 |
+| Four-eyes and multi-approver approvals | A single approver covers the demo and most real cases. Note that v1 **permits self-approval**: the author of a workflow can approve its steps | v1.1 |
+| Per-service integration adapters (Gmail, Drive, Notion, GitHub) | Each is OAuth scopes, API quirks and app review; MCP covers most demand for one implementation | v1.1, demand-ordered |
+| pgvector knowledge retrieval | Full-text is adequate at first-user volumes, and swapping it is behind the `knowledge_search` tool | v1.1 |
 | Cost and token analytics | The data is already in `metric_samples`; this is a UI | v1.1 |
-| Multi-approver and quorum approvals | Single approver covers the demo and most real cases | v1.1 |
-| Agent and workflow templates, and sharing between workspaces | Needs export/import, versioning and a trust model for shared definitions | v1.2 |
-| Multi-project / cross-project island | Scene complexity before one island is proven | v1.2 |
+| Pending invitations for users who have not signed up | Needs a token, expiry, accept flow and a mail path (carried from Phase 1) | v1.1 |
+| Conversational debugging of a running ecosystem | Needs the builder to read execution state, which is a different and larger tool surface | v1.2 |
+| Agent and workflow templates, shared between workspaces | Export/import, versioning and a trust model for shared definitions | v1.2 |
+| Multi-project island | Scene complexity before one island is proven | v1.2 |
 | OpenTelemetry trace import | Valuable, and a whole adapter class of its own | v1.2 |
 | Alerting rules and notifications | Needs a rule engine; the attention queue and webhooks cover the urgent case | v1.2 |
-| Pending invitations for users who have not signed up | Needs a token, an expiry, an accept flow and a mail path (carried over from Phase 1) | v1.1 |
 | Mobile-native app | The web workspace is responsive enough to start | v2 |
 | SSO/SAML, SCIM | Enterprise-gated; Supabase Auth covers it until then | on demand |
 | Self-serve billing | No pricing model yet | pre-GA |
-| Agent-to-agent negotiation beyond `delegate` | Genuine multi-agent protocols need a conversation model, not a handoff | v2 |
+| Agent-to-agent negotiation beyond `delegate` | Real multi-agent protocols need a conversation model, not a handoff | v2 |
 
-**Explicitly *not* deferred**, reversing the previous roadmap: agent-to-agent collaboration
-and workflow execution. They were in the old deferred table as v2 on the grounds that they
-"change the protocol from observational to transactional". That was correct, and it is now
-the product.
+**Not deferred**, reversing the original roadmap: agent-to-agent collaboration and workflow
+execution. They were v2 on the grounds that they "change the protocol from observational to
+transactional". That was correct, and it is now the product.
 
-## 6. Risks
+## 10. Risks
 
 | Risk | Mitigation |
 |------|-----------|
-| The orchestration model is wrong | Phase 3 proves it end to end on one step before anything is built on it. `advance()` being pure means changing it is a unit-test exercise |
-| Prompt injection via knowledge, tool results or integration payloads reaching a tool call | Tool grants checked at call time; `consequential` tools gated by approval; model output is never an authorization input; a dedicated review in Phase 10 |
-| The builder creates something harmful or expensive | Propose/apply split, `requires_consent`, object caps, nothing published or enabled on apply, bounded by the user's own role |
-| Beginners still find it too complex | Simple mode with a lint on its vocabulary, safe-by-default approvals, and Phase 7 shipping before the island so the plain UI is tested first |
-| The island becomes the source of truth | `interpret()` is pure and cannot fetch; `world/dispatch/` is the only layer permitted to call the API; the isolation test keeps the product working without Phaser |
-| Provider lock-in creeps in | Two import-linter contracts, each verified by planting a violation |
-| Secrets leak into events or logs | Entities with no field for them, declared `secret_fields`, and a test that searches every table for a known secret |
-| Scope expands until nothing ships | §4's right-hand column, and the rule that each category gets one reliable instance in v1 |
+| The orchestration model is wrong | Phase 3 proves it on one step before anything is built on it; `advance()` being pure makes changing it a unit-test exercise |
+| **The product concept does not land** | M1 at week eight, with the domain model written and almost nothing on top of it. This is the risk the revision exists to address |
+| The early prototypes become throwaway work | Both are built on the final architecture: the island on the real projector/interpreter/dispatch split, the builder on the final plan schema with a capability enum. Phase 10's acceptance criteria include the Phase 4 builder tests passing unmodified |
+| Parallel tracks fragment attention | Phases 3 and 4 are the only ones with more than one track, and each has a single milestone to converge on |
+| Prompt injection reaching a tool call | Grants checked at call time, `consequential` tools gated by approval, model output never an authorization input, a dedicated Phase 11 review |
+| The builder creates something harmful or expensive | Propose/apply, `requires_consent`, object caps, nothing published or enabled on apply, bounded by the caller's role at plan time |
+| Beginners still find it too complex | Simple mode with a vocabulary lint, safe-by-default approvals, and Phase 8 before Phase 9 so the plain UI is tested first |
+| The island becomes the source of truth | `interpret()` is pure and cannot fetch; `world/dispatch/` is the only layer that may call an API; the isolation test keeps the product working without Phaser; the layout tables hold no execution state |
+| Secrets leak | Entities with no field for them, AAD tenant binding, declared `secret_fields`, four redaction channels, and the canary test |
+| Scope expands until nothing ships | §7's right-hand column, and one reliable instance per category |

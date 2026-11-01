@@ -33,7 +33,7 @@ src/agentworld/
 │   │                                field), KnowledgeSource, Trigger, Execution,
 │   │                                ExecutionStep, Approval
 │   ├── enums.py                   + 8 new enums
-│   ├── policy.py                  + ~45 new actions, same table
+│   ├── policy.py                  + 57 new actions, same table (05-PERMISSIONS)
 │   ├── protocol/
 │   │   ├── envelope.py            NEW  subject + correlation
 │   │   ├── types.py               NEW  the registry and payload models
@@ -362,13 +362,87 @@ and emits `AnimationIntent`s; it has no timer and invents nothing. A Playwright 
 ingests one `workflow.step_dispatched` and asserts the scene receives a `walk_to` for that
 entity — the same test the previous roadmap specified, against the new event.
 
-### Placements widen
+### The layout is its own persisted model
 
-`world_placements` keyed on `agent_id` becomes keyed on `(project_id, node_kind, node_id)`
-so workflows, integrations, knowledge sources and triggers can be placed. Still a
-presentation table no reducer, adapter or SDK touches. Autolayout runs on creation so the
-island is never empty, and a user's manual placement sets `auto_assigned = false` and is
-then never overwritten — the existing rule, unchanged.
+`world_placements`, keyed on `agent_id`, becomes four tables — `world_layouts`,
+`world_districts`, `world_nodes`, `world_routes` — specified in
+`01-DOMAIN-AND-PROTOCOL.md` §10. They hold position, size, appearance, grouping and visual
+routing, and **no column that mirrors execution state**.
+
+What that buys the frontend:
+
+- **Dragging a building is a `world.update` call and nothing else.** No event, no audit row,
+  no agent mutation, and the weakest role that can change anything at all
+  (`05-PERMISSIONS.md` §2). A `viewer` watching an execution cannot rearrange the island
+  under the person building it.
+- **An offline, archived or broken agent keeps its node and stays visible.** The shuttered
+  building *is* the information. An island that empties itself when things go wrong would be
+  useless at exactly the moment it matters.
+- **Rerouting a road changes no grant.** `world_routes.waypoints` is how a line is drawn;
+  `connections` is whether the relationship exists.
+- **Status arrives at render time**, as `projectLive`'s second argument, never from the
+  layout tables.
+
+Autolayout runs on creation so the island is never empty, and a manual placement sets
+`auto_assigned = false` and is then never overwritten — the existing rule, unchanged.
+
+### Island API
+
+| Method | Path | Role |
+|--------|------|------|
+| `GET` | `/v1/projects/{id}/world` | viewer+ |
+| `PUT` | `/v1/projects/{id}/world/layout` | member+ |
+| `PUT` | `/v1/projects/{id}/world/nodes/{kind}/{node_id}` | member+ |
+| `DELETE` | `/v1/projects/{id}/world/nodes/{kind}/{node_id}` | member+ |
+| `PUT` | `/v1/projects/{id}/world/routes/{kind}/{route_id}` | member+ |
+| `GET` `POST` `PATCH` `DELETE` | `/v1/projects/{id}/world/districts` | member+ |
+| `POST` | `/v1/projects/{id}/world/autolayout` | member+ |
+
+`DELETE` on a node removes the placement, not the agent. The confirmation dialog says so,
+because "delete" on a building is the single most likely place for a user to destroy
+something they meant to tidy away.
+
+### The prototype milestone, and what it deliberately omits
+
+The island ships early — Phases 3 and 4 in `04-ROADMAP-AND-MVP.md` — on the **real**
+`projector/` + `interpreter/` + `dispatch/` architecture, so the prototype is extended
+rather than replaced. Build Mode and Live Mode exist as distinct concepts from the first
+commit even while each does little.
+
+**Milestone I1 (Phase 3) — the island renders the real backend**
+
+| Capability | Shape at I1 |
+|-----------|-------------|
+| Display actual backend objects | agents from `GET /v1/projects/{id}/agents`, placed from `world_nodes` |
+| Agents as buildings and characters | one building sprite per `building_kind`, one character per `character_kind`; small sets |
+| Select an object | click → `OpenInspector` intent → the same panel the agents page uses |
+| Open configuration panels | the real agent form in Simple mode, not an island-specific one |
+| Display actual agent statuses | a tint and a badge per status, from live WebSocket deltas |
+| Build / Live distinction | a toggle. Build allows select and move; Live is read-only and shows status |
+
+**Milestone I2 (Phase 4) — the island becomes a workspace**
+
+| Capability | Shape at I2 |
+|-----------|-------------|
+| Add objects | drag from a palette → `CreateAgent` → the ordinary `POST` |
+| Move objects | drag → `MovePlacement` → `PUT …/world/nodes/…` |
+| Display connections | straight or waypointed routes from `connections`, drawn per `world_routes` |
+| Create connections | drag building to building → `CreateConnection`, kind inferred |
+| Live step progress | the executing step's building is lit; its name is on the banner |
+| Broken connections | drawn dashed and amber with the `validate` finding as the tooltip |
+
+**Explicitly not at I1 or I2**, and the omission is the point: walk cycles, resource
+tokens flowing along roads, chimney smoke, crates, the town-hall bell, camera easing,
+object pooling, districts, custom themes, sound. Those are Phase 9. The prototype exists to
+prove the **interaction model** — that a user can understand and manipulate an ecosystem
+spatially, and that real backend state drives it — not to look finished. Building the
+animation system first would mean tuning easing curves before knowing whether anyone can
+find the configure button.
+
+One consequence worth stating: at I1 and I2 the island is **not** the recommended way to do
+anything. The plain pages do everything it does and more. That is deliberate — it keeps the
+island optional while it is still unproven, and it means the Phase 8 workspace is not
+racing to catch up with it.
 
 ## 6. The web workspace
 
@@ -421,8 +495,12 @@ simple-mode string catalogue, because it is the first thing that erodes.
 
 ## 7. The conversational ecosystem builder
 
-The headline feature, and it is last in the roadmap for a reason: it is a *writer* of the
-domain model. Built before the model settles, it is rewritten with every change to it.
+A *writer* of the domain model, which is why the complete version comes after the model
+settles — built before that, it is rewritten with every change to it.
+
+But it is also the product's clearest differentiator, so a **deliberately limited
+prototype ships in Phase 4**, on the final architecture rather than a temporary one. §7.1
+sets out how the capability is narrowed without the design being narrowed.
 
 ### Propose, then apply — never one step
 
@@ -484,6 +562,68 @@ POST /v1/builder/sessions/{id}/apply  { "plan_id": "plan-5d2c" }
 `validation.publishable` comes from the same `POST /workflows/{id}/validate` the UI calls,
 run against the proposed graph before the plan is shown. The builder therefore cannot
 propose an ecosystem that will not run and call it done.
+
+### 7.1 The early prototype, and how it extends rather than gets replaced
+
+The prototype is the full design with a **smaller tool surface**. Nothing about the plan
+schema, the propose/apply split, the transaction boundary or the permission model is
+provisional.
+
+```python
+# domain/builder/capabilities.py — pure, and the only thing that changes per phase.
+class BuilderCapability(StrEnum):
+    CREATE_AGENT      = "create_agent"        # Phase 4
+    CREATE_CONNECTION = "create_connection"   # Phase 4
+    CREATE_TEAM       = "create_team"         # Phase 4
+    CREATE_WORKFLOW   = "create_workflow"     # Phase 10
+    CREATE_TRIGGER    = "create_trigger"      # Phase 10
+    CREATE_INTEGRATION = "create_integration" # Phase 10
+    CREATE_KNOWLEDGE  = "create_knowledge"    # Phase 10
+    MODIFY_EXISTING   = "modify_existing"     # Phase 10
+    GRANT_TOOL        = "grant_tool"          # Phase 10
+```
+
+The enabled set is configuration. The model is handed tool definitions for exactly the
+enabled capabilities, and a plan containing anything else is rejected by the plan validator
+before a user ever sees it — so the prototype cannot half-propose a workflow and fail at
+apply.
+
+**What the prototype can do (Phase 4)**
+
+| Capability | Example |
+|-----------|---------|
+| Create agents from natural language | *"a researcher and a writer"* → two `managed` agents with roles, instructions and a default model profile |
+| Create simple connections | a `delegate` connection from researcher to writer |
+| Create a basic multi-agent team | the two above, plus a two-step sequential workflow compiled from the delegation — see below |
+| Present a structured proposal | the same `plan` object the complete builder returns, rendered as a list and previewed on the island |
+| Confirm or reject | `POST …/apply` with the `plan_id`, or discard. Nothing is created until then |
+| Show the result in the workspace | the applied objects appear on the island and in the agents list, via the ordinary realtime deltas |
+
+**`create_team` compiles to a real workflow.** This is the decision that keeps the
+prototype from becoming throwaway architecture: a "team" is not a new entity and not a
+special execution path. The builder emits a `workflow_version` with one `agent_task` step
+per member, wired in the order the delegation implies, and it runs on the same orchestrator
+as everything else. There is exactly one execution engine in the product at every point in
+its life.
+
+**What the prototype cannot do**, and says so in plain language when asked: workflows with
+branches or approvals, integrations, triggers, knowledge sources, tool grants, or modifying
+anything that already exists. Asked for one, it answers what it can build now and what has
+to be done by hand — rather than attempting it and producing something that fails
+`validate`.
+
+**What does not change between the prototype and the complete version**
+
+- the plan schema, including `reuses`, `creates`, `requires_consent` and `validation`
+- propose-then-apply, with nothing created on propose
+- one transaction on apply; a half-built ecosystem is worse than none
+- workflows left unpublished and triggers left disabled
+- `builder.apply` bounded by the caller's own permissions, refused at plan time
+- per-plan object caps and per-session rate limits
+- `services/builder.py` as a client of the ordinary services, with no privileged path
+
+So Phase 10 adds capabilities to an enum and tool definitions to a prompt. It does not
+revisit the architecture, which is the whole reason the prototype is worth shipping early.
 
 ### Architecturally
 

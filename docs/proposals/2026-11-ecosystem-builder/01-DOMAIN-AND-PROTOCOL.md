@@ -21,7 +21,7 @@ EXECUTION          what actually ran. Written by reducers and the orchestrator.
   events, logs, metric_samples          (append-only, partitioned)
 
 PRESENTATION       how it looks. Touched by no reducer, adapter or SDK.
-  world_layouts, world_placements
+  world_layouts, world_districts, world_nodes, world_routes
 ```
 
 | Group | Written by | Replayable | Retention |
@@ -373,55 +373,210 @@ it is not part of the contract.
 
 ## 6. Credentials — the separate mechanism
 
+The requirement is a credential the server can *use* and nobody can *read*. That is a
+different mechanism from `api_keys`, which must be verifiable and unreadable even by the
+server, and the two are kept apart deliberately: conflating them yields either unusable
+integrations or recoverable AgentWorld keys.
+
+| | `api_keys` (Phase 1, built) | `credentials` (proposed) |
+|---|---|---|
+| Purpose | authenticate an inbound caller | authenticate AgentWorld to someone else |
+| Stored as | Argon2id hash of a peppered secret | AES-256-GCM ciphertext under a wrapped data key |
+| Recoverable by the server | **no, ever** | yes, at the point of use, and nowhere else |
+| Recoverable by an attacker with the database | no | no — the key-encryption key is not in it |
+| Shown to a user | once, at mint | never |
+| Module | `infra/hashing.py` (untouched) | `infra/secrets/` (new) |
+
+### Schema
+
 ```sql
 CREATE TYPE credential_kind AS ENUM ('api_key', 'oauth2', 'basic', 'custom');
 
 CREATE TABLE credentials (
   id            uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   workspace_id  uuid NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
-  project_id    uuid REFERENCES projects(id) ON DELETE CASCADE,
+  project_id    uuid REFERENCES projects(id) ON DELETE CASCADE,  -- NULL = workspace-wide
   name          text NOT NULL,
   kind          credential_kind NOT NULL,
   provider_slug text NOT NULL,
-  -- Envelope-encrypted. `ciphertext` is AES-256-GCM over the secret material
-  -- under a per-row data key; `wrapped_key` is that data key encrypted by the
-  -- master key named in `key_id`. Rotating the master re-wraps the data keys
-  -- without touching, or decrypting, the secrets themselves.
+
+  -- Envelope encryption. `ciphertext` is AES-256-GCM over the secret material
+  -- under a per-row data key (DEK); `wrapped_key` is that DEK encrypted by the
+  -- key-encryption key (KEK) named in `key_id`. The KEK is never in this
+  -- database.
   ciphertext    bytea NOT NULL,
-  nonce         bytea NOT NULL,
+  nonce         bytea NOT NULL,       -- 96-bit, unique per encryption
   wrapped_key   bytea NOT NULL,
-  key_id        text  NOT NULL,
-  -- Readable facts, so the UI can show something useful without decrypting.
-  display_hint  text,                  -- "xoxb-…4f2a", "ada@example.com"
+  key_id        text  NOT NULL,       -- which KEK version wrapped this DEK
+  aad_version   smallint NOT NULL DEFAULT 1,
+
+  -- Readable facts, so the UI shows something useful without decrypting.
+  display_hint  text,                 -- "xoxb-…4f2a", "ada@example.com"
   scopes        text[],
   expires_at    timestamptz,
   refresh_after timestamptz,
+
   created_by_user_id uuid REFERENCES users(id) ON DELETE SET NULL,
   created_at    timestamptz NOT NULL DEFAULT now(),
   last_used_at  timestamptz,
   revoked_at    timestamptz,
+  revoked_by_user_id uuid REFERENCES users(id) ON DELETE SET NULL,
+  deleted_at    timestamptz,          -- tombstone; see "Deletion" below
   UNIQUE (workspace_id, provider_slug, name)
 );
+CREATE INDEX credentials_refresh_due_idx ON credentials (refresh_after)
+  WHERE revoked_at IS NULL AND deleted_at IS NULL AND refresh_after IS NOT NULL;
 ```
 
-Five rules, each one a thing that otherwise goes wrong:
+### Envelope encryption, and what each layer is for
 
-1. **No endpoint ever returns `ciphertext`, `nonce` or `wrapped_key`.** As with `ApiKey`,
-   the domain entity has no field for them, so there is nowhere for a response model or a
-   log line to pick them up. Only `infra/secrets/` sees them.
-2. **Decryption is by `credential_id` at the point of use**, inside the tool or provider
-   call, never earlier. A credential is not loaded into an execution's context.
-3. **Credentials are never in events, step inputs or step outputs.** Tool schemas declare
-   `secret_fields`; the executor redacts them before the result is persisted or
-   published. A test asserts a known secret never appears in `events`, `logs`,
-   `execution_steps` or `dispatches` — the same shape as the Phase 1 test that searched
-   every text column for a key plaintext.
-4. **`api_keys` is untouched.** AgentWorld's own credentials stay Argon2id-hashed and
-   unrecoverable. Two mechanisms, because one must be verifiable and the other usable.
-5. **The master key comes from the environment** (`CREDENTIAL_MASTER_KEY`), and
-   `Settings` refuses to boot without it outside local and test — the pattern
-   `API_KEY_PEPPER` already uses. `SecretStore` is an interface, so KMS or Vault is a
-   deployment choice.
+```
+secret material
+   │  AES-256-GCM, nonce unique per encryption,
+   │  AAD = workspace_id ‖ credential_id ‖ aad_version
+   ▼
+ciphertext + nonce                     ──► credentials.ciphertext, .nonce
+   ▲
+   │ encrypted under
+data key (DEK), 256-bit, one per credential
+   │  wrapped by
+   ▼
+key-encryption key (KEK), named by key_id, held in the environment or a KMS
+```
+
+Three properties, each the reason a layer exists:
+
+**The AAD binds the ciphertext to its tenant and its row.** Authenticated additional
+data is covered by the GCM tag but not stored, so decryption fails unless the caller
+supplies the same `workspace_id` and `credential_id`. A row copied from one workspace to
+another — by a SQL injection, a bad restore, or a mistaken migration — **cannot be
+decrypted in its new home**. This is the strongest tenant-isolation property in the
+proposal and it costs nothing: `SecretStore.decrypt()` takes both ids and has no overload
+that omits them.
+
+**A per-credential DEK keeps KEK rotation cheap.** Rotating the KEK means unwrapping and
+re-wrapping each DEK. That needs no access to the plaintext secret, touches no
+`ciphertext`, and can run online over a few thousand rows in seconds.
+
+**`key_id` makes rotation additive rather than a cutover.** Several KEKs are valid at
+once; rows name the one that wrapped them.
+
+### Key management and rotation
+
+```
+CREDENTIAL_KEKS           = '{"k2026a":"<base64 32 bytes>","k2026b":"<base64>"}'
+CREDENTIAL_ACTIVE_KEK_ID  = 'k2026b'
+```
+
+`Settings` refuses to construct outside `local` and `test` without both, and refuses an
+`ACTIVE_KEK_ID` absent from the map — the same fail-fast validator `API_KEY_PEPPER`
+already uses, which Phase 1 has a test for.
+
+| Operation | What it does | Needs plaintext? | Online? |
+|-----------|--------------|------------------|---------|
+| **KEK rotation** | add a new KEK, point `ACTIVE` at it, re-wrap DEKs in the background, retire the old KEK when no row names it | no | yes |
+| **DEK rotation** | new DEK and new ciphertext for one credential | yes | yes, at rotation time |
+| **Credential rotation** | the user supplies new material; a new DEK and ciphertext replace the old | n/a | yes |
+| **Compromised KEK** | rotate KEK, then rotate every credential it protected — the material must be assumed read | yes | per credential |
+
+`SecretStore` is an interface with an envelope implementation over the environment map.
+A KMS or Vault backend implements the same two methods; the choice is a deployment one and
+no caller changes.
+
+```python
+class SecretStore(Protocol):
+    async def encrypt(self, plaintext: bytes, *, workspace_id: UUID,
+                      credential_id: UUID) -> EncryptedBlob: ...
+    async def decrypt(self, blob: EncryptedBlob, *, workspace_id: UUID,
+                      credential_id: UUID) -> bytes: ...
+```
+
+### Tenant isolation
+
+Four independent layers, which is one more than any other table gets, because this is the
+table worth the most to an attacker:
+
+1. `credentials` is in `RLS_PROTECTED_TABLES`, so a query with the wrong session variable
+   returns nothing.
+2. The repository is a `ScopedRepository` and cannot be constructed without a
+   `TenantScope`.
+3. `authorize()` requires `admin` for every credential action (see `05-PERMISSIONS.md`).
+4. The AAD binding above, which makes a leaked row useless in another workspace even if
+   the first three were bypassed.
+
+### No exposure to frontend clients
+
+- **The domain entity has no field for secret material.** As with `ApiKey` in Phase 1,
+  there is nowhere for a response model, a `repr`, a log line or a serialiser to pick it
+  up, because the attribute does not exist. Only `infra/secrets/` sees `EncryptedBlob`.
+- **No endpoint returns it.** There is no `credential.read_secret` action in the
+  permission matrix — not restricted to owners, *absent*.
+- **Decryption happens at the point of use**, inside the provider or tool call, keyed by
+  `credential_id`. A credential is never loaded into an execution's context, a dispatch's
+  `instruction`, or a prompt.
+- **A dispatch carries references, never material.** `dispatches.instruction` holds
+  `{"credential_id": "…"}`; the worker resolves it immediately before the outbound call.
+- *Acceptance:* a test walks the generated OpenAPI document and asserts no schema reachable
+  from a `credentials` response has a property named `ciphertext`, `nonce`, `wrapped_key`,
+  `secret`, `token`, `password` or `key`.
+
+### Redaction in logs, events, errors and telemetry
+
+Four mechanisms, because each channel leaks differently:
+
+| Channel | Mechanism |
+|---------|-----------|
+| **Logs** | A `Secret` wrapper whose `__str__`, `__repr__` and `__format__` return `"***"`, so an accidental `log.info("...", cred=c)` renders nothing. Plus a structlog processor that scrubs values matching known credential shapes from every event dict |
+| **Events** | Tool and provider schemas declare `secret_fields`; the executor redacts those paths from step input and output **before** the event is appended or published. Redaction happens at the boundary, not at render time, so the stored row is already clean |
+| **Errors** | Problem details never echo a request body. Provider and tool errors are mapped to sanitised messages; the raw error goes to the log with the secret already wrapped |
+| **Telemetry** | Metric labels are a fixed allow-list of low-cardinality names. No span attribute is populated from a tool argument or result |
+
+*Acceptance (the canary test):* a credential is created whose secret is a known unique
+string. A workflow then uses it through a tool, fails, retries and succeeds. The test
+asserts the canary appears in **no** row of any table, **no** captured log line, **no**
+`events` payload, **no** WebSocket frame, **no** problem document and **no** metric label.
+This is the same shape as the Phase 1 test that searched every text column for an API key
+plaintext, which already passes.
+
+### Revocation and deletion
+
+**Revoke** — `revoked_at` set, and the effects are immediate and loud rather than silent:
+
+| Consequence | Behaviour |
+|-------------|-----------|
+| `SecretStore.decrypt` | refuses; the row is treated as absent |
+| A dispatch using it | fails with a terminal (non-retryable) error — retrying cannot help |
+| The step | `workflow.step_failed`, reason `credential_revoked`; `on_failure` applies |
+| The integration | status `error`, with the reason shown in the workspace and on the island portal |
+| Model profiles using it | agents using them fail to dispatch, with the same clear reason |
+| Running executions | fail the affected step. They are **not** paused and **not** silently skipped: a workflow that quietly continued without the step it needed would be worse than one that stopped |
+| Reversible? | No. Un-revoking would mean the window of compromise had no end. Create a new credential |
+
+**Delete** — a two-step operation, because an unreferenced credential is the only kind
+safe to remove:
+
+1. `DELETE` is refused with `409` while any integration, model profile or enabled trigger
+   references it, and the response names the referents. `ON DELETE RESTRICT` enforces it
+   at the database as well.
+2. Once detached, deletion zeroes `ciphertext`, `nonce` and `wrapped_key`, sets
+   `deleted_at`, and **keeps the row as a tombstone** carrying `id`, `name`,
+   `display_hint`, `created_by`, `revoked_at` and `deleted_at`. `audit_log` rows reference
+   credential ids, and a dangling reference in an audit trail is worse than a tombstone.
+
+**OAuth revocation** is best-effort and says so: AgentWorld calls the provider's revoke
+endpoint, then revokes locally **regardless of the outcome**. The UI reports whether the
+provider confirmed. Claiming a third party honoured a revocation is not something this
+system can know.
+
+*Acceptance criteria for this section:*
+
+- A revoked credential cannot be decrypted, and the failing step's reason names the cause.
+- A referenced credential cannot be deleted; the `409` lists what references it.
+- A deleted credential's row holds no key material, and audit rows referencing it still
+  resolve.
+- A credential row copied into another workspace at the SQL level cannot be decrypted.
+- KEK rotation re-wraps every DEK with no plaintext access and no change to `ciphertext`.
+- The canary test above passes.
 
 ## 7. Execution state
 
@@ -530,7 +685,8 @@ workspace ─┬─ projects ─┬─ agents ──────────┬�
            │            │                                │                   └─ dispatches
            │            │                                └─ (events, logs)
            │            ├─ triggers ──> workflows
-           │            └─ world_layouts, world_placements      [presentation]
+           │            └─ world_layouts, world_districts,
+           │               world_nodes, world_routes            [presentation]
            ├─ api_keys
            ├─ credentials
            └─ audit_log
@@ -688,3 +844,140 @@ Promises 1–6 in `docs/03-API.md` §5 stand unchanged, and one is added:
 >    workers running and asserting that no dispatch row is created.
 
 That promise is what lets the other six survive the move from telemetry to orchestration.
+
+
+## 10. The visual state model, and why it is a separate table set
+
+The island needs persisted layout — where a building sits, how big it is, what it looks
+like, which district it belongs to, how a road is routed. That is **not** a view of
+execution state and must not be stored with it.
+
+The rule, stated as the two failures it prevents:
+
+> **Moving a building must never change what the system does.** If position lived on
+> `agents`, then a drag would be a write to a domain row, would need the permission that
+> edits an agent, would appear in the audit trail as a configuration change, and would
+> have to be considered by anything that reads agent state.
+>
+> **An agent that is offline, archived or broken must stay on the island.** If a node's
+> existence were derived from execution state, the island would empty itself exactly when
+> the user most needs to look at it. A shuttered building is the information.
+
+### Schema
+
+```sql
+CREATE TABLE world_layouts (
+  project_id   uuid PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
+  theme        text NOT NULL DEFAULT 'island-temperate',
+  grid_width   smallint NOT NULL DEFAULT 24,
+  grid_height  smallint NOT NULL DEFAULT 24,
+  tiles        jsonb NOT NULL DEFAULT '[]'::jsonb,
+  -- [{"q":3,"r":5,"terrain":"grass","decor":"tree"}, ...]
+  landmarks    jsonb NOT NULL DEFAULT '[]'::jsonb,
+  camera       jsonb NOT NULL DEFAULT '{}'::jsonb,   -- last view, per project
+  updated_at   timestamptz NOT NULL DEFAULT now()
+);
+
+-- Visual grouping only. A *project* is the domain and tenancy boundary; a
+-- *district* is a region of one project's island. The earlier proposal mapped
+-- the brief's "projects or districts" onto projects alone; this separates
+-- them, so a user can group an ecosystem visually without creating a second
+-- tenancy boundary and without the permissions that come with one.
+CREATE TABLE world_districts (
+  id           uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  project_id   uuid NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  name         text NOT NULL,
+  bounds       jsonb NOT NULL,          -- {"q":0,"r":0,"width":8,"height":8}
+  accent_color text,
+  collapsed    boolean NOT NULL DEFAULT false,
+  sort_order   smallint NOT NULL DEFAULT 0,
+  UNIQUE (project_id, name)
+);
+
+-- One row per placed object, whatever kind it is. Replaces the previous
+-- design's `world_placements`, which was keyed on `agent_id` and so could
+-- only ever place agents.
+CREATE TABLE world_nodes (
+  project_id   uuid NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  node_kind    text NOT NULL,           -- 'agent'|'workflow'|'integration'|
+                                        -- 'knowledge_source'|'trigger'|'approval_desk'
+  node_id      uuid NOT NULL,           -- the domain object's id
+  district_id  uuid REFERENCES world_districts(id) ON DELETE SET NULL,
+
+  -- position and size
+  tile_q       smallint NOT NULL,
+  tile_r       smallint NOT NULL,
+  width        smallint NOT NULL DEFAULT 1,
+  height       smallint NOT NULL DEFAULT 1,
+  rotation     smallint NOT NULL DEFAULT 0,
+  z_order      smallint NOT NULL DEFAULT 0,
+
+  -- appearance
+  building_kind  text NOT NULL,         -- 'workshop'|'library'|'factory'|'portal'|...
+  character_kind text,                  -- sprite set, for agents
+  accent_color text,
+  icon         text,
+  scale        numeric(3,2) NOT NULL DEFAULT 1.00,
+
+  auto_assigned boolean NOT NULL DEFAULT true,
+  hidden       boolean NOT NULL DEFAULT false,   -- a user's choice, not a status
+  updated_at   timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (project_id, node_kind, node_id),
+  UNIQUE (project_id, tile_q, tile_r)
+);
+
+-- Visual routing for a line the user can see. The *existence* of the
+-- relationship is domain (`connections`, `workflow_edges`); only its drawn
+-- path is here, so rerouting a road changes no grant.
+CREATE TABLE world_routes (
+  project_id   uuid NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  route_kind   text NOT NULL,           -- 'connection' | 'workflow_edge'
+  route_id     uuid NOT NULL,           -- connections.id | workflow_edges.id
+  waypoints    jsonb NOT NULL DEFAULT '[]'::jsonb,   -- [{"q":4,"r":6}, ...]
+  style        text NOT NULL DEFAULT 'road',         -- 'road'|'bridge'|'cable'|'pipe'
+  accent_color text,
+  hidden       boolean NOT NULL DEFAULT false,
+  updated_at   timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (project_id, route_kind, route_id)
+);
+```
+
+### What these tables deliberately do not contain
+
+No column here holds, mirrors or caches:
+
+- agent execution status (`working`, `idle`, `offline`, `error`, `paused`)
+- workflow or step execution state
+- integration connection health
+- task or step progress
+- anything else a reducer writes
+
+Those arrive at render time, from the domain, as the second argument to `projectLive`.
+A `hidden` column exists and is a *user's choice to hide something*, which is why it is
+here; an `offline` column would be a cache of execution state, which is why there is not
+one.
+
+*Acceptance (a structural test, not a convention):* the presentation tables' column names
+are asserted to intersect a forbidden list — `status`, `progress`, `running`, `state`,
+`last_heartbeat_at`, `current_task_id`, `enabled`, `health` — at zero. A future column
+called `agent_status` on `world_nodes` fails CI.
+
+### What enforces the separation
+
+| Guarantee | Mechanism |
+|-----------|-----------|
+| No reducer writes a world table | the reducer registry's targets are typed to the execution tables; a `world_*` write from `domain/reducers/` does not type-check, and an import-linter contract forbids the presentation repositories there |
+| No execution table references a world table | no foreign key points that way. Dropping all four tables leaves every execution query valid — the existing "the backend would behave identically" property, kept |
+| Moving an object changes nothing operational | the only write is `world_nodes`; it emits no event, writes no `audit_log` row, and the `world.update` permission is held by `member` and grants nothing else (`05-PERMISSIONS.md`) |
+| An offline or archived agent stays visible | `world_nodes` rows are independent of status. An archived agent keeps its node and renders shuttered; deleting the agent cascades the node, and **deleting a node does not touch the agent** |
+| The domain stays the source of truth | the projections read both and write neither. `interpret()` is pure and cannot fetch; `world/dispatch/` is the only layer that may call an API |
+
+*Acceptance criteria:*
+
+- Moving a node produces no row in `events` and no row in `audit_log`.
+- A `viewer` cannot move a node; a `member` can; moving one never requires `agent.update`.
+- An agent transitioning to `offline`, and an agent archived, both still render.
+- Deleting a `world_nodes` row leaves the agent, its runs and its history intact.
+- Dropping all four presentation tables leaves the backend suite green — the Phase 0
+  isolation property, widened from two tables to four.
+
