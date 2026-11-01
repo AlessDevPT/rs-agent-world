@@ -755,6 +755,283 @@ class WorkflowEdge(Base):
     )
 
 
+# ------------------------------------------------------ Phase 2: execution ---
+
+#: Statuses in which an execution may still progress. The no-stuck-executions
+#: invariant reads this: a live execution with no live dispatch, no pending
+#: approval and no terminal step is a bug.
+LIVE_EXECUTION_STATUSES: tuple[str, ...] = (
+    "pending",
+    "running",
+    "waiting_approval",
+    "waiting_input",
+    "paused",
+)
+
+
+class WorkflowExecution(Base):
+    """One run of one frozen workflow version.
+
+    Bound to a `workflow_version_id` for its whole life, so editing the
+    definition cannot change what a running copy means.
+
+    The initiator is immutable and total: written once at creation, never
+    recomputed, and never resolved through a mutable row. Authority for a
+    `system` initiator comes from the published version rather than from a
+    user, so the run borrows no account's permissions and nothing goes stale
+    after a demotion or a departure.
+    """
+
+    __tablename__ = "workflow_executions"
+
+    id: Mapped[UUID] = _uuid_pk()
+    workspace_id: Mapped[UUID] = mapped_column(
+        sa.ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False
+    )
+    project_id: Mapped[UUID] = mapped_column(
+        sa.ForeignKey("projects.id", ondelete="CASCADE"), nullable=False
+    )
+    workflow_id: Mapped[UUID] = mapped_column(
+        sa.ForeignKey("workflows.id", ondelete="CASCADE"), nullable=False
+    )
+    #: RESTRICT: the frozen version cannot be deleted while an execution
+    #: references it, or the record would describe a graph nobody can read.
+    workflow_version_id: Mapped[UUID] = mapped_column(
+        sa.ForeignKey("workflow_versions.id", ondelete="RESTRICT"), nullable=False
+    )
+    status: Mapped[enums.ExecutionStatus] = mapped_column(
+        pg_enum(enums.ExecutionStatus, "execution_status"),
+        nullable=False,
+        server_default=sa.text("'pending'::execution_status"),
+    )
+    #: The FK arrives with `triggers` in Phase 7.
+    trigger_id: Mapped[UUID | None] = mapped_column(sa.Uuid)
+
+    # ---- the immutable initiator ----
+    initiator_kind: Mapped[enums.InitiatorKind] = mapped_column(
+        pg_enum(enums.InitiatorKind, "initiator_kind"), nullable=False
+    )
+    #: RESTRICT: a user who has initiated an execution cannot be hard deleted
+    #: out from under the record.
+    initiator_user_id: Mapped[UUID | None] = mapped_column(
+        sa.ForeignKey("users.id", ondelete="RESTRICT")
+    )
+    initiator_trigger_id: Mapped[UUID | None] = mapped_column(sa.Uuid)
+    #: Plain text, written once, so an audit two years later answers "what
+    #: started this" without a join that may have gone.
+    initiator_label: Mapped[str] = mapped_column(nullable=False)
+
+    #: A trigger firing twice yields one execution.
+    idempotency_key: Mapped[str | None] = mapped_column(CITEXT)
+    input: Mapped[dict[str, Any]] = mapped_column(
+        nullable=False, server_default=sa.text("'{}'::jsonb")
+    )
+    output: Mapped[dict[str, Any] | None]
+    error: Mapped[dict[str, Any] | None]
+    started_at: Mapped[dt.datetime | None]
+    finished_at: Mapped[dt.datetime | None]
+    created_at: Mapped[dt.datetime] = _created_at()
+
+    __table_args__ = (
+        # Exactly one of the two ids, matching the kind. A `system` initiator
+        # names no user, which is the whole point.
+        sa.CheckConstraint(
+            "(initiator_kind = 'user' AND initiator_user_id IS NOT NULL "
+            "AND initiator_trigger_id IS NULL) "
+            "OR (initiator_kind = 'system' AND initiator_user_id IS NULL)",
+            name="initiator_user_xor_system",
+        ),
+        sa.UniqueConstraint(
+            "project_id", "idempotency_key", name="workflow_executions_idempotency_key"
+        ),
+        # Redundant alone; the target of `execution_steps`, which is what
+        # stops a step being recorded against a version this execution is not
+        # bound to.
+        sa.UniqueConstraint("id", "workflow_version_id", name="workflow_executions_id_version_key"),
+        sa.Index(
+            "executions_live_idx",
+            "project_id",
+            "status",
+            "created_at",
+            postgresql_where=sa.text("status IN ('" + "', '".join(LIVE_EXECUTION_STATUSES) + "')"),
+        ),
+        sa.Index("executions_initiator_idx", "project_id", "initiator_kind", "created_at"),
+        sa.Index("executions_workflow_idx", "workflow_id", "created_at"),
+    )
+
+
+class ExecutionStep(Base):
+    """One attempt at one step of one execution.
+
+    The two composite foreign keys together say "this step belongs to the
+    version its execution is bound to" - the same bug class as 0008's
+    cross-version edge, one level down. Without them a step record could be
+    attributed to a step absent from the graph being executed.
+    """
+
+    __tablename__ = "execution_steps"
+
+    id: Mapped[UUID] = _uuid_pk()
+    execution_id: Mapped[UUID] = mapped_column(sa.Uuid, nullable=False)
+    workspace_id: Mapped[UUID] = mapped_column(
+        sa.ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False
+    )
+    project_id: Mapped[UUID] = mapped_column(
+        sa.ForeignKey("projects.id", ondelete="CASCADE"), nullable=False
+    )
+    #: Denormalised so the composite foreign keys below can be expressed.
+    workflow_version_id: Mapped[UUID] = mapped_column(sa.Uuid, nullable=False)
+    workflow_step_id: Mapped[UUID] = mapped_column(sa.Uuid, nullable=False)
+    #: Denormalised, so a timeline needs no join.
+    step_key: Mapped[str] = mapped_column(CITEXT, nullable=False)
+    status: Mapped[enums.StepStatus] = mapped_column(
+        pg_enum(enums.StepStatus, "step_status"),
+        nullable=False,
+        server_default=sa.text("'pending'::step_status"),
+    )
+    attempt: Mapped[int] = mapped_column(nullable=False, server_default=sa.text("0"))
+    agent_id: Mapped[UUID | None] = mapped_column(sa.ForeignKey("agents.id", ondelete="SET NULL"))
+    #: The FK arrives with `tasks`.
+    task_id: Mapped[UUID | None] = mapped_column(sa.Uuid)
+    input: Mapped[dict[str, Any] | None]
+    output: Mapped[dict[str, Any] | None]
+    error: Mapped[dict[str, Any] | None]
+    started_at: Mapped[dt.datetime | None]
+    finished_at: Mapped[dt.datetime | None]
+
+    __table_args__ = (
+        sa.CheckConstraint("attempt >= 0", name="step_attempt_is_not_negative"),
+        # This row's version must be the one its execution is bound to.
+        sa.ForeignKeyConstraint(
+            ["execution_id", "workflow_version_id"],
+            [
+                "workflow_executions.id",
+                "workflow_executions.workflow_version_id",
+            ],
+            name="execution_steps_execution_version_fkey",
+            ondelete="CASCADE",
+        ),
+        # And the step named must live in that version.
+        sa.ForeignKeyConstraint(
+            ["workflow_version_id", "workflow_step_id"],
+            ["workflow_steps.workflow_version_id", "workflow_steps.id"],
+            name="execution_steps_step_fkey",
+            ondelete="RESTRICT",
+        ),
+        sa.UniqueConstraint(
+            "execution_id", "workflow_step_id", "attempt", name="execution_steps_attempt_key"
+        ),
+        sa.Index("execution_steps_execution_idx", "execution_id"),
+        sa.Index(
+            "execution_steps_live_idx",
+            "project_id",
+            "status",
+            postgresql_where=sa.text("status IN ('pending', 'ready', 'dispatched', 'running')"),
+        ),
+    )
+
+
+class Dispatch(Base):
+    """The transactional outbox: work to be performed, exactly once asked for.
+
+    **Not part of the event log and never replayed.** One transaction appends
+    an event, folds the state change, and inserts a row here; a worker then
+    performs the side effect. That separation is what lets the log be replayed
+    to rebuild state without re-sending the emails.
+
+    Operational state rather than history: rows are updated as they progress
+    and pruned after completion. The history is in `events`.
+    """
+
+    __tablename__ = "dispatches"
+
+    id: Mapped[UUID] = _uuid_pk()
+    workspace_id: Mapped[UUID] = mapped_column(
+        sa.ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False
+    )
+    project_id: Mapped[UUID] = mapped_column(
+        sa.ForeignKey("projects.id", ondelete="CASCADE"), nullable=False
+    )
+    execution_id: Mapped[UUID | None] = mapped_column(
+        sa.ForeignKey("workflow_executions.id", ondelete="CASCADE")
+    )
+    execution_step_id: Mapped[UUID | None] = mapped_column(
+        sa.ForeignKey("execution_steps.id", ondelete="CASCADE")
+    )
+    kind: Mapped[enums.DispatchKind] = mapped_column(
+        pg_enum(enums.DispatchKind, "dispatch_kind"), nullable=False
+    )
+    status: Mapped[enums.DispatchStatus] = mapped_column(
+        pg_enum(enums.DispatchStatus, "dispatch_status"),
+        nullable=False,
+        server_default=sa.text("'pending'::dispatch_status"),
+    )
+    #: Copied at dispatch time, not looked up at retry time: the retry policy
+    #: must not change because somebody edited a tool while work was in
+    #: flight.
+    side_effect_class: Mapped[enums.SideEffect] = mapped_column(
+        pg_enum(enums.SideEffect, "side_effect"), nullable=False
+    )
+    #: The whole instruction, resolved: credential *references*, never
+    #: credentials.
+    instruction: Mapped[dict[str, Any]] = mapped_column(nullable=False)
+    #: Forwarded outbound as `X-AgentWorld-Idempotency-Key`, stable across
+    #: attempts of the same work. A human-initiated retry gets a new one,
+    #: because that is new work rather than a repeat.
+    idempotency_token: Mapped[UUID] = mapped_column(
+        sa.Uuid, nullable=False, server_default=sa.text("gen_random_uuid()")
+    )
+    attempt: Mapped[int] = mapped_column(nullable=False, server_default=sa.text("0"))
+    max_attempts: Mapped[int] = mapped_column(nullable=False, server_default=sa.text("3"))
+    #: A lease, not a lock: a worker that dies holds nothing.
+    leased_by: Mapped[str | None]
+    leased_until: Mapped[dt.datetime | None]
+    #: Set before the outbound call and cleared after it returns. A lease that
+    #: expires with this set means the side effect was in flight when the
+    #: worker died and nobody knows whether it landed - which is what sends a
+    #: consequential dispatch to `needs_review` rather than a retry.
+    side_effect_started_at: Mapped[dt.datetime | None]
+    run_after: Mapped[dt.datetime] = _created_at()
+    last_error: Mapped[str | None]
+    last_error_code: Mapped[str | None]
+    created_at: Mapped[dt.datetime] = _created_at()
+    finished_at: Mapped[dt.datetime | None]
+
+    __table_args__ = (
+        sa.CheckConstraint("attempt >= 0", name="dispatch_attempt_is_not_negative"),
+        sa.CheckConstraint("max_attempts >= 1", name="dispatch_max_attempts_is_positive"),
+        # A row marked leased with no lease could never be reclaimed by the
+        # reaper, so it would be stuck forever. Make it unrepresentable.
+        sa.CheckConstraint(
+            "status <> 'leased' OR (leased_by IS NOT NULL AND leased_until IS NOT NULL)",
+            name="leased_dispatch_has_a_lease",
+        ),
+        # The idempotency guarantee: one dispatch per step attempt. Two
+        # concurrent `advance` calls hit this rather than sending twice.
+        sa.UniqueConstraint(
+            "execution_step_id", "kind", "attempt", name="dispatches_step_attempt_key"
+        ),
+        sa.Index(
+            "dispatches_claimable_idx",
+            "run_after",
+            "id",
+            postgresql_where=sa.text("status = 'pending'"),
+        ),
+        sa.Index(
+            "dispatches_expired_lease_idx",
+            "leased_until",
+            postgresql_where=sa.text("status = 'leased'"),
+        ),
+        # What the attention queue reads: the two states that need a human.
+        sa.Index(
+            "dispatches_attention_idx",
+            "project_id",
+            "status",
+            postgresql_where=sa.text("status IN ('dead', 'needs_review')"),
+        ),
+    )
+
+
 #: Tables protected by row-level security in migration `0004_rls`.
 #: `test_rls.py` reads this and asserts the database agrees, so a new
 #: tenant-scoped table cannot be added without a decision about it being
@@ -779,4 +1056,8 @@ RLS_PROTECTED_TABLES: tuple[str, ...] = (
     "workflow_versions",
     "workflow_steps",
     "workflow_edges",
+    # 0009
+    "workflow_executions",
+    "execution_steps",
+    "dispatches",
 )
