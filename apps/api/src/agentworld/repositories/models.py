@@ -525,6 +525,236 @@ class Connection(Base):
     )
 
 
+# ------------------------------------------------------ Phase 2: workflows ---
+
+#: What a step may do when it fails. Text with a check constraint rather than
+#: a native enum: adding a fourth value should not need `ALTER TYPE` and the
+#: transaction dance that comes with it (migration 0006, and `env.py`).
+ON_FAILURE: tuple[str, ...] = ("fail", "continue", "route")
+
+
+class Workflow(Base):
+    """A workflow definition. Executions reference a *version*, never this.
+
+    `current_version_id` is the published version that triggers and manual
+    runs use, and its foreign key targets `(workflow_id, id)` so it cannot
+    name a version belonging to a different workflow.
+    """
+
+    __tablename__ = "workflows"
+
+    id: Mapped[UUID] = _uuid_pk()
+    workspace_id: Mapped[UUID] = mapped_column(
+        sa.ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False
+    )
+    project_id: Mapped[UUID] = mapped_column(
+        sa.ForeignKey("projects.id", ondelete="CASCADE"), nullable=False
+    )
+    slug: Mapped[str] = mapped_column(CITEXT, nullable=False)
+    name: Mapped[str] = mapped_column(nullable=False)
+    description: Mapped[str | None]
+    #: NULL until the first publish, which is why a workflow starts disabled.
+    current_version_id: Mapped[UUID | None] = mapped_column(sa.Uuid)
+    enabled: Mapped[bool] = mapped_column(nullable=False, server_default=sa.text("false"))
+    created_by_user_id: Mapped[UUID | None] = mapped_column(
+        sa.ForeignKey("users.id", ondelete="SET NULL")
+    )
+    created_at: Mapped[dt.datetime] = _created_at()
+    archived_at: Mapped[dt.datetime | None]
+
+    __table_args__ = (
+        sa.UniqueConstraint("project_id", "slug", name="workflows_project_slug_key"),
+        # Composite, so the named version must belong to this workflow.
+        #
+        # `use_alter` is not cosmetic. `workflows` and `workflow_versions`
+        # reference each other, and without it SQLAlchemy cannot sort the two
+        # and warns that "foreign key constraints involving these tables will
+        # not be considered" - which would mean the schema drift test
+        # silently stopped comparing foreign keys on both. A blind check that
+        # reports success is worse than no check. `use_alter` tells
+        # SQLAlchemy this constraint is emitted after both tables exist,
+        # which is exactly what migration 0008 does.
+        sa.ForeignKeyConstraint(
+            ["id", "current_version_id"],
+            ["workflow_versions.workflow_id", "workflow_versions.id"],
+            name="workflows_current_version_fkey",
+            ondelete="SET NULL",
+            use_alter=True,
+        ),
+    )
+
+
+class WorkflowVersion(Base):
+    """A frozen graph. An execution is bound to one of these for its whole life.
+
+    Editing a definition while it runs must not change what the running copy
+    means - otherwise a step can complete against a graph that no longer
+    contains it, and replay has nothing stable to fold against.
+    """
+
+    __tablename__ = "workflow_versions"
+
+    id: Mapped[UUID] = _uuid_pk()
+    workflow_id: Mapped[UUID] = mapped_column(
+        sa.ForeignKey("workflows.id", ondelete="CASCADE"), nullable=False
+    )
+    workspace_id: Mapped[UUID] = mapped_column(
+        sa.ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False
+    )
+    project_id: Mapped[UUID] = mapped_column(
+        sa.ForeignKey("projects.id", ondelete="CASCADE"), nullable=False
+    )
+    version: Mapped[int] = mapped_column(nullable=False)
+    #: The authority an execution is bound to. `WorkflowStep` and
+    #: `WorkflowEdge` are the queryable projection of this column.
+    graph: Mapped[dict[str, Any]] = mapped_column(nullable=False)
+    input_schema: Mapped[dict[str, Any]] = mapped_column(
+        nullable=False, server_default=sa.text("'{}'::jsonb")
+    )
+    #: NULL means a draft. Only a published version may be executed.
+    published_at: Mapped[dt.datetime | None]
+    created_by_user_id: Mapped[UUID | None] = mapped_column(
+        sa.ForeignKey("users.id", ondelete="SET NULL")
+    )
+    created_at: Mapped[dt.datetime] = _created_at()
+
+    __table_args__ = (
+        sa.CheckConstraint("version > 0", name="version_is_positive"),
+        sa.UniqueConstraint("workflow_id", "version", name="workflow_versions_number_key"),
+        # Redundant alone; the target of `workflows.current_version_id`.
+        sa.UniqueConstraint("workflow_id", "id", name="workflow_versions_workflow_id_id_key"),
+    )
+
+
+class WorkflowStep(Base):
+    """One node of a frozen graph.
+
+    `step_key` is what an input mapping refers to, so renaming `name` does not
+    break a reference. The two check constraints mean an unrunnable step
+    cannot be stored at all, which leaves `validate` to report the richer
+    problems rather than this one.
+    """
+
+    __tablename__ = "workflow_steps"
+
+    id: Mapped[UUID] = _uuid_pk()
+    workflow_version_id: Mapped[UUID] = mapped_column(
+        sa.ForeignKey("workflow_versions.id", ondelete="CASCADE"), nullable=False
+    )
+    workspace_id: Mapped[UUID] = mapped_column(
+        sa.ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False
+    )
+    project_id: Mapped[UUID] = mapped_column(
+        sa.ForeignKey("projects.id", ondelete="CASCADE"), nullable=False
+    )
+    step_key: Mapped[str] = mapped_column(CITEXT, nullable=False)
+    name: Mapped[str] = mapped_column(nullable=False)
+    kind: Mapped[enums.StepKind] = mapped_column(
+        pg_enum(enums.StepKind, "step_kind"), nullable=False
+    )
+    #: RESTRICT: an agent assigned a step in a published version cannot be
+    #: deleted out from under it. Archive it instead.
+    agent_id: Mapped[UUID | None] = mapped_column(sa.ForeignKey("agents.id", ondelete="RESTRICT"))
+    #: The foreign key to `tools` arrives with that table in Phase 6.
+    tool_id: Mapped[UUID | None] = mapped_column(sa.Uuid)
+    config: Mapped[dict[str, Any]] = mapped_column(
+        nullable=False, server_default=sa.text("'{}'::jsonb")
+    )
+    #: Declarative on purpose: an expression language the orchestrator
+    #: evaluates, not code it executes.
+    input_mapping: Mapped[dict[str, Any]] = mapped_column(
+        nullable=False, server_default=sa.text("'{}'::jsonb")
+    )
+    max_attempts: Mapped[int] = mapped_column(nullable=False, server_default=sa.text("1"))
+    timeout_seconds: Mapped[int | None]
+    on_failure: Mapped[str] = mapped_column(nullable=False, server_default=sa.text("'fail'"))
+
+    __table_args__ = (
+        sa.CheckConstraint(
+            "kind <> 'agent_task' OR agent_id IS NOT NULL", name="agent_task_needs_agent"
+        ),
+        sa.CheckConstraint(
+            "kind <> 'tool_call' OR tool_id IS NOT NULL", name="tool_call_needs_tool"
+        ),
+        sa.CheckConstraint(
+            "on_failure IN ('" + "', '".join(ON_FAILURE) + "')", name="on_failure_is_known"
+        ),
+        sa.CheckConstraint("max_attempts >= 1", name="max_attempts_is_positive"),
+        sa.CheckConstraint(
+            "timeout_seconds IS NULL OR timeout_seconds > 0", name="timeout_is_positive"
+        ),
+        sa.UniqueConstraint("workflow_version_id", "step_key", name="workflow_steps_key_key"),
+        # Redundant alone; the target of both edge endpoints, which is what
+        # stops an edge wiring steps from two different versions.
+        sa.UniqueConstraint("workflow_version_id", "id", name="workflow_steps_version_id_id_key"),
+        sa.Index("workflow_steps_agent_idx", "agent_id"),
+    )
+
+
+class WorkflowEdge(Base):
+    """One edge of a frozen graph: control flow inside this version only.
+
+    Not a `Connection`. An edge is sequencing within one workflow version; a
+    connection is a standing grant between components that outlives any
+    workflow. The island draws both as paths, which is where the two get
+    conflated.
+    """
+
+    __tablename__ = "workflow_edges"
+
+    id: Mapped[UUID] = _uuid_pk()
+    workflow_version_id: Mapped[UUID] = mapped_column(
+        sa.ForeignKey("workflow_versions.id", ondelete="CASCADE"), nullable=False
+    )
+    workspace_id: Mapped[UUID] = mapped_column(
+        sa.ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False
+    )
+    project_id: Mapped[UUID] = mapped_column(
+        sa.ForeignKey("projects.id", ondelete="CASCADE"), nullable=False
+    )
+    #: NULL means an entry edge: this step starts when the execution does.
+    from_step_id: Mapped[UUID | None] = mapped_column(sa.Uuid)
+    to_step_id: Mapped[UUID] = mapped_column(sa.Uuid, nullable=False)
+    #: NULL means unconditional.
+    condition: Mapped[dict[str, Any] | None]
+    #: "approved" / "rejected" - drawn on the island and the DAG canvas.
+    label: Mapped[str | None]
+
+    __table_args__ = (
+        # A self-loop is a cycle, and loops are not a v1 feature.
+        sa.CheckConstraint(
+            "from_step_id IS NULL OR from_step_id <> to_step_id", name="no_self_edge"
+        ),
+        # Both endpoints must live in the same version as the edge. MATCH
+        # SIMPLE, so a NULL `from_step_id` - an entry edge - passes.
+        sa.ForeignKeyConstraint(
+            ["workflow_version_id", "from_step_id"],
+            ["workflow_steps.workflow_version_id", "workflow_steps.id"],
+            name="workflow_edges_from_step_fkey",
+            ondelete="CASCADE",
+        ),
+        sa.ForeignKeyConstraint(
+            ["workflow_version_id", "to_step_id"],
+            ["workflow_steps.workflow_version_id", "workflow_steps.id"],
+            name="workflow_edges_to_step_fkey",
+            ondelete="CASCADE",
+        ),
+        # NULLS NOT DISTINCT: an entry edge has a NULL `from_step_id` and
+        # usually a NULL `label`, so under the default semantics this key
+        # would permit the same entry edge any number of times.
+        sa.UniqueConstraint(
+            "workflow_version_id",
+            "from_step_id",
+            "to_step_id",
+            "label",
+            name="workflow_edges_edge_key",
+            postgresql_nulls_not_distinct=True,
+        ),
+        sa.Index("workflow_edges_from_idx", "workflow_version_id", "from_step_id"),
+        sa.Index("workflow_edges_to_idx", "workflow_version_id", "to_step_id"),
+    )
+
+
 #: Tables protected by row-level security in migration `0004_rls`.
 #: `test_rls.py` reads this and asserts the database agrees, so a new
 #: tenant-scoped table cannot be added without a decision about it being
@@ -544,4 +774,9 @@ RLS_PROTECTED_TABLES: tuple[str, ...] = (
     "model_profiles",
     "agents",
     "connections",
+    # 0008
+    "workflows",
+    "workflow_versions",
+    "workflow_steps",
+    "workflow_edges",
 )
