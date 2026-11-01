@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import datetime as dt
 import re
+from decimal import Decimal
 from enum import StrEnum
 from typing import Any, ClassVar
 from uuid import UUID
@@ -65,6 +66,26 @@ def _uuid_pk() -> Mapped[UUID]:
 
 def _created_at() -> Mapped[dt.datetime]:
     return mapped_column(server_default=sa.text("now()"))
+
+
+def _project_fk(table: str) -> sa.ForeignKeyConstraint:
+    """The composite key that makes `workspace_id` and `project_id` agree.
+
+    A single-column key to `projects.id` validates that the project exists,
+    not that it belongs to the workspace in the same row - and row-level
+    security reads `workspace_id` alone. Migration 0012 has the probe that
+    found rows could name one tenant's workspace and another's project.
+
+    On the two tables where `project_id` is nullable, NULL means
+    workspace-wide and the default MATCH SIMPLE passes it, which is the
+    intent rather than a loophole.
+    """
+    return sa.ForeignKeyConstraint(
+        ["workspace_id", "project_id"],
+        ["projects.workspace_id", "projects.id"],
+        name=f"{table}_project_fkey",
+        ondelete="CASCADE",
+    )
 
 
 class User(Base):
@@ -154,6 +175,11 @@ class Project(Base):
 
     __table_args__ = (
         sa.UniqueConstraint("workspace_id", "slug", name="projects_workspace_slug_key"),
+        # `id` is already unique on its own. This pair exists so a child
+        # row can reference the project *and* its workspace in one
+        # constraint, which is what makes the two agree - see
+        # `_project_fk` and migration 0012.
+        sa.UniqueConstraint("workspace_id", "id", name="projects_workspace_id_id_key"),
     )
 
 
@@ -172,9 +198,7 @@ class ApiKey(Base):
         sa.ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False
     )
     #: NULL means workspace-wide. Ingest keys may not be: see the check below.
-    project_id: Mapped[UUID | None] = mapped_column(
-        sa.ForeignKey("projects.id", ondelete="CASCADE")
-    )
+    project_id: Mapped[UUID | None] = mapped_column(sa.Uuid)
     name: Mapped[str] = mapped_column(nullable=False)
     prefix: Mapped[str] = mapped_column(nullable=False, unique=True)
     secret_hash: Mapped[str] = mapped_column(nullable=False)
@@ -195,6 +219,7 @@ class ApiKey(Base):
     revoked_at: Mapped[dt.datetime | None]
 
     __table_args__ = (
+        _project_fk("api_keys"),
         # An ingest key with no project would be able to emit events into any
         # project in the workspace, which is exactly the blast radius the
         # ingest scope exists to avoid.
@@ -270,9 +295,7 @@ class Credential(Base):
         sa.ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False
     )
     #: NULL means workspace-wide, the common case for a provider key.
-    project_id: Mapped[UUID | None] = mapped_column(
-        sa.ForeignKey("projects.id", ondelete="CASCADE")
-    )
+    project_id: Mapped[UUID | None] = mapped_column(sa.Uuid)
     name: Mapped[str] = mapped_column(nullable=False)
     kind: Mapped[enums.CredentialKind] = mapped_column(
         pg_enum(enums.CredentialKind, "credential_kind"), nullable=False
@@ -307,6 +330,7 @@ class Credential(Base):
     deleted_at: Mapped[dt.datetime | None]
 
     __table_args__ = (
+        _project_fk("credentials"),
         sa.UniqueConstraint("workspace_id", "provider_slug", "name", name="credentials_name_key"),
         sa.Index(
             "credentials_refresh_due_idx",
@@ -375,9 +399,7 @@ class Agent(Base):
     workspace_id: Mapped[UUID] = mapped_column(
         sa.ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False
     )
-    project_id: Mapped[UUID] = mapped_column(
-        sa.ForeignKey("projects.id", ondelete="CASCADE"), nullable=False
-    )
+    project_id: Mapped[UUID] = mapped_column(sa.Uuid, nullable=False)
     #: Caller-chosen, so a restarted or scaled-out worker keeps its identity
     #: without persisting anything.
     agent_key: Mapped[str] = mapped_column(CITEXT, nullable=False)
@@ -440,6 +462,7 @@ class Agent(Base):
     archived_at: Mapped[dt.datetime | None]
 
     __table_args__ = (
+        _project_fk("agents"),
         # Only a managed agent has a model, because it is the only mode where
         # AgentWorld calls one. This is what makes "runtime and model provider
         # are separate axes" structural rather than documented.
@@ -486,9 +509,7 @@ class Connection(Base):
     workspace_id: Mapped[UUID] = mapped_column(
         sa.ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False
     )
-    project_id: Mapped[UUID] = mapped_column(
-        sa.ForeignKey("projects.id", ondelete="CASCADE"), nullable=False
-    )
+    project_id: Mapped[UUID] = mapped_column(sa.Uuid, nullable=False)
     kind: Mapped[enums.ConnectionKind] = mapped_column(
         pg_enum(enums.ConnectionKind, "connection_kind"), nullable=False
     )
@@ -508,6 +529,7 @@ class Connection(Base):
     created_at: Mapped[dt.datetime] = _created_at()
 
     __table_args__ = (
+        _project_fk("connections"),
         sa.UniqueConstraint(
             "project_id",
             "kind",
@@ -552,9 +574,7 @@ class Workflow(Base):
     workspace_id: Mapped[UUID] = mapped_column(
         sa.ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False
     )
-    project_id: Mapped[UUID] = mapped_column(
-        sa.ForeignKey("projects.id", ondelete="CASCADE"), nullable=False
-    )
+    project_id: Mapped[UUID] = mapped_column(sa.Uuid, nullable=False)
     slug: Mapped[str] = mapped_column(CITEXT, nullable=False)
     name: Mapped[str] = mapped_column(nullable=False)
     description: Mapped[str | None]
@@ -568,6 +588,7 @@ class Workflow(Base):
     archived_at: Mapped[dt.datetime | None]
 
     __table_args__ = (
+        _project_fk("workflows"),
         sa.UniqueConstraint("project_id", "slug", name="workflows_project_slug_key"),
         # Composite, so the named version must belong to this workflow.
         #
@@ -606,9 +627,7 @@ class WorkflowVersion(Base):
     workspace_id: Mapped[UUID] = mapped_column(
         sa.ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False
     )
-    project_id: Mapped[UUID] = mapped_column(
-        sa.ForeignKey("projects.id", ondelete="CASCADE"), nullable=False
-    )
+    project_id: Mapped[UUID] = mapped_column(sa.Uuid, nullable=False)
     version: Mapped[int] = mapped_column(nullable=False)
     #: The authority an execution is bound to. `WorkflowStep` and
     #: `WorkflowEdge` are the queryable projection of this column.
@@ -624,6 +643,7 @@ class WorkflowVersion(Base):
     created_at: Mapped[dt.datetime] = _created_at()
 
     __table_args__ = (
+        _project_fk("workflow_versions"),
         sa.CheckConstraint("version > 0", name="version_is_positive"),
         sa.UniqueConstraint("workflow_id", "version", name="workflow_versions_number_key"),
         # Redundant alone; the target of `workflows.current_version_id`.
@@ -649,9 +669,7 @@ class WorkflowStep(Base):
     workspace_id: Mapped[UUID] = mapped_column(
         sa.ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False
     )
-    project_id: Mapped[UUID] = mapped_column(
-        sa.ForeignKey("projects.id", ondelete="CASCADE"), nullable=False
-    )
+    project_id: Mapped[UUID] = mapped_column(sa.Uuid, nullable=False)
     step_key: Mapped[str] = mapped_column(CITEXT, nullable=False)
     name: Mapped[str] = mapped_column(nullable=False)
     kind: Mapped[enums.StepKind] = mapped_column(
@@ -675,6 +693,7 @@ class WorkflowStep(Base):
     on_failure: Mapped[str] = mapped_column(nullable=False, server_default=sa.text("'fail'"))
 
     __table_args__ = (
+        _project_fk("workflow_steps"),
         sa.CheckConstraint(
             "kind <> 'agent_task' OR agent_id IS NOT NULL", name="agent_task_needs_agent"
         ),
@@ -714,9 +733,7 @@ class WorkflowEdge(Base):
     workspace_id: Mapped[UUID] = mapped_column(
         sa.ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False
     )
-    project_id: Mapped[UUID] = mapped_column(
-        sa.ForeignKey("projects.id", ondelete="CASCADE"), nullable=False
-    )
+    project_id: Mapped[UUID] = mapped_column(sa.Uuid, nullable=False)
     #: NULL means an entry edge: this step starts when the execution does.
     from_step_id: Mapped[UUID | None] = mapped_column(sa.Uuid)
     to_step_id: Mapped[UUID] = mapped_column(sa.Uuid, nullable=False)
@@ -726,6 +743,7 @@ class WorkflowEdge(Base):
     label: Mapped[str | None]
 
     __table_args__ = (
+        _project_fk("workflow_edges"),
         # A self-loop is a cycle, and loops are not a v1 feature.
         sa.CheckConstraint(
             "from_step_id IS NULL OR from_step_id <> to_step_id", name="no_self_edge"
@@ -793,9 +811,7 @@ class WorkflowExecution(Base):
     workspace_id: Mapped[UUID] = mapped_column(
         sa.ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False
     )
-    project_id: Mapped[UUID] = mapped_column(
-        sa.ForeignKey("projects.id", ondelete="CASCADE"), nullable=False
-    )
+    project_id: Mapped[UUID] = mapped_column(sa.Uuid, nullable=False)
     workflow_id: Mapped[UUID] = mapped_column(
         sa.ForeignKey("workflows.id", ondelete="CASCADE"), nullable=False
     )
@@ -838,6 +854,7 @@ class WorkflowExecution(Base):
     created_at: Mapped[dt.datetime] = _created_at()
 
     __table_args__ = (
+        _project_fk("workflow_executions"),
         # Exactly one of the two ids, matching the kind. A `system` initiator
         # names no user, which is the whole point.
         sa.CheckConstraint(
@@ -881,9 +898,7 @@ class ExecutionStep(Base):
     workspace_id: Mapped[UUID] = mapped_column(
         sa.ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False
     )
-    project_id: Mapped[UUID] = mapped_column(
-        sa.ForeignKey("projects.id", ondelete="CASCADE"), nullable=False
-    )
+    project_id: Mapped[UUID] = mapped_column(sa.Uuid, nullable=False)
     #: Denormalised so the composite foreign keys below can be expressed.
     workflow_version_id: Mapped[UUID] = mapped_column(sa.Uuid, nullable=False)
     workflow_step_id: Mapped[UUID] = mapped_column(sa.Uuid, nullable=False)
@@ -909,6 +924,7 @@ class ExecutionStep(Base):
     finished_at: Mapped[dt.datetime | None]
 
     __table_args__ = (
+        _project_fk("execution_steps"),
         sa.CheckConstraint("attempt >= 0", name="step_attempt_is_not_negative"),
         # This row's version must be the one its execution is bound to.
         sa.ForeignKeyConstraint(
@@ -958,9 +974,7 @@ class Dispatch(Base):
     workspace_id: Mapped[UUID] = mapped_column(
         sa.ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False
     )
-    project_id: Mapped[UUID] = mapped_column(
-        sa.ForeignKey("projects.id", ondelete="CASCADE"), nullable=False
-    )
+    project_id: Mapped[UUID] = mapped_column(sa.Uuid, nullable=False)
     execution_id: Mapped[UUID | None] = mapped_column(
         sa.ForeignKey("workflow_executions.id", ondelete="CASCADE")
     )
@@ -1007,6 +1021,7 @@ class Dispatch(Base):
     finished_at: Mapped[dt.datetime | None]
 
     __table_args__ = (
+        _project_fk("dispatches"),
         sa.CheckConstraint("attempt >= 0", name="dispatch_attempt_is_not_negative"),
         sa.CheckConstraint("max_attempts >= 1", name="dispatch_max_attempts_is_positive"),
         # A row marked leased with no lease could never be reclaimed by the
@@ -1065,9 +1080,7 @@ class Task(Base):
     workspace_id: Mapped[UUID] = mapped_column(
         sa.ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False
     )
-    project_id: Mapped[UUID] = mapped_column(
-        sa.ForeignKey("projects.id", ondelete="CASCADE"), nullable=False
-    )
+    project_id: Mapped[UUID] = mapped_column(sa.Uuid, nullable=False)
     #: The caller's own id, so an integrator can address a task by the
     #: reference their system already uses.
     task_ref: Mapped[str | None] = mapped_column(CITEXT)
@@ -1118,6 +1131,7 @@ class Task(Base):
     updated_at: Mapped[dt.datetime] = _created_at()
 
     __table_args__ = (
+        _project_fk("tasks"),
         sa.CheckConstraint(
             "progress_percent IS NULL OR progress_percent BETWEEN 0 AND 100",
             name="progress_is_a_percentage",
@@ -1160,6 +1174,7 @@ class TaskDependency(Base):
     depends_on_id: Mapped[UUID] = mapped_column(sa.Uuid, primary_key=True)
 
     __table_args__ = (
+        _project_fk("task_dependencies"),
         sa.CheckConstraint("task_id <> depends_on_id", name="no_self_dependency"),
         sa.ForeignKeyConstraint(
             ["project_id", "task_id"],
@@ -1186,9 +1201,7 @@ class Run(Base):
     workspace_id: Mapped[UUID] = mapped_column(
         sa.ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False
     )
-    project_id: Mapped[UUID] = mapped_column(
-        sa.ForeignKey("projects.id", ondelete="CASCADE"), nullable=False
-    )
+    project_id: Mapped[UUID] = mapped_column(sa.Uuid, nullable=False)
     run_ref: Mapped[str | None] = mapped_column(CITEXT)
     agent_id: Mapped[UUID] = mapped_column(
         sa.ForeignKey("agents.id", ondelete="CASCADE"), nullable=False
@@ -1214,6 +1227,7 @@ class Run(Base):
     )
 
     __table_args__ = (
+        _project_fk("runs"),
         sa.CheckConstraint("step_count >= 0", name="step_count_is_not_negative"),
         sa.CheckConstraint("tool_call_count >= 0", name="tool_call_count_is_not_negative"),
         sa.UniqueConstraint("project_id", "run_ref", name="runs_project_ref_key"),
@@ -1238,9 +1252,7 @@ class RunStep(Base):
     workspace_id: Mapped[UUID] = mapped_column(
         sa.ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False
     )
-    project_id: Mapped[UUID] = mapped_column(
-        sa.ForeignKey("projects.id", ondelete="CASCADE"), nullable=False
-    )
+    project_id: Mapped[UUID] = mapped_column(sa.Uuid, nullable=False)
     seq: Mapped[int] = mapped_column(nullable=False)
     name: Mapped[str] = mapped_column(nullable=False)
     #: Free text. The core never branches on it.
@@ -1257,6 +1269,7 @@ class RunStep(Base):
     finished_at: Mapped[dt.datetime | None]
 
     __table_args__ = (
+        _project_fk("run_steps"),
         sa.CheckConstraint("seq >= 0", name="run_step_seq_is_not_negative"),
         sa.UniqueConstraint("run_id", "seq", name="run_steps_seq_key"),
     )
@@ -1280,9 +1293,7 @@ class AgentStatusHistory(Base):
     workspace_id: Mapped[UUID] = mapped_column(
         sa.ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False
     )
-    project_id: Mapped[UUID] = mapped_column(
-        sa.ForeignKey("projects.id", ondelete="CASCADE"), nullable=False
-    )
+    project_id: Mapped[UUID] = mapped_column(sa.Uuid, nullable=False)
     #: NULL for the first transition, out of nothing.
     from_status: Mapped[enums.AgentStatus | None] = mapped_column(
         pg_enum(enums.AgentStatus, "agent_status")
@@ -1295,6 +1306,7 @@ class AgentStatusHistory(Base):
     changed_at: Mapped[dt.datetime] = _created_at()
 
     __table_args__ = (
+        _project_fk("agent_status_history"),
         sa.Index("agent_status_history_agent_idx", "agent_id", sa.text("changed_at DESC")),
     )
 
@@ -1461,6 +1473,193 @@ class MetricSample(Base):
     )
 
 
+# ---------------------------------------------------- Phase 2: presentation ---
+#
+# Where a building sits, how big it is, what it looks like, how a road is
+# drawn - and nothing else. No column below holds, mirrors or caches
+# execution status, progress or health; `test_world_separation.py` asserts
+# that against a forbidden-name list rather than trusting a review. Those
+# arrive at render time, from the domain.
+
+
+class WorldLayout(Base):
+    """One island per project: its grid, terrain and last camera position."""
+
+    __tablename__ = "world_layouts"
+
+    #: The key, because a project has exactly one island.
+    project_id: Mapped[UUID] = mapped_column(sa.Uuid, primary_key=True)
+    workspace_id: Mapped[UUID] = mapped_column(sa.Uuid, nullable=False)
+    theme: Mapped[str] = mapped_column(nullable=False, server_default=sa.text("'island-temperate'"))
+    grid_width: Mapped[int] = mapped_column(sa.SmallInteger, nullable=False, server_default="24")
+    grid_height: Mapped[int] = mapped_column(sa.SmallInteger, nullable=False, server_default="24")
+    tiles: Mapped[list[Any]] = mapped_column(
+        JSONB, nullable=False, server_default=sa.text("'[]'::jsonb")
+    )
+    landmarks: Mapped[list[Any]] = mapped_column(
+        JSONB, nullable=False, server_default=sa.text("'[]'::jsonb")
+    )
+    camera: Mapped[dict[str, Any]] = mapped_column(
+        nullable=False, server_default=sa.text("'{}'::jsonb")
+    )
+    updated_at: Mapped[dt.datetime] = _created_at()
+
+    __table_args__ = (
+        _project_fk("world_layouts"),
+        sa.ForeignKeyConstraint(
+            ["workspace_id"],
+            ["workspaces.id"],
+            name="world_layouts_workspace_id_fkey",
+            ondelete="CASCADE",
+        ),
+        sa.CheckConstraint(
+            "grid_width BETWEEN 8 AND 256 AND grid_height BETWEEN 8 AND 256",
+            name="grid_is_a_usable_size",
+        ),
+    )
+
+
+class WorldDistrict(Base):
+    """A visual region of one project's island.
+
+    Visual grouping only. A *project* is the domain and tenancy boundary; a
+    district is a region inside one, so a user can group an ecosystem
+    visually without creating a second tenancy boundary and the permissions
+    that come with one.
+    """
+
+    __tablename__ = "world_districts"
+
+    id: Mapped[UUID] = _uuid_pk()
+    workspace_id: Mapped[UUID] = mapped_column(sa.Uuid, nullable=False)
+    project_id: Mapped[UUID] = mapped_column(sa.Uuid, nullable=False)
+    name: Mapped[str] = mapped_column(nullable=False)
+    bounds: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    accent_color: Mapped[str | None]
+    collapsed: Mapped[bool] = mapped_column(nullable=False, server_default=sa.text("false"))
+    sort_order: Mapped[int] = mapped_column(sa.SmallInteger, nullable=False, server_default="0")
+
+    __table_args__ = (
+        _project_fk("world_districts"),
+        sa.ForeignKeyConstraint(
+            ["workspace_id"],
+            ["workspaces.id"],
+            name="world_districts_workspace_id_fkey",
+            ondelete="CASCADE",
+        ),
+        sa.CheckConstraint("sort_order >= 0", name="sort_order_is_not_negative"),
+        sa.UniqueConstraint("project_id", "name", name="world_districts_project_name_key"),
+        #: What `world_nodes.district_id` points at, so a node cannot be filed
+        #: under another project's district.
+        sa.UniqueConstraint("project_id", "id", name="world_districts_project_id_id_key"),
+    )
+
+
+class WorldNode(Base):
+    """One placed object, whatever kind it is.
+
+    `node_id` names its domain object polymorphically and carries no foreign
+    key, because three of the six kinds have no table yet. Migration 0013
+    states what that obliges: the delete paths must remove the node, since
+    the database will not, and a dangling node holds its tile.
+    """
+
+    __tablename__ = "world_nodes"
+
+    workspace_id: Mapped[UUID] = mapped_column(sa.Uuid, nullable=False)
+    project_id: Mapped[UUID] = mapped_column(sa.Uuid, primary_key=True)
+    node_kind: Mapped[enums.WorldNodeKind] = mapped_column(
+        pg_enum(enums.WorldNodeKind, "world_node_kind"), primary_key=True
+    )
+    node_id: Mapped[UUID] = mapped_column(sa.Uuid, primary_key=True)
+    district_id: Mapped[UUID | None] = mapped_column(sa.Uuid)
+
+    # ---- position and size ----
+    tile_q: Mapped[int] = mapped_column(sa.SmallInteger, nullable=False)
+    tile_r: Mapped[int] = mapped_column(sa.SmallInteger, nullable=False)
+    width: Mapped[int] = mapped_column(sa.SmallInteger, nullable=False, server_default="1")
+    height: Mapped[int] = mapped_column(sa.SmallInteger, nullable=False, server_default="1")
+    rotation: Mapped[int] = mapped_column(sa.SmallInteger, nullable=False, server_default="0")
+    z_order: Mapped[int] = mapped_column(sa.SmallInteger, nullable=False, server_default="0")
+
+    # ---- appearance ----
+    building_kind: Mapped[str] = mapped_column(nullable=False)
+    character_kind: Mapped[str | None]
+    accent_color: Mapped[str | None]
+    icon: Mapped[str | None]
+    scale: Mapped[Decimal] = mapped_column(sa.Numeric(3, 2), nullable=False, server_default="1.00")
+
+    #: Whether the auto-layout placed this, or a person did. The auto-layout
+    #: may move its own nodes and must not move a person's.
+    auto_assigned: Mapped[bool] = mapped_column(nullable=False, server_default=sa.text("true"))
+    #: A user's choice to hide something - not a status.
+    hidden: Mapped[bool] = mapped_column(nullable=False, server_default=sa.text("false"))
+    updated_at: Mapped[dt.datetime] = _created_at()
+
+    __table_args__ = (
+        _project_fk("world_nodes"),
+        sa.ForeignKeyConstraint(
+            ["workspace_id"],
+            ["workspaces.id"],
+            name="world_nodes_workspace_id_fkey",
+            ondelete="CASCADE",
+        ),
+        sa.ForeignKeyConstraint(
+            ["project_id", "district_id"],
+            ["world_districts.project_id", "world_districts.id"],
+            name="world_nodes_district_fkey",
+            #: The column list matters: a plain composite SET NULL would null
+            #: `project_id` as well. See migration 0013.
+            ondelete="SET NULL (district_id)",
+        ),
+        sa.CheckConstraint("tile_q >= 0 AND tile_r >= 0", name="tile_is_on_the_grid"),
+        sa.CheckConstraint(
+            "width BETWEEN 1 AND 16 AND height BETWEEN 1 AND 16", name="footprint_is_bounded"
+        ),
+        sa.CheckConstraint("rotation BETWEEN 0 AND 359", name="rotation_is_a_bearing"),
+        sa.CheckConstraint("scale BETWEEN 0.25 AND 4.00", name="scale_is_bounded"),
+        #: The anchor tile only - a footprint can still overlap another, which
+        #: no constraint can range over. The placement service owns that.
+        sa.UniqueConstraint("project_id", "tile_q", "tile_r", name="world_nodes_tile_key"),
+        sa.Index("world_nodes_project_idx", "project_id", "z_order"),
+        sa.Index(
+            "world_nodes_district_idx",
+            "district_id",
+            postgresql_where=sa.text("district_id IS NOT NULL"),
+        ),
+    )
+
+
+class WorldRoute(Base):
+    """The drawn path of a relationship that exists in the domain."""
+
+    __tablename__ = "world_routes"
+
+    workspace_id: Mapped[UUID] = mapped_column(sa.Uuid, nullable=False)
+    project_id: Mapped[UUID] = mapped_column(sa.Uuid, primary_key=True)
+    route_kind: Mapped[enums.WorldRouteKind] = mapped_column(
+        pg_enum(enums.WorldRouteKind, "world_route_kind"), primary_key=True
+    )
+    route_id: Mapped[UUID] = mapped_column(sa.Uuid, primary_key=True)
+    waypoints: Mapped[list[Any]] = mapped_column(
+        JSONB, nullable=False, server_default=sa.text("'[]'::jsonb")
+    )
+    style: Mapped[str] = mapped_column(nullable=False, server_default=sa.text("'road'"))
+    accent_color: Mapped[str | None]
+    hidden: Mapped[bool] = mapped_column(nullable=False, server_default=sa.text("false"))
+    updated_at: Mapped[dt.datetime] = _created_at()
+
+    __table_args__ = (
+        _project_fk("world_routes"),
+        sa.ForeignKeyConstraint(
+            ["workspace_id"],
+            ["workspaces.id"],
+            name="world_routes_workspace_id_fkey",
+            ondelete="CASCADE",
+        ),
+    )
+
+
 #: Tables protected by row-level security in migration `0004_rls`.
 #: `test_rls.py` reads this and asserts the database agrees, so a new
 #: tenant-scoped table cannot be added without a decision about it being
@@ -1499,6 +1698,12 @@ RLS_PROTECTED_TABLES: tuple[str, ...] = (
     "events",
     "logs",
     "metric_samples",
+    # 0013 - presentation. Protected for the same reason as everything else:
+    # a project's layout says what a tenant has built.
+    "world_layouts",
+    "world_districts",
+    "world_nodes",
+    "world_routes",
 )
 
 #: Monthly partitions are named `<table>_y2026m11`, created by

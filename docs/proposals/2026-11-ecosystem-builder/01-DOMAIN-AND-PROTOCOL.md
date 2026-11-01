@@ -1336,7 +1336,7 @@ called `agent_status` on `world_nodes` fails CI.
 | No reducer writes a world table | the reducer registry's targets are typed to the execution tables; a `world_*` write from `domain/reducers/` does not type-check, and an import-linter contract forbids the presentation repositories there |
 | No execution table references a world table | no foreign key points that way. Dropping all four tables leaves every execution query valid — the existing "the backend would behave identically" property, kept |
 | Moving an object changes nothing operational | the only write is `world_nodes`; it emits no event, writes no `audit_log` row, and the `world.update` permission is held by `member` and grants nothing else (`05-PERMISSIONS.md`) |
-| An offline or archived agent stays visible | `world_nodes` rows are independent of status. An archived agent keeps its node and renders shuttered; deleting the agent cascades the node, and **deleting a node does not touch the agent** |
+| An offline or archived agent stays visible | `world_nodes` rows are independent of status. An archived agent keeps its node and renders shuttered, and **deleting a node does not touch the agent**. The other direction is *not* structural — see the correction below |
 | The domain stays the source of truth | the projections read both and write neither. `interpret()` is pure and cannot fetch; `world/dispatch/` is the only layer that may call an API |
 
 *Acceptance criteria:*
@@ -1347,4 +1347,24 @@ called `agent_status` on `world_nodes` fails CI.
 - Deleting a `world_nodes` row leaves the agent, its runs and its history intact.
 - Dropping all four presentation tables leaves the backend suite green — the Phase 0
   isolation property, widened from two tables to four.
+
+### Correction from implementing migration 0013
+
+One criterion above was written as though it were enforced and is not. **Deleting an
+agent does not cascade its node.** `world_nodes.node_id` names its object
+polymorphically — one of six kinds, three of which have no table yet — so there is
+nothing to point a foreign key at, and the database cannot clean up after a deleted
+agent. The orphan also *holds its tile*, because `UNIQUE (project_id, tile_q, tile_r)`
+does not care that its referent is gone, which is the user-visible half of the problem.
+
+Two obligations follow, and they are obligations rather than guarantees: the Phase 3
+delete paths must remove the node in the same transaction as the domain row, and a
+reconciliation sweep must drop nodes whose referent has vanished.
+`test_world_separation.py` pins the current behaviour, so the gap fails a test if it is
+ever mistaken for a guarantee — and the test says which assertion to change when the
+gap closes.
+
+The direction that *does* hold structurally is the one that matters more for the
+separation: no foreign key points from the domain into the presentation tables, so
+dropping all four leaves every execution query valid.
 

@@ -42,6 +42,25 @@ re-decision; the pivot does not touch any of it.
 Totals as committed: **444 API tests, 26 web tests, 5 import-linter contracts, mypy strict
 clean.**
 
+### Corrections found while implementing, not while designing
+
+Both were found by a test written against a claim this proposal makes, which is the
+argument for writing those tests at all rather than reviewing for them.
+
+| Found | What the design said | What was true | Fix |
+|-------|---------------------|---------------|-----|
+| Tenant scope was enforced per column, not per pair | `workspace_id` and `project_id` both identify the tenant | Two single-column foreign keys check existence, never agreement, and RLS reads `workspace_id` alone — so the application role could write a row naming its own workspace and **another tenant's project** | Migration 0012: `UNIQUE (workspace_id, id)` on `projects` and a composite key on all 16 tenant-scoped tables. A structural test covers tables not yet written |
+| RLS was assumed to cover a partitioned table | the tenant policy protects `events` | A partition inherits neither privileges nor policies, so `SELECT * FROM events_y2026m11` returned **every tenant's** events | Migration 0011: the application role holds no privilege on any partition, asserted over every partition |
+
+Neither leaked data — no release has shipped, and the first is a write channel rather
+than a read. Both would have been cross-tenant defects in production, and both were
+mistakes in this document's own reasoning rather than in its implementation.
+
+Three tables are knowingly left outside the first fix: `events`, `logs` and
+`metric_samples` carry no foreign key to `projects` at all, because they outlive what
+they describe. On those the pair is enforced by ingest, their only writer, and a test
+asserts the gap rather than leaving a reader to assume otherwise.
+
 ## 2. Approved for implementation
 
 Agreed across the original brief and two refinements. These are what the roadmap builds.

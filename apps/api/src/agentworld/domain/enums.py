@@ -294,6 +294,35 @@ class DispatchStatus(StrEnum):
     CANCELLED = "cancelled"
 
 
+class WorldNodeKind(StrEnum):
+    """What kind of object a placed node stands for.
+
+    Structural rather than decorative: this is what decides which table
+    `world_nodes.node_id` names. Three of the six have no table yet, and are
+    here because the island can place a node for something before Phase 6
+    builds its backend.
+    """
+
+    AGENT = "agent"
+    WORKFLOW = "workflow"
+    INTEGRATION = "integration"
+    KNOWLEDGE_SOURCE = "knowledge_source"
+    TRIGGER = "trigger"
+    APPROVAL_DESK = "approval_desk"
+
+
+class WorldRouteKind(StrEnum):
+    """Which domain relationship a drawn line stands for.
+
+    The relationship itself lives in `connections` or `workflow_edges`; only
+    its path is presentation, which is what makes rerouting a road a change
+    that grants nothing.
+    """
+
+    CONNECTION = "connection"
+    WORKFLOW_EDGE = "workflow_edge"
+
+
 #: Every enum that has a native PostgreSQL type, keyed by that type's name.
 #: The migration and the drift test both read this, so adding an enum in one
 #: place adds it in both.
@@ -321,4 +350,9 @@ PG_ENUMS: dict[str, type[StrEnum]] = {
     "credential_kind": CredentialKind,
     "dispatch_kind": DispatchKind,
     "dispatch_status": DispatchStatus,
+    # Phase 2, presentation. Only the two structural vocabularies are native
+    # types; everything about appearance is text, because an art asset must
+    # not need a migration.
+    "world_node_kind": WorldNodeKind,
+    "world_route_kind": WorldRouteKind,
 }
