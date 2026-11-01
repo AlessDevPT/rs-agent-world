@@ -24,6 +24,16 @@ one and an event's producer has no way to send one. Resolving a reference to a
 row is the repository's job, and it may legitimately fail - an event about an
 agent that was deleted is still a valid event.
 
+**A stale event must not overwrite a newer one.** Events arrive in the order
+a producer managed to send them, which is not the order things happened: a
+worker that was briefly offline flushes a backlog, and an `agent.paused` from
+two minutes ago lands after the `agent.resumed` that followed it. Applied
+blindly, the agent ends up paused and the island shows it shuttered while it
+works. So the patches that move a row's current state carry `not_before`, and
+the repository adds a predicate on the column that records how recent the row
+is. Replay is unaffected: it applies events in `seq` order, which is the same
+order the guard already produced live.
+
 **`Increment` is sound because application is exactly-once.** The unique index
 on `(project_id, dedup_key)` refuses a duplicate inside the same transaction
 that folds it, so a retried batch cannot double-count; and replay is a full
@@ -34,6 +44,7 @@ thing to go wrong.
 
 from __future__ import annotations
 
+import datetime as dt
 from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
@@ -165,6 +176,9 @@ class Patch:
 
     selector: Selector
     fields: Mapping[str, Any]
+    #: `(column, when)` - apply only if the row's `column` is null or not
+    #: already newer than `when`. See the note below.
+    not_before: tuple[str, dt.datetime] | None = None
 
     @property
     def target(self) -> MutationTarget:

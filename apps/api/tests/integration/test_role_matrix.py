@@ -71,6 +71,81 @@ ENDPOINTS = [
     ),
     Endpoint("POST", "/v1/api-keys/{key}/revoke", MemberRole.ADMIN),
     Endpoint("DELETE", "/v1/api-keys/{key}", MemberRole.ADMIN),
+    # Phase 1 routes that were never covered, because the guard below could
+    # not see any route at all until Phase 2 fixed it.
+    Endpoint(
+        "PATCH",
+        "/v1/workspaces/{workspace}/members/{target}",
+        MemberRole.ADMIN,
+        {"role": "member"},
+    ),
+    Endpoint("DELETE", "/v1/workspaces/{workspace}/members/{target}", MemberRole.ADMIN),
+    # ---- Phase 2 -----------------------------------------------------------
+    Endpoint("GET", "/v1/projects/{project}/agents", MemberRole.VIEWER),
+    Endpoint(
+        "POST",
+        "/v1/projects/{project}/agents",
+        MemberRole.MEMBER,
+        {"display_name": "Matrix Agent", "interaction_mode": "managed"},
+    ),
+    Endpoint("GET", "/v1/projects/{project}/agents/{agent}", MemberRole.VIEWER),
+    # Editing is `member`; the configuration half is `admin` and is covered
+    # by its own test in `test_agents_api.py`, because the role it needs
+    # depends on which fields the body carries rather than on the route.
+    Endpoint(
+        "PATCH",
+        "/v1/projects/{project}/agents/{agent}",
+        MemberRole.MEMBER,
+        {"display_name": "Renamed"},
+    ),
+    Endpoint("DELETE", "/v1/projects/{project}/agents/{agent}", MemberRole.ADMIN),
+    Endpoint("GET", "/v1/workspaces/{workspace}/model-profiles", MemberRole.VIEWER),
+    Endpoint(
+        "POST",
+        "/v1/workspaces/{workspace}/model-profiles",
+        MemberRole.ADMIN,
+        {"name": "Matrix Profile", "provider_slug": "anthropic", "model_id": "claude-opus-5"},
+    ),
+    Endpoint("DELETE", "/v1/workspaces/{workspace}/model-profiles/{profile}", MemberRole.ADMIN),
+    Endpoint("GET", "/v1/projects/{project}/connections", MemberRole.VIEWER),
+    # A read-only grant, so this row tests the baseline role. The elevation
+    # to `admin` for a consequential tool is a property of the body, and has
+    # its own test in `test_workflows_api.py`.
+    Endpoint(
+        "POST",
+        "/v1/projects/{project}/connections",
+        MemberRole.MEMBER,
+        {
+            "kind": "grant_tool",
+            "source_kind": "agent",
+            # A different agent from the one the scenario already granted
+            # to: `connections` has a unique index over
+            # (project, source_kind, source_id, kind) where enabled, so a
+            # second grant from the same agent is a 409 rather than a
+            # permission answer.
+            "source_id": "{other_agent}",
+            "target_kind": "tool",
+            "target_id": "{other_agent}",
+            "config": {"tool_name": "web_search", "side_effect": "read"},
+        },
+    ),
+    Endpoint("DELETE", "/v1/projects/{project}/connections/{connection}", MemberRole.MEMBER),
+    Endpoint("GET", "/v1/projects/{project}/workflows", MemberRole.VIEWER),
+    Endpoint(
+        "POST",
+        "/v1/projects/{project}/workflows",
+        MemberRole.MEMBER,
+        {"name": "Matrix Workflow"},
+    ),
+    Endpoint("GET", "/v1/projects/{project}/workflows/{workflow}/draft", MemberRole.VIEWER),
+    Endpoint(
+        "PUT",
+        "/v1/projects/{project}/workflows/{workflow}/draft",
+        MemberRole.MEMBER,
+        {"graph": {"steps": [], "edges": []}},
+    ),
+    Endpoint("POST", "/v1/projects/{project}/workflows/{workflow}/validate", MemberRole.MEMBER),
+    Endpoint("DELETE", "/v1/projects/{project}/workflows/{workflow}", MemberRole.ADMIN),
 ]
 
 
@@ -79,12 +154,45 @@ class Scenario:
     workspace_id: str
     project_id: str
     api_key_id: str
+    agent_id: str
+    other_agent_id: str
+    profile_id: str
+    connection_id: str
+    workflow_id: str
+    #: A member who is never one of the callers, so that removing them is
+    #: never self-service - which a viewer may do regardless of role.
+    target_user_id: str
     actors: dict[MemberRole, Actor]
 
+    def substitutions(self) -> dict[str, str]:
+        return {
+            "workspace": self.workspace_id,
+            "project": self.project_id,
+            "key": self.api_key_id,
+            "agent": self.agent_id,
+            "other_agent": self.other_agent_id,
+            "profile": self.profile_id,
+            "connection": self.connection_id,
+            "workflow": self.workflow_id,
+            "target": self.target_user_id,
+        }
+
     def url(self, template: str) -> str:
-        return template.format(
-            workspace=self.workspace_id, project=self.project_id, key=self.api_key_id
-        )
+        return template.format(**self.substitutions())
+
+    def body(self, template: dict[str, Any] | None) -> dict[str, Any] | None:
+        """Substitute ids inside a request body as well as inside a path.
+
+        One endpoint needs it: creating a connection names the agent it
+        grants to, and that id is not known until the scenario is built.
+        """
+        if template is None:
+            return None
+        values = self.substitutions()
+        return {
+            key: value.format(**values) if isinstance(value, str) else value
+            for key, value in template.items()
+        }
 
 
 @pytest.fixture
@@ -125,10 +233,59 @@ async def scenario(
     # "add a member" call.
     await seed_user(owner_database, uuid.uuid4(), "outsider@example.com")
 
+    # A fifth member, only ever a target. If the member rows below aimed at
+    # one of the four callers, the call would be self-service when that
+    # caller made it - which a viewer may do - and the row would be testing
+    # the wrong rule.
+    target_user_id = uuid.uuid4()
+    await seed_user(owner_database, target_user_id, "target@example.com")
+    await seed_membership(
+        owner_database, uuid.UUID(workspace["id"]), target_user_id, MemberRole.VIEWER
+    )
+
+    agent = client.post(
+        f"/v1/projects/{project['id']}/agents",
+        json={"display_name": "Matrix Researcher", "interaction_mode": "managed"},
+        headers=actor.headers,
+    ).json()
+    other_agent = client.post(
+        f"/v1/projects/{project['id']}/agents",
+        json={"display_name": "Matrix Writer", "interaction_mode": "managed"},
+        headers=actor.headers,
+    ).json()
+    profile = client.post(
+        f"/v1/workspaces/{workspace['id']}/model-profiles",
+        json={"name": "Matrix Model", "provider_slug": "anthropic", "model_id": "opus"},
+        headers=actor.headers,
+    ).json()
+    connection = client.post(
+        f"/v1/projects/{project['id']}/connections",
+        json={
+            "kind": "grant_tool",
+            "source_kind": "agent",
+            "source_id": agent["id"],
+            "target_kind": "tool",
+            "target_id": agent["id"],
+            "config": {"tool_name": "web_search", "side_effect": "read"},
+        },
+        headers=actor.headers,
+    ).json()
+    workflow = client.post(
+        f"/v1/projects/{project['id']}/workflows",
+        json={"name": "Matrix Flow"},
+        headers=actor.headers,
+    ).json()
+
     return Scenario(
         workspace_id=workspace["id"],
         project_id=project["id"],
         api_key_id=api_key["id"],
+        agent_id=agent["id"],
+        other_agent_id=other_agent["id"],
+        profile_id=profile["id"],
+        connection_id=connection["id"],
+        workflow_id=workflow["workflow"]["id"],
+        target_user_id=str(target_user_id),
         actors=actors,
     )
 
@@ -142,7 +299,7 @@ def test_role_matrix(
     response = client.request(
         endpoint.method,
         scenario.url(endpoint.path),
-        json=endpoint.body,
+        json=scenario.body(endpoint.body),
         headers=actor.headers,
     )
 
@@ -188,6 +345,13 @@ def test_the_matrix_covers_every_mutating_route(app_routes: set[str]) -> None:
         "GET /v1/workspaces",
         "POST /v1/workspaces",
         "GET /v1/self/key",
+        # The ingest plane authenticates with a key, not a role, so the role
+        # matrix has nothing to say about it. `test_ingest.py` covers what
+        # does apply: the scope, the project pin and the agent allowlist.
+        "POST /v1/ingest/events",
+        "POST /v1/ingest/heartbeat",
+        "POST /v1/ingest/logs",
+        "POST /v1/ingest/metrics",
         "GET /healthz",
         "GET /readyz",
         "GET /v1/meta",
@@ -198,24 +362,39 @@ def test_the_matrix_covers_every_mutating_route(app_routes: set[str]) -> None:
 
 @pytest.fixture
 def app_routes(client: TestClient) -> set[str]:
-    """Every route the app serves, in the `METHOD /path` form used above."""
+    """Every route the app serves, in the `METHOD /path` form used above.
+
+    Read from the OpenAPI schema rather than by walking `app.routes`, and
+    that is not a detail. FastAPI wraps each `include_router` in an object
+    that carries no `path` of its own, so a one-level walk finds only
+    `/openapi.json` and `/docs` - both filtered - and returns nothing. This
+    fixture did exactly that from Phase 1 until Phase 2 noticed, which made
+    the guard below pass unconditionally: `missing` is always empty when
+    `app_routes` is. A blind check that reports success is worse than no
+    check, because it occupies the place where a real one would go.
+
+    The schema is also the better source on its own merits: it is the
+    contract the API publishes, so it cannot drift from what is served.
+    """
+    schema = client.app.openapi()  # type: ignore[attr-defined]
     routes: set[str] = set()
-    for route in client.app.routes:  # type: ignore[attr-defined]
-        path = getattr(route, "path", None)
-        methods = getattr(route, "methods", None)
-        # FastAPI's own documentation routes, including the OAuth2 redirect
-        # helper it mounts beside /docs.
-        if path is None or methods is None:
-            continue
+    for path, operations in schema.get("paths", {}).items():
         if path.startswith(("/openapi", "/docs")):
             continue
         normalised = (
             path.replace("{workspace_id}", "{workspace}")
             .replace("{project_id}", "{project}")
             .replace("{api_key_id}", "{key}")
+            .replace("{agent_id}", "{agent}")
+            .replace("{connection_id}", "{connection}")
+            .replace("{workflow_id}", "{workflow}")
+            .replace("{profile_id}", "{profile}")
+            .replace("{user_id}", "{target}")
         )
-        for method in methods:
-            if method in ("HEAD", "OPTIONS"):
+        for method in operations:
+            if method.upper() in ("HEAD", "OPTIONS"):
                 continue
-            routes.add(f"{method} {normalised}")
+            routes.add(f"{method.upper()} {normalised}")
+
+    assert routes, "the schema walk found nothing, so the guard below is blind"
     return routes

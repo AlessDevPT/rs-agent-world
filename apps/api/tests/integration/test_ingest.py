@@ -630,3 +630,147 @@ async def test_one_projects_events_are_invisible_to_another_tenant(
     async with database.session(visible_workspaces=[ingest.workspace_id]) as session:
         count = (await session.execute(text("SELECT count(*) FROM events"))).scalar_one()
     assert count == 1
+
+
+# -------------------------------------------- stale and out-of-order delivery ---
+
+
+async def test_a_stale_event_does_not_overwrite_a_newer_one(
+    client: TestClient, ingest: Fixture, agents: dict[str, uuid.UUID], owner_database: Database
+) -> None:
+    """A worker that was offline flushes a backlog, late.
+
+    The events arrive in the order it managed to send them, which is not the
+    order things happened. Applied blindly, the oldest event in the batch
+    decides what the agent looks like - and the island shows it paused while
+    it works.
+    """
+    now = dt.datetime.now(dt.UTC).replace(microsecond=0)
+    recent = (now - dt.timedelta(minutes=1)).isoformat()
+    ancient = (now - dt.timedelta(minutes=30)).isoformat()
+
+    assert (
+        post(
+            client,
+            ingest,
+            event(
+                dedup_key="s-recent",
+                type="agent.status_changed",
+                occurred_at=recent,
+                payload={"status": "working"},
+            ),
+        ).status_code
+        == 202
+    )
+
+    assert (
+        post(
+            client,
+            ingest,
+            event(
+                dedup_key="s-ancient",
+                type="agent.status_changed",
+                occurred_at=ancient,
+                payload={"status": "paused"},
+            ),
+        ).status_code
+        == 202
+    )
+
+    async with owner_database.session() as session:
+        status, history = (
+            await session.execute(
+                text(
+                    "SELECT a.status, (SELECT count(*) FROM agent_status_history) "
+                    "FROM agents a WHERE a.agent_key = 'researcher'"
+                )
+            )
+        ).one()
+
+    assert status == "working", "a 30-minute-old event overwrote a newer one"
+    # The history still records both transitions: what the agent *is* is
+    # guarded, what happened is not rewritten.
+    assert history == 2
+
+
+async def test_delivery_order_does_not_change_the_final_state(
+    client: TestClient, ingest: Fixture, agents: dict[str, uuid.UUID], owner_database: Database
+) -> None:
+    """The same three events, sent newest-first, converge on the same answer."""
+    now = dt.datetime.now(dt.UTC).replace(microsecond=0)
+    moments = [
+        (now - dt.timedelta(minutes=5), "idle"),
+        (now - dt.timedelta(minutes=3), "working"),
+        (now - dt.timedelta(minutes=1), "blocked"),
+    ]
+
+    for index, (when, status) in enumerate(reversed(moments)):
+        assert (
+            post(
+                client,
+                ingest,
+                event(
+                    dedup_key=f"order-{index}",
+                    type="agent.status_changed",
+                    occurred_at=when.isoformat(),
+                    payload={"status": status},
+                ),
+            ).status_code
+            == 202
+        )
+
+    async with owner_database.session() as session:
+        final = (
+            await session.execute(text("SELECT status FROM agents WHERE agent_key = 'researcher'"))
+        ).scalar_one()
+    assert final == "blocked", "the newest event should decide, whenever it arrived"
+
+
+async def test_a_stale_task_update_is_ignored_too(
+    client: TestClient, ingest: Fixture, agents: dict[str, uuid.UUID], owner_database: Database
+) -> None:
+    """A finished task must not be dragged back to running by a late start."""
+    task_id = uuid.uuid4()
+    now = dt.datetime.now(dt.UTC).replace(microsecond=0)
+    async with owner_database.session() as session:
+        await session.execute(
+            text(
+                "INSERT INTO tasks (id, workspace_id, project_id, task_ref, title) "
+                "VALUES (:i, :w, :p, 'task-1', 'Research')"
+            ),
+            {"i": task_id, "w": ingest.workspace_id, "p": ingest.project_id},
+        )
+
+    assert (
+        post(
+            client,
+            ingest,
+            event(
+                dedup_key="t-done",
+                type="task.completed",
+                subject={"kind": "task", "ref": "task-1"},
+                occurred_at=(now - dt.timedelta(minutes=1)).isoformat(),
+            ),
+        ).status_code
+        == 202
+    )
+
+    assert (
+        post(
+            client,
+            ingest,
+            event(
+                dedup_key="t-late-start",
+                type="task.started",
+                subject={"kind": "task", "ref": "task-1"},
+                occurred_at=(now - dt.timedelta(minutes=10)).isoformat(),
+            ),
+        ).status_code
+        == 202
+    )
+
+    async with owner_database.session() as session:
+        status = (
+            await session.execute(text("SELECT status FROM tasks WHERE task_ref = 'task-1'"))
+        ).scalar_one()
+    assert status == "completed"

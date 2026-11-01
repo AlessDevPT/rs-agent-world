@@ -187,7 +187,13 @@ def test_an_unknown_agent_status_folds_to_nothing() -> None:
     mutations = folded(
         "agent.status_changed", "agent", "researcher", {"status": "interpretive-dance"}
     )
-    assert mutations == (Patch(AgentRef("researcher"), {"last_event_at": WHEN}),)
+    assert mutations == (
+        Patch(
+            AgentRef("researcher"),
+            {"last_event_at": WHEN},
+            not_before=("last_event_at", WHEN),
+        ),
+    )
 
 
 # ------------------------------------------------------------------ the agent ---
@@ -195,7 +201,13 @@ def test_an_unknown_agent_status_folds_to_nothing() -> None:
 
 def test_a_heartbeat_touches_two_timestamps_and_nothing_else() -> None:
     assert folded("agent.heartbeat", "agent", "researcher") == (
-        Patch(AgentRef("researcher"), {"last_event_at": WHEN, "last_heartbeat_at": WHEN}),
+        Patch(
+            AgentRef("researcher"),
+            {"last_event_at": WHEN, "last_heartbeat_at": WHEN},
+            # Guarded, so a backlog flushed by a worker that was offline
+            # cannot drag the heartbeat backwards.
+            not_before=("last_event_at", WHEN),
+        ),
     )
 
 
@@ -236,6 +248,7 @@ def test_a_status_change_patches_and_appends_history() -> None:
                 "status": AgentStatus.PAUSED,
                 "status_reason": "operator stopped it",
             },
+            not_before=("last_event_at", WHEN),
         ),
         Append(
             AgentStatusRef("researcher"),
@@ -275,7 +288,9 @@ def test_progress_does_not_start_a_task() -> None:
         "progress_percent": 40,
         "progress_message": "reading",
         "updated_at": WHEN,
+        "last_event_at": WHEN,
     }
+    assert patch.not_before == ("last_event_at", WHEN)
 
 
 @pytest.mark.parametrize("percent", [-1, 101, 1000, "40", True])
@@ -581,3 +596,46 @@ def test_every_folding_event_type_produces_something_for_a_plausible_event() -> 
     # `tool.returned`, `failed` and `denied` declare `runs` because they are
     # about a run, while only `tool.invoked` changes its counter.
     assert missing == ["tool.returned", "tool.failed", "tool.denied"]
+
+
+def test_every_patch_that_moves_current_state_is_guarded() -> None:
+    """A patch with no guard is one a stale event can win.
+
+    Checked over every folding type rather than per reducer, because the
+    reducer most likely to forget is the one written next. Run steps and
+    execution steps are exempt and say why below.
+    """
+    unguarded: list[str] = []
+    for event_type, spec in KNOWN_EVENTS.items():
+        if not spec.folds_into:
+            continue
+        kind = spec.subjects[0].value
+        refs = {"execution_step": "exec-1:post", "tool_call": "run-1:tool-1"}
+        correlations = {
+            "approval": {"execution_step_ref": "exec-1:post"},
+            "tool_call": {"run_ref": "run-1"},
+        }
+        plausible = {
+            "agent.status_changed": {"status": "working"},
+            "run.step_started": {"seq": 1},
+            "run.step_finished": {"seq": 1},
+            "task.progress": {"percent": 10},
+        }
+        for mutation in folded(
+            event_type,
+            kind,
+            refs.get(kind, "r-1"),
+            plausible.get(event_type, {}),
+            **correlations.get(kind, {}),
+        ):
+            if isinstance(mutation, Patch) and mutation.not_before is None:
+                unguarded.append(f"{event_type} -> {mutation.target.value}")
+
+    # `runs`, `run_steps`, `workflow_executions` and `execution_steps` carry
+    # no "as of when do we know this" column yet. Their events come from the
+    # orchestrator and its runners rather than from a worker flushing a
+    # backlog, so the exposure is different - but it is an exemption, not an
+    # absence of risk, and it is listed here so it cannot be forgotten.
+    exempt_targets = {"runs", "run_steps", "workflow_executions", "execution_steps"}
+    surprising = [entry for entry in unguarded if entry.split(" -> ")[1] not in exempt_targets]
+    assert surprising == [], f"these patches can be overwritten by a stale event: {surprising}"

@@ -109,9 +109,7 @@ def test_listing_and_fetching(client: TestClient, world: World, actor: Actor) ->
     assert listed.status_code == 200
     assert [a["id"] for a in listed.json()] == [created["id"]]
 
-    one = client.get(
-        f"/v1/agents/{created['id']}?project_id={world.project_id}", headers=actor.headers
-    )
+    one = client.get(f"{world.agents_url()}/{created['id']}", headers=actor.headers)
     assert one.status_code == 200
     assert one.json()["display_name"] == "Researcher"
 
@@ -229,9 +227,7 @@ async def test_a_mixed_request_changes_neither_half(
     )
     assert refused.status_code == 403
 
-    after = client.get(
-        f"/v1/agents/{agent['id']}?project_id={world.project_id}", headers=actor.headers
-    ).json()
+    after = client.get(f"{world.agents_url()}/{agent['id']}", headers=actor.headers).json()
     assert after["display_name"] == "Researcher", "the member half was applied anyway"
     assert after["model_profile_id"] is None
 

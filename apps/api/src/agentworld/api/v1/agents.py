@@ -34,7 +34,6 @@ from agentworld.domain.enums import AgentInteractionMode, AgentStatus
 from agentworld.repositories.definitions import UNSET
 
 project_router = APIRouter(prefix="/v1/projects/{project_id}/agents", tags=["agents"])
-router = APIRouter(prefix="/v1/agents", tags=["agents"])
 profiles_router = APIRouter(prefix="/v1/workspaces/{workspace_id}/model-profiles", tags=["agents"])
 
 Name = Annotated[str, Field(min_length=1, max_length=200)]
@@ -236,13 +235,19 @@ async def create_agent(
     return AgentView.of(agent)
 
 
-@router.get("/{agent_id}", response_model=AgentView, summary="One agent")
+@project_router.get("/{agent_id}", response_model=AgentView, summary="One agent")
 async def get_agent(
+    project_id: UUID,
     agent_id: UUID,
-    project_id: Annotated[UUID, Query(description="The project the agent belongs to.")],
     principal: CurrentUser,
     service: AgentServiceDep,
 ) -> AgentView:
+    """Nested under the project, like every other agent route.
+
+    An earlier draft had this at `/v1/agents/{id}` with the project as a
+    query parameter, which made one route in the group shaped unlike the
+    rest for no reason a caller could see.
+    """
     return AgentView.of(await service.get(principal, project_id, agent_id))
 
 

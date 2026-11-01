@@ -82,6 +82,11 @@ class DerivedStateRepository(ScopedRepository):
         where = await self._where(mutation.selector)
         if where is None:
             return 0
+        if mutation.not_before is not None:
+            column_name, when = mutation.not_before
+            column = getattr(table, column_name)
+            # Null means nothing has been recorded yet, so anything is newer.
+            where = sa.and_(where, sa.or_(column.is_(None), column <= when))
         return await self._rows(sa.update(table).where(where).values(**fields))
 
     async def _increment(self, mutation: Increment) -> int:

@@ -194,8 +194,16 @@ class AgentService:
         agent_key: str | None = None,
         **fields: Any,
     ) -> Agent:
+        # An empty dict is not a configuration change. The request models
+        # default `model_overrides` and `dispatch` to `{}`, so counting them
+        # by presence made *every* create need `agent.configure` - which
+        # meant a member could not create an agent at all. The role matrix
+        # caught it; the rule is about what is being set, not which keys the
+        # serialiser happened to emit.
         configuration = {
-            name: value for name, value in fields.items() if name in CONFIGURATION_FIELDS
+            name: value
+            for name, value in fields.items()
+            if name in CONFIGURATION_FIELDS and value not in (None, {}, [], UNSET)
         }
         key = validated_slug(agent_key, fallback=display_name)
         _check_model_mode(interaction_mode, configuration.get("model_profile_id"))
@@ -249,6 +257,10 @@ class AgentService:
     ) -> Agent:
         """One endpoint, two permissions. See the module docstring."""
         sent = {name: value for name, value in fields.items() if value is not UNSET}
+        # On update, a key the caller actually sent counts even when it is
+        # empty: clearing an agent's overrides is a configuration change.
+        # The asymmetry with `create` above is deliberate - there, an empty
+        # dict is the serialiser's default rather than the caller's intent.
         touched_configuration = sorted(set(sent) & CONFIGURATION_FIELDS)
 
         async with self._factory.begin(visible_workspaces=set(principal.memberships)) as work:

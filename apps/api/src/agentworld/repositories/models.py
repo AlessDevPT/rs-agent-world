@@ -1123,6 +1123,11 @@ class Task(Base):
     labels: Mapped[dict[str, Any]] = mapped_column(
         nullable=False, server_default=sa.text("'{}'::jsonb")
     )
+    #: When the newest *event* folded into this row happened. Null until
+    #: one has been. Distinct from `updated_at`, which moves whenever
+    #: anything touches the row - including the API creating it, which is
+    #: why it cannot serve as the staleness guard. See migration 0016.
+    last_event_at: Mapped[dt.datetime | None]
     created_at: Mapped[dt.datetime] = _created_at()
     queued_at: Mapped[dt.datetime | None]
     started_at: Mapped[dt.datetime | None]

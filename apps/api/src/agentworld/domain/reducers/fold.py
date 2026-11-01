@@ -76,9 +76,19 @@ def _agent(envelope: EventEnvelope) -> tuple[Mutation, ...]:
     selector = AgentRef(agent_key=envelope.subject.ref)
     seen = {"last_event_at": envelope.occurred_at}
     name = envelope.type.split(".", 1)[1]
+    # A backlog flushed by a worker that was offline arrives in send
+    # order, not in the order things happened. Without this, the oldest
+    # event in the batch decides what the agent looks like.
+    fresh = ("last_event_at", envelope.occurred_at)
 
     if name == "heartbeat":
-        return (Patch(selector, {**seen, "last_heartbeat_at": envelope.occurred_at}),)
+        return (
+            Patch(
+                selector,
+                {**seen, "last_heartbeat_at": envelope.occurred_at},
+                not_before=fresh,
+            ),
+        )
 
     if name == "registered":
         # `registered_at` and the declared shape of the worker. The agent row
@@ -95,16 +105,21 @@ def _agent(envelope: EventEnvelope) -> tuple[Mutation, ...]:
                     "status_reason": None,
                     **_declared(envelope.payload),
                 },
+                not_before=fresh,
             ),
         )
 
     if name == "capability_changed":
-        return (Patch(selector, {**seen, **_declared(envelope.payload)}),)
+        return (Patch(selector, {**seen, **_declared(envelope.payload)}, not_before=fresh),)
 
     if status := _agent_status_for(name, envelope.payload):
         reason = _text(envelope.payload.get("reason"))
         return (
-            Patch(selector, {**seen, "status": status, "status_reason": reason}),
+            Patch(
+                selector,
+                {**seen, "status": status, "status_reason": reason},
+                not_before=fresh,
+            ),
             # The history row records the transition itself, and targets a
             # different table, so it takes its own selector. `from_status` is
             # left to the repository, which is the only layer that can read
@@ -115,7 +130,7 @@ def _agent(envelope: EventEnvelope) -> tuple[Mutation, ...]:
             ),
         )
 
-    return (Patch(selector, seen),)
+    return (Patch(selector, seen, not_before=fresh),)
 
 
 def _agent_status_for(name: str, payload: Mapping[str, Any]) -> AgentStatus | None:
@@ -184,6 +199,11 @@ def _task(envelope: EventEnvelope) -> tuple[Mutation, ...]:
     selector = TaskRef(task_ref=envelope.subject.ref)
     name = envelope.type.split(".", 1)[1]
     payload = envelope.payload
+    # Guarded on `last_event_at`, not on `updated_at`: the latter moves
+    # whenever anything touches the row, including the API creating it, so a
+    # guard on it refuses every event about a task someone made first.
+    seen = {"last_event_at": envelope.occurred_at, "updated_at": envelope.occurred_at}
+    fresh = ("last_event_at", envelope.occurred_at)
 
     if name == "progress":
         fields: dict[str, Any] = {}
@@ -194,17 +214,15 @@ def _task(envelope: EventEnvelope) -> tuple[Mutation, ...]:
             fields["progress_message"] = message
         # No status change: progress on a task that is not running would be
         # a producer bug, and quietly starting it here would hide it.
-        return (
-            (Patch(selector, {**fields, "updated_at": envelope.occurred_at}),)
-            if fields
-            else _NOTHING
-        )
+        if not fields:
+            return _NOTHING
+        return (Patch(selector, {**fields, **seen}, not_before=fresh),)
 
     status = _TASK_STATUS.get(name)
     if status is None:
         return _NOTHING
 
-    fields = {"status": status, "updated_at": envelope.occurred_at}
+    fields = {"status": status, **seen}
     if name == "assigned":
         fields["queued_at"] = envelope.occurred_at
     if name == "started":
@@ -217,7 +235,7 @@ def _task(envelope: EventEnvelope) -> tuple[Mutation, ...]:
             fields["result"] = result
     if error := _error(payload):
         fields["error"] = error
-    return (Patch(selector, fields),)
+    return (Patch(selector, fields, not_before=fresh),)
 
 
 # ---------------------------------------------------------------------- run ---
