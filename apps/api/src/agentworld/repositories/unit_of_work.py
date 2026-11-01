@@ -30,7 +30,9 @@ from agentworld.repositories.audit import AuditLogRepository
 from agentworld.repositories.base import TenantScope
 from agentworld.repositories.definitions import (
     AgentRepository,
+    ConnectionRepository,
     ModelProfileRepository,
+    WorkflowRepository,
 )
 from agentworld.repositories.derived import DerivedStateRepository
 from agentworld.repositories.events import EventRepository, TelemetryRepository
@@ -108,6 +110,12 @@ class UnitOfWork:
 
     def model_profiles(self, scope: TenantScope) -> ModelProfileRepository:
         return ModelProfileRepository(self._session, scope)
+
+    def connections(self, scope: TenantScope) -> ConnectionRepository:
+        return ConnectionRepository(self._session, scope)
+
+    def workflows(self, scope: TenantScope) -> WorkflowRepository:
+        return WorkflowRepository(self._session, scope)
 
     def events(self, scope: TenantScope) -> EventRepository:
         """Appending events. Needs `scope.project_id`, and says so."""

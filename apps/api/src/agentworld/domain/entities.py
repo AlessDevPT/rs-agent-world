@@ -24,6 +24,7 @@ from agentworld.domain.enums import (
     AgentInteractionMode,
     AgentStatus,
     ApiKeyScope,
+    ConnectionKind,
     MemberRole,
 )
 
@@ -196,3 +197,62 @@ class Agent:
     @property
     def is_archived(self) -> bool:
         return self.archived_at is not None
+
+
+@dataclass(frozen=True, slots=True)
+class Connection:
+    """A standing grant or route between components.
+
+    Not a workflow edge. An edge is control flow inside one workflow version;
+    a connection is a capability that outlives any single workflow. The
+    island draws both as paths, and keeping them apart here is what stops a
+    line someone drew becoming a permission nobody granted.
+    """
+
+    id: UUID
+    workspace_id: UUID
+    project_id: UUID
+    kind: ConnectionKind
+    source_kind: str
+    source_id: UUID
+    target_kind: str
+    target_id: UUID
+    config: Mapping[str, Any] = field(default_factory=dict)
+    requires_approval: bool = False
+    enabled: bool = True
+    created_at: datetime | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class Workflow:
+    id: UUID
+    workspace_id: UUID
+    project_id: UUID
+    slug: str
+    name: str
+    description: str | None = None
+    #: NULL until the first publish, which is why a workflow starts disabled.
+    current_version_id: UUID | None = None
+    enabled: bool = False
+    created_at: datetime | None = None
+    archived_at: datetime | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class WorkflowDraft:
+    """An unpublished version: the graph somebody is currently editing.
+
+    The graph is held whole rather than normalised into steps and edges,
+    because a draft changes as a whole and nothing reads its parts until it
+    is published.
+    """
+
+    id: UUID
+    workflow_id: UUID
+    version: int
+    graph: Mapping[str, Any] = field(default_factory=dict)
+    published_at: datetime | None = None
+
+    @property
+    def is_published(self) -> bool:
+        return self.published_at is not None

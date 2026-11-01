@@ -215,6 +215,29 @@ class MembershipRepository(GlobalRepository):
 class MemberListRepository(ScopedRepository):
     """Listing the members of one workspace. Scoped, unlike the above."""
 
+    async def count_at_least(self, role: MemberRole) -> int:
+        """How many members hold at least `role` in this workspace.
+
+        Used by workflow validation to answer one question: could an approval
+        that requires a second person ever be satisfied here? A workspace
+        with one eligible approver and a four-eyes rule is a deadlock built
+        by configuration, and the cheap moment to notice is before publishing
+        rather than when an execution stops forever.
+        """
+        ranked = [member for member in MemberRole if member.at_least(role)]
+        return int(
+            (
+                await self._session.execute(
+                    sa.select(sa.func.count())
+                    .select_from(m.WorkspaceMember)
+                    .where(
+                        m.WorkspaceMember.workspace_id == self.scope.workspace_id,
+                        m.WorkspaceMember.role.in_(ranked),
+                    )
+                )
+            ).scalar_one()
+        )
+
     async def list_members(self) -> Sequence[MembershipView]:
         rows = await self._session.execute(
             sa.select(m.WorkspaceMember, m.User)

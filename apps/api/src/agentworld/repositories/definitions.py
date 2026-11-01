@@ -21,8 +21,14 @@ from uuid import UUID
 import sqlalchemy as sa
 from sqlalchemy.engine import CursorResult
 
-from agentworld.domain.entities import Agent, ModelProfile
-from agentworld.domain.enums import AgentInteractionMode
+from agentworld.domain.entities import (
+    Agent,
+    Connection,
+    ModelProfile,
+    Workflow,
+    WorkflowDraft,
+)
+from agentworld.domain.enums import AgentInteractionMode, ConnectionKind, SideEffect
 from agentworld.repositories import models as m
 from agentworld.repositories.base import ScopedRepository
 
@@ -330,4 +336,341 @@ def _to_agent(row: m.Agent) -> Agent:
         last_event_at=row.last_event_at,
         registered_at=row.registered_at,
         archived_at=row.archived_at,
+    )
+
+
+class ConnectionRepository(ScopedRepository):
+    """Standing grants and routes between components.
+
+    Not a workflow edge. An edge is control flow inside one workflow version;
+    a connection is a capability that outlives any single workflow. The island
+    draws both as paths, which is exactly where the two get conflated - and
+    conflating them is how a line someone drew becomes a permission nobody
+    granted.
+    """
+
+    async def create(
+        self,
+        *,
+        kind: ConnectionKind,
+        source_kind: str,
+        source_id: UUID,
+        target_kind: str,
+        target_id: UUID,
+        config: Mapping[str, Any] | None = None,
+        requires_approval: bool = False,
+        enabled: bool = True,
+        created_by_user_id: UUID | None = None,
+    ) -> Connection:
+        row = (
+            await self._session.execute(
+                sa.insert(m.Connection)
+                .values(
+                    workspace_id=self.scope.workspace_id,
+                    project_id=self.scope.require_project(),
+                    kind=kind,
+                    source_kind=source_kind,
+                    source_id=source_id,
+                    target_kind=target_kind,
+                    target_id=target_id,
+                    config=dict(config or {}),
+                    requires_approval=requires_approval,
+                    enabled=enabled,
+                    created_by_user_id=created_by_user_id,
+                )
+                .returning(m.Connection)
+            )
+        ).scalar_one()
+        return _to_connection(row)
+
+    async def get(self, connection_id: UUID) -> Connection | None:
+        row = (
+            await self._session.execute(
+                sa.select(m.Connection).where(
+                    m.Connection.id == connection_id,
+                    m.Connection.project_id == self.scope.require_project(),
+                )
+            )
+        ).scalar_one_or_none()
+        return _to_connection(row) if row is not None else None
+
+    async def list_all(self) -> Sequence[Connection]:
+        rows = await self._session.execute(
+            sa.select(m.Connection)
+            .where(m.Connection.project_id == self.scope.require_project())
+            .order_by(m.Connection.created_at)
+        )
+        return [_to_connection(row) for row in rows.scalars().all()]
+
+    async def update(self, connection_id: UUID, **fields: Any) -> Connection | None:
+        values = {name: value for name, value in fields.items() if value is not UNSET}
+        if not values:
+            return await self.get(connection_id)
+        row = (
+            await self._session.execute(
+                sa.update(m.Connection)
+                .where(
+                    m.Connection.id == connection_id,
+                    m.Connection.project_id == self.scope.require_project(),
+                )
+                .values(**values)
+                .returning(m.Connection)
+            )
+        ).scalar_one_or_none()
+        return _to_connection(row) if row is not None else None
+
+    async def delete(self, connection_id: UUID) -> bool:
+        return bool(
+            await _rows(
+                self._session,
+                sa.delete(m.Connection).where(
+                    m.Connection.id == connection_id,
+                    m.Connection.project_id == self.scope.require_project(),
+                ),
+            )
+        )
+
+    async def tool_grants(self) -> Mapping[UUID, frozenset[str]]:
+        """Which tools each agent can actually reach, as validation needs them.
+
+        Enabled grants only: a disabled connection is a capability somebody
+        deliberately switched off, and treating it as live would make
+        `tool_not_granted` miss exactly the case the switch exists for.
+        """
+        rows = await self._session.execute(
+            sa.select(m.Connection.source_id, m.Connection.config).where(
+                m.Connection.project_id == self.scope.require_project(),
+                m.Connection.kind == ConnectionKind.GRANT_TOOL,
+                m.Connection.source_kind == "agent",
+                m.Connection.enabled.is_(True),
+            )
+        )
+        grants: dict[UUID, set[str]] = {}
+        for source_id, config in rows.all():
+            name = config.get("tool_name")
+            if isinstance(name, str) and name:
+                grants.setdefault(source_id, set()).add(name)
+        return {agent_id: frozenset(names) for agent_id, names in grants.items()}
+
+    async def tool_effects(self) -> Mapping[str, SideEffect]:
+        """What each granted tool can do, read from the grants themselves.
+
+        There is no `tools` table until Phase 6, so the side effect is
+        recorded on the grant. The strictest wins where two grants disagree:
+        a tool that is consequential anywhere is consequential.
+        """
+        rows = await self._session.execute(
+            sa.select(m.Connection.config).where(
+                m.Connection.project_id == self.scope.require_project(),
+                m.Connection.kind == ConnectionKind.GRANT_TOOL,
+            )
+        )
+        ranked = {SideEffect.READ: 0, SideEffect.WRITE: 1, SideEffect.CONSEQUENTIAL: 2}
+        effects: dict[str, SideEffect] = {}
+        for (config,) in rows.all():
+            name, raw = config.get("tool_name"), config.get("side_effect")
+            if not isinstance(name, str) or not name:
+                continue
+            try:
+                effect = SideEffect(raw) if raw else SideEffect.READ
+            except ValueError:
+                effect = SideEffect.READ
+            if name not in effects or ranked[effect] > ranked[effects[name]]:
+                effects[name] = effect
+        return effects
+
+
+class WorkflowRepository(ScopedRepository):
+    """Workflows and their draft versions.
+
+    A *draft* is a `workflow_versions` row with `published_at IS NULL`, and
+    its graph lives in one jsonb column rather than in `workflow_steps` and
+    `workflow_edges`. That is deliberate: a draft is edited whole, by someone
+    dragging things around, and normalising it on every save would be a great
+    deal of work to produce rows nothing reads yet. Publishing is what freezes
+    it into the normalised tables, and publishing arrives with the execution
+    core - nothing can run a frozen version until there is something to run
+    it with.
+    """
+
+    async def create(
+        self,
+        *,
+        slug: str,
+        name: str,
+        description: str | None = None,
+        created_by_user_id: UUID | None = None,
+        graph: Mapping[str, Any] | None = None,
+    ) -> tuple[Workflow, WorkflowDraft]:
+        """A workflow and its first draft, in one transaction.
+
+        A workflow with no version at all would be a row the UI has to
+        special-case the first time it opens one, so there is never one.
+        """
+        workflow = (
+            await self._session.execute(
+                sa.insert(m.Workflow)
+                .values(
+                    workspace_id=self.scope.workspace_id,
+                    project_id=self.scope.require_project(),
+                    slug=slug,
+                    name=name,
+                    description=description,
+                    created_by_user_id=created_by_user_id,
+                )
+                .returning(m.Workflow)
+            )
+        ).scalar_one()
+        draft = await self._new_version(
+            workflow.id, version=1, graph=graph, created_by_user_id=created_by_user_id
+        )
+        return _to_workflow(workflow), draft
+
+    async def get(self, workflow_id: UUID) -> Workflow | None:
+        row = (
+            await self._session.execute(
+                sa.select(m.Workflow).where(
+                    m.Workflow.id == workflow_id,
+                    m.Workflow.project_id == self.scope.require_project(),
+                    m.Workflow.archived_at.is_(None),
+                )
+            )
+        ).scalar_one_or_none()
+        return _to_workflow(row) if row is not None else None
+
+    async def list_all(self) -> Sequence[Workflow]:
+        rows = await self._session.execute(
+            sa.select(m.Workflow)
+            .where(
+                m.Workflow.project_id == self.scope.require_project(),
+                m.Workflow.archived_at.is_(None),
+            )
+            .order_by(m.Workflow.created_at)
+        )
+        return [_to_workflow(row) for row in rows.scalars().all()]
+
+    async def slug_taken(self, slug: str) -> bool:
+        found = (
+            await self._session.execute(
+                sa.select(sa.literal(1))
+                .where(
+                    m.Workflow.project_id == self.scope.require_project(),
+                    m.Workflow.slug == slug,
+                )
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        return found is not None
+
+    async def draft_of(self, workflow_id: UUID) -> WorkflowDraft | None:
+        """The newest unpublished version, which is the one being edited."""
+        row = (
+            await self._session.execute(
+                sa.select(m.WorkflowVersion)
+                .where(
+                    m.WorkflowVersion.workflow_id == workflow_id,
+                    m.WorkflowVersion.project_id == self.scope.require_project(),
+                    m.WorkflowVersion.published_at.is_(None),
+                )
+                .order_by(m.WorkflowVersion.version.desc())
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        return _to_draft(row) if row is not None else None
+
+    async def save_draft(
+        self, workflow_id: UUID, *, graph: Mapping[str, Any]
+    ) -> WorkflowDraft | None:
+        row = (
+            await self._session.execute(
+                sa.update(m.WorkflowVersion)
+                .where(
+                    m.WorkflowVersion.workflow_id == workflow_id,
+                    m.WorkflowVersion.project_id == self.scope.require_project(),
+                    m.WorkflowVersion.published_at.is_(None),
+                )
+                .values(graph=dict(graph))
+                .returning(m.WorkflowVersion)
+            )
+        ).scalar_one_or_none()
+        return _to_draft(row) if row is not None else None
+
+    async def archive(self, workflow_id: UUID) -> bool:
+        return bool(
+            await _rows(
+                self._session,
+                sa.update(m.Workflow)
+                .where(
+                    m.Workflow.id == workflow_id,
+                    m.Workflow.project_id == self.scope.require_project(),
+                    m.Workflow.archived_at.is_(None),
+                )
+                .values(archived_at=sa.func.now()),
+            )
+        )
+
+    async def _new_version(
+        self,
+        workflow_id: UUID,
+        *,
+        version: int,
+        graph: Mapping[str, Any] | None,
+        created_by_user_id: UUID | None,
+    ) -> WorkflowDraft:
+        row = (
+            await self._session.execute(
+                sa.insert(m.WorkflowVersion)
+                .values(
+                    workflow_id=workflow_id,
+                    workspace_id=self.scope.workspace_id,
+                    project_id=self.scope.require_project(),
+                    version=version,
+                    graph=dict(graph or {"steps": [], "edges": []}),
+                    created_by_user_id=created_by_user_id,
+                )
+                .returning(m.WorkflowVersion)
+            )
+        ).scalar_one()
+        return _to_draft(row)
+
+
+def _to_connection(row: m.Connection) -> Connection:
+    return Connection(
+        id=row.id,
+        workspace_id=row.workspace_id,
+        project_id=row.project_id,
+        kind=row.kind,
+        source_kind=row.source_kind,
+        source_id=row.source_id,
+        target_kind=row.target_kind,
+        target_id=row.target_id,
+        config=dict(row.config),
+        requires_approval=row.requires_approval,
+        enabled=row.enabled,
+        created_at=row.created_at,
+    )
+
+
+def _to_workflow(row: m.Workflow) -> Workflow:
+    return Workflow(
+        id=row.id,
+        workspace_id=row.workspace_id,
+        project_id=row.project_id,
+        slug=row.slug,
+        name=row.name,
+        description=row.description,
+        current_version_id=row.current_version_id,
+        enabled=row.enabled,
+        created_at=row.created_at,
+        archived_at=row.archived_at,
+    )
+
+
+def _to_draft(row: m.WorkflowVersion) -> WorkflowDraft:
+    return WorkflowDraft(
+        id=row.id,
+        workflow_id=row.workflow_id,
+        version=row.version,
+        graph=dict(row.graph),
+        published_at=row.published_at,
     )

@@ -29,7 +29,12 @@ from agentworld.repositories.unit_of_work import UnitOfWorkFactory
 from agentworld.services.api_keys import CHALLENGE as KEY_CHALLENGE
 from agentworld.services.api_keys import ApiKeyService
 from agentworld.services.context import CallContext
-from agentworld.services.definitions import AgentService, ModelProfileService
+from agentworld.services.definitions import (
+    AgentService,
+    ConnectionService,
+    ModelProfileService,
+    WorkflowService,
+)
 from agentworld.services.identity import IdentityService, resolve_principal
 from agentworld.services.ingest import IngestService
 from agentworld.services.projects import ProjectService
@@ -216,6 +221,14 @@ def get_model_profile_service(factory: FactoryDep) -> ModelProfileService:
     return ModelProfileService(factory)
 
 
+def get_connection_service(factory: FactoryDep) -> ConnectionService:
+    return ConnectionService(factory)
+
+
+def get_workflow_service(factory: FactoryDep) -> WorkflowService:
+    return WorkflowService(factory)
+
+
 def get_ingest_service(factory: FactoryDep, settings: SettingsDep) -> IngestService:
     """The batch limits are settings, because they are an operator's call.
 
@@ -241,3 +254,5 @@ ApiKeyServiceDep = Annotated[ApiKeyService, Depends(get_api_key_service)]
 IngestServiceDep = Annotated[IngestService, Depends(get_ingest_service)]
 AgentServiceDep = Annotated[AgentService, Depends(get_agent_service)]
 ModelProfileServiceDep = Annotated[ModelProfileService, Depends(get_model_profile_service)]
+ConnectionServiceDep = Annotated[ConnectionService, Depends(get_connection_service)]
+WorkflowServiceDep = Annotated[WorkflowService, Depends(get_workflow_service)]
