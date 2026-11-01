@@ -441,6 +441,11 @@ class Passage:
     score: float                        # 0..1, comparable within one result set only
     locator: str | None                 # page, heading, offset - for citation
     metadata: Mapping[str, str]
+    # Provenance, carried so a later tool call can record where its arguments
+    # came from. Retrieved text is untrusted input; knowing which document a
+    # tool argument derived from is what makes an exfiltration attempt
+    # investigable after the fact. See risk R1.
+    provenance: Provenance              # source kind, external ref, retrieved_at
 
 @dataclass(frozen=True, slots=True)
 class RetrievalResult:
@@ -472,6 +477,11 @@ Four properties make the swap genuinely contract-free:
   condition in somebody's workflow is exactly what would break on the swap.
 - **`index` and `forget` are part of the interface**, so the re-index pipeline a vector
   backend needs has a place to live without the ingest path changing.
+- **Every passage carries provenance**, and a managed agent's turn records which document
+  ids were in its context when each tool call was made — on the `tool.invoked` event, as
+  `payload.context_sources`. That is "provenance wherever practical": it does not prove a
+  causal link between a document and an argument, and it does make "which document was in
+  scope when this agent posted our customer list" a query rather than an investigation.
 - **`backend` is for diagnostics.** A test asserts no module outside `infra/knowledge/`
   reads it, so it cannot become a branch.
 
@@ -689,6 +699,10 @@ system can know.
 ## 7. Execution state
 
 ```sql
+-- Who started an execution. There is no third value and no NULL: an
+-- execution with no recorded initiator is an audit hole.
+CREATE TYPE initiator_kind AS ENUM ('user', 'system');
+
 CREATE TYPE execution_status AS ENUM (
   'pending', 'running', 'waiting_approval', 'waiting_input',
   'paused', 'completed', 'failed', 'cancelled'
@@ -708,7 +722,22 @@ CREATE TABLE workflow_executions (
   workflow_version_id uuid NOT NULL REFERENCES workflow_versions(id) ON DELETE RESTRICT,
   status        execution_status NOT NULL DEFAULT 'pending',
   trigger_id    uuid REFERENCES triggers(id) ON DELETE SET NULL,
-  triggered_by_user_id uuid REFERENCES users(id) ON DELETE SET NULL,
+
+  -- The initiator. Immutable: written once at creation, never recomputed,
+  -- and never resolved through a mutable row like `triggers.created_by`.
+  -- `initiator_kind` is always present; exactly one of the two ids is.
+  initiator_kind initiator_kind NOT NULL,
+  initiator_user_id uuid REFERENCES users(id) ON DELETE RESTRICT,
+  initiator_trigger_id uuid REFERENCES triggers(id) ON DELETE RESTRICT,
+  -- A human-readable record that survives both rows being archived, so an
+  -- audit two years later does not depend on a join that may have gone.
+  initiator_label text NOT NULL,       -- "ada@example.com" | "schedule competitor-brief"
+  CONSTRAINT initiator_user_xor_system CHECK (
+    (initiator_kind = 'user'   AND initiator_user_id IS NOT NULL
+                               AND initiator_trigger_id IS NULL)
+    OR
+    (initiator_kind = 'system' AND initiator_user_id IS NULL)
+  ),
   idempotency_key citext,          -- a trigger firing twice yields one execution
   input         jsonb NOT NULL DEFAULT '{}'::jsonb,
   output        jsonb,
@@ -720,6 +749,7 @@ CREATE TABLE workflow_executions (
 );
 CREATE INDEX executions_live_idx ON workflow_executions (project_id, status, created_at DESC)
   WHERE status IN ('pending','running','waiting_approval','waiting_input','paused');
+CREATE INDEX executions_initiator_idx ON workflow_executions (project_id, initiator_kind, created_at DESC);
 
 CREATE TABLE execution_steps (
   id            uuid PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -860,26 +890,105 @@ neither is in the table because neither is configurable:
   independently; a policy that named `viewer` would still be refused by the permission
   matrix. The policy can only ask for more.
 
-### Closing the scheduling loophole
+### Execution identity: immutable, and never a borrowed user
 
-`requires_different_user` compares `decided_by_user_id` against
-`attributed_to_user_id`, and the naive choice — whoever pressed Run — has a hole: a user
-who cannot self-approve schedules the workflow instead, and the scheduled run has no
-requester to differ from.
+Revision 3 proposed attributing a scheduled run to whoever last performed
+`trigger.enable`. **That was wrong and is withdrawn.** Two things break:
 
-So attribution is resolved per trigger kind:
+- **Authority would be borrowed and would go stale.** A workflow enabled by an admin who
+  later drops to `member`, or leaves, would keep running with the authority of a role they
+  no longer hold — resolved through a mutable row, `triggers`, long after the decision.
+  Permissions that outlive the person holding them are the bug this would have built.
+- **It silently disqualifies a bystander.** The enabler would become unable to approve any
+  of that workflow's consequential steps, a consequence they never chose and nothing told
+  them about.
 
-| Execution started by | `attributed_to_user_id` |
-|---------------------|------------------------|
-| `POST /workflows/{id}/run` | the caller |
-| `manual` trigger | the caller |
-| `schedule` trigger | the user who last performed `trigger.enable` — an `admin` action |
-| `webhook` trigger | the user who last performed `trigger.enable` |
-| `integration_event` | the user who last performed `trigger.enable` |
-| `workflow_completed` | inherited from the originating execution |
+So every execution carries an **immutable initiator**, written once at creation:
 
-The person who turned autonomy on is the person the run is attributed to. Scheduling is
-therefore not a route around a gate.
+| Execution started by | `initiator_kind` | `initiator_user_id` | `initiator_label` |
+|---------------------|------------------|--------------------|-------------------|
+| `POST /workflows/{id}/run` | `user` | the caller | their email |
+| `manual` trigger | `user` | the caller | their email |
+| `schedule` trigger | **`system`** | NULL | `schedule <workflow-slug>` |
+| `webhook` trigger | **`system`** | NULL | `webhook <trigger-id>` |
+| `integration_event` | **`system`** | NULL | `integration <slug>` |
+| `workflow_completed` | **inherited verbatim** from the originating execution | | |
+
+Three properties follow, and each is the point:
+
+**Authority never comes from a user for a system-initiated run.** What a scheduled
+execution may do is fixed by the **published `workflow_version`** — its steps, its
+assignees, and the tool grants those assignees hold. Those were authorized at publish and
+grant time by someone who held the role then. The execution consults no user's live
+permissions, so there is no account whose authority it borrows and nothing to go stale.
+Revoking a grant stops the next call (checked at call time, `02-ORCHESTRATION.md` §5);
+demoting a user changes nothing about a running schedule, because the schedule never had
+their authority.
+
+**The initiator is recorded, not derived.** `initiator_label` is written at creation and is
+plain text, so an audit still answers "what started this" after the trigger is deleted and
+the user row is gone. `ON DELETE RESTRICT` on `initiator_user_id` means a user who has
+initiated an execution cannot be hard-deleted out from under the record.
+
+**A `SystemPrincipal` makes this explicit in code.** The principal union becomes
+`UserPrincipal | KeyPrincipal | SystemPrincipal`, where the third is what a worker acts
+as. It carries no workspace membership and `authorize()` refuses every control-plane
+action for it, exactly as it does for a key — so "the scheduler did it" can never widen
+into "the scheduler may do anything". A small, pleasing consequence: Phase 1 removed the
+`"system"` branch from `services/context.actor_of` as unreachable dead code. It becomes
+reachable now, legitimately.
+
+### The different-user rule, and the residual it leaves
+
+`requires_different_user` compares the decider against the execution's initiator **when
+that initiator is a user**. For a system-initiated execution there is no user to differ
+from: `approvals.attributed_to_user_id` is NULL, the check is satisfied by any authorized
+approver, and the approval records `initiator_kind = 'system'` so the audit shows why.
+
+**The residual, stated rather than buried:** a user who cannot self-approve a manual run
+could — if they also hold `trigger.enable` — schedule the same workflow and then approve
+its steps themselves. Three things bound it, and none of them eliminates it:
+
+- `trigger.enable` is an `admin` action (`05-PERMISSIONS.md` §5). The route is open only to
+  someone who could, in most cases, have granted themselves the capability directly.
+- The approver's **own** role is still checked independently, so this is never a route to
+  an action their role does not permit — only to one they could have approved anyway if
+  somebody else had started it.
+- Enabling the trigger, the execution and the decision are three `audit_log` rows naming
+  the same user.
+
+Closing it properly needs a policy knob — "a system-initiated consequential step needs an
+approver who did not enable its trigger" — which reintroduces the mutable-row lookup this
+section exists to remove, unless the enabler is also snapshotted onto the trigger at enable
+time. That is a v1.1 candidate (`04-ROADMAP-AND-MVP.md` §9), not v1 scope.
+
+### Authorization is checked independently of approval policy
+
+Worth stating as its own rule, because it is the one that makes everything above safe:
+
+```
+authorize(principal, Action.APPROVAL_DECIDE, Resource(workspace_id))   # first, always
+   ↓ only if that passed
+check approvals.required_role            (from the frozen requirement)
+   ↓
+check requires_different_user            (against the frozen initiator)
+   ↓
+write the decision
+```
+
+- **A policy can only add requirements.** `resolve_requirement` returns an
+  `ApprovalRequirement`; nothing in it is consulted by `authorize`, and nothing it could
+  say would relax the permission matrix. A policy naming `viewer` is still refused.
+- **An approval cannot grant the approver anything.** Granting one writes a decision and
+  calls `advance()`. The dispatch that follows runs with the *workflow version's* grants,
+  not the approver's — so approving a step does not lend it your permissions.
+- **An approval cannot grant the requester anything either.** A `member` whose workflow
+  needs a `consequential` tool the project never granted gets
+  `tool_not_granted` from `validate` at publish time. No approval exists for it, because
+  the workflow could not be published.
+- **The floor is the underlying action's own role.** An approver's required role may never
+  be below the role required to perform what is being approved, so approval cannot become
+  a cheaper path to a privileged act.
 
 ### When a requirement cannot be satisfied
 

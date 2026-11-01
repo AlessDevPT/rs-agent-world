@@ -1,6 +1,6 @@
 # Proposal: AgentWorld as a visual AI ecosystem builder
 
-> **Revision 3, 2026-11-01** — final, pending approval. **Nothing here is implemented.**
+> **Revision 4, 2026-11-01** — approved; Phase 2 implementation has begun. **Nothing here is implemented.**
 > `docs/01`–`05` still describe the previous product direction and remain the contract the
 > code was written against. On approval these documents are merged into that set and this
 > directory is removed.
@@ -112,8 +112,18 @@ classification and approvals are real but partial mitigations — `http_request`
 `write`, not `consequential`, so by default it is not gated, and classifying every outbound
 request as consequential would make the product unusable.
 
-v1 ships with the risk documented, `http_request` kept out of builder-proposed plans by
-default, and a Phase 11 review of every path where model output reaches a tool call. The
-actual fixes — per-grant destination allow-lists, and treating any tool call whose arguments
-derive from retrieved content as requiring approval — are v1.1 candidates. Full form in
-[07 §5](07-DECISION-RECORD.md).
+**AgentWorld is not injection-proof and must not be described as such.** The accurate
+claim is narrower and still worth making: *an agent can only do what it has been granted,
+you can see what it has been granted, and you can find out afterwards what was in scope
+when it acted.*
+
+The mitigations are a **gate on Phase 6**, not a Phase 11 audit item: `http_request`
+excluded from builder-proposed plans by default, an egress summary on every agent surface
+derived from its grants, provenance on retrieved passages and `context_sources` on every
+tool call, a review of the complete path from model output and retrieved content to tool
+execution, and an adversarial test suite — including a case that asserts the exfiltration
+**succeeds**, so the limitation is encoded in CI rather than remembered.
+
+The actual fixes — per-tool-grant destination allow-lists, and an approval policy for tool
+calls whose arguments trace to retrieved content — are explicit v1.1 candidates. What v1
+does and does not protect against is enumerated in [07 §5](07-DECISION-RECORD.md).

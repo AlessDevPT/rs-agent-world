@@ -138,10 +138,14 @@ through a mechanism that is not plain DNS.
 **Redirects are never followed automatically.** `follow_redirects=False` on the guarded
 client, always.
 
-A caller that wants them opts in, and then each hop goes through §2 from the start —
-parse, resolve, validate every address, pin — with a cap of three hops and a rule that
-the scheme may not downgrade from `https` to `http`. A redirect to a blocked destination
-is a terminal error, not a retryable one: the destination will not become allowed.
+A caller that wants them opts in, and then **each hop is treated as a new request**: the
+`Location` is parsed, its host is resolved **independently**, every resolved address is
+validated, and the connection is pinned to a validated one. The first hop's validation
+grants the second nothing — a redirect chain is not a trusted channel.
+
+A cap of three hops, and the scheme may not downgrade from `https` to `http`. A redirect to
+a blocked destination is a terminal error, not a retryable one: the destination will not
+become allowed by waiting.
 
 `agent_push` and `webhook_emit` do not opt in. A `302` from a webhook receiver is a
 misconfiguration on their side, and following it would mean posting the work somewhere the
@@ -237,30 +241,47 @@ Stated because a boundary document that only lists wins is not a boundary docume
 
 Each is a test. The parametrised ones run the whole table, not a sample.
 
-**Address validation**
+All of the following are **automated** and run in CI, parametrised over the tables above
+rather than over a sample. The list is the one the final clarification asked for, plus the
+cases that were already here.
+
+**Address normalisation and validation**
 - [ ] Every range in §3 is refused, for both families, parametrised one case per row.
+- [ ] IPv4 and IPv6 normalisation: each address is canonicalised before testing, so
+      `10.0.0.1`, `::ffff:10.0.0.1`, `::ffff:a00:1` and `64:ff9b::a00:1` are all recognised
+      as the same blocked destination.
 - [ ] `http://[::ffff:169.254.169.254]/` and `http://[::ffff:10.0.0.1]/` are refused.
 - [ ] `http://[64:ff9b::a00:1]/` (NAT64-wrapped `10.0.0.1`) is refused.
 - [ ] `http://127.1/`, `http://2130706433/`, `http://0x7f.0.0.1/` — decimal, hex and short
       forms of loopback — are all refused, because normalisation happens before testing.
-- [ ] A hostname resolving to one public and one private address is refused, not partially
-      allowed.
+- [ ] **Mixed DNS answers:** a hostname resolving to one public and one private address is
+      refused outright, not partially allowed and not resolved to "the good one".
+- [ ] A hostname resolving to several public addresses connects to one of them.
 - [ ] `file://`, `gopher://`, `dict://` and `ftp://` are refused on scheme alone.
 - [ ] A URL carrying userinfo is refused.
 - [ ] Port 22 and port 6379 are refused under the default port policy.
 - [ ] Each metadata hostname in §3 is refused by name, with resolution stubbed to a public
       address so the name check is what fails it.
 
-**Rebinding and pinning**
+**DNS rebinding and pinning**
 - [ ] With a resolver that returns a public address on the first call and `10.0.0.5` on the
       second, the request still connects to the first — proving the address is pinned and
-      not re-resolved.
-- [ ] The `Host` header and TLS SNI carry the original hostname when connecting by IP, so a
-      virtual-hosted HTTPS endpoint still works. Asserted against a real TLS test server.
+      not re-resolved. This is the DNS-rebinding case.
+- [ ] A resolver whose answer changes between the validation call and the connect call
+      cannot affect the connection, because there is no second call — asserted with a
+      resolver spy that records exactly one lookup per request.
+- [ ] **Host and SNI preservation:** the `Host` header and TLS SNI carry the original
+      hostname when connecting by IP, so a virtual-hosted HTTPS endpoint still works.
+      Asserted against a real TLS test server, not a mock.
 
 **Redirects**
 - [ ] A `302` to `http://169.254.169.254/` is not followed, under both the default and the
       opt-in policy.
+- [ ] **Each hop is independently resolved and validated:** a `302` from an allowed host to
+      a hostname that resolves to `10.0.0.5` is refused, proving the first hop's validation
+      did not carry over.
+- [ ] A redirect hop is also pinned: a resolver returning public-then-private for the
+      *redirect target* still connects to the first answer.
 - [ ] A fourth redirect hop is refused.
 - [ ] An `https` → `http` redirect is refused.
 - [ ] `agent_push` and `webhook_emit` do not follow a `302` at all.

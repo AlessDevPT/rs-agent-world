@@ -518,7 +518,7 @@ per form:
 
 | | Simple | Advanced |
 |---|--------|----------|
-| Agent | name, what it does (one line), what it should do (prose), a "Fast / Careful" choice, tool checkboxes | full instructions, model profile, parameter overrides, `max_turns`, timeout, dispatch config, labels |
+| Agent | name, what it does (one line), what it should do (prose), a "Fast / Careful" choice, tool checkboxes, **the egress summary below** | full instructions, model profile, parameter overrides, `max_turns`, timeout, dispatch config, labels |
 | Workflow step | "who does this", "what do they get", "needs approval?" | `input_mapping` expressions, `max_attempts`, timeout, `on_failure`, conditions |
 | Integration | a guided connect button and a plain-language scope list | endpoints, headers, HMAC, discovered schemas |
 | Trigger | "every weekday morning" | cron, timezone, overlap policy |
@@ -530,6 +530,30 @@ Two rules that keep this from becoming two products:
   only one mode can express, so a user who graduates loses nothing.
 - **Simple mode's defaults are safe, not clever.** `requires_approval` defaults on for any
   `consequential` tool. A beginner's first workflow asks before it sends.
+
+### Making outward reach visible
+
+A user has to be able to tell, without reading a tool schema, that an agent can send
+information out of AgentWorld. So every agent surface — its page, the island's contextual
+panel, and the builder's plan — carries an **egress summary** computed from its granted
+tools' `side_effect` classification and their declared destinations:
+
+> **Can send data out:** Slack (`#market-intel`), any web address.
+> **Can only read:** your uploaded documents, web search.
+
+Three rules:
+
+- It is **derived, never authored.** The summary is computed from `connections` of kind
+  `grant_tool` joined to `tools.side_effect`, so it cannot drift from what the agent can
+  actually do, and granting a tool updates it with no second edit.
+- **"Any web address" is said in those words** when `http_request` is granted, because that
+  is the honest description and it is the grant most worth a second thought.
+- It appears in the **builder's plan before apply**, in the `requires_consent` block, so
+  the user sees the reach before agreeing rather than after.
+
+This is a mitigation for risk R1 (`07-DECISION-RECORD.md` §5): it does not stop a
+determined exfiltration, it makes the capability that enables one visible at the moment it
+is granted.
 
 The word "LLM" does not appear in Simple mode. Neither does "token", "temperature",
 "prompt", "schema" or "webhook". That is a copy rule with a lint check on the

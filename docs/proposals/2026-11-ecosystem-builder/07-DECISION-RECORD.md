@@ -2,9 +2,17 @@
 
 > Proposal, 2026-11-01, revision 3. Refinement item 6.
 
-Four tables, in increasing order of uncertainty: what is **built**, what is **approved for
-implementation**, what is **deferred**, and what is still **open**. Then the architectural
-risks that remain unresolved, which is the part worth reading twice.
+Four statuses, in increasing order of uncertainty:
+
+| Status | Meaning | Section |
+|--------|---------|---------|
+| **Implemented** | In the repository, tested, committed. Not up for re-decision | §1 |
+| **Approved, not implemented** | Agreed and specified; the roadmap builds it | §2 |
+| **Deferred to v1.1 or later** | A real feature, consciously postponed, with its earliest release named | §3 |
+| **Still open** | Needs a decision, with a recommended resolution and the phase that forces it | §4 |
+
+Then §5: the architectural risks that remain unresolved, which is the part worth reading
+twice.
 
 A decision's status here is the single source of truth for it. Where a numbered decision
 (`K*`, `C*`) appears in `00-GAP-ANALYSIS.md`, that document explains *why*; this one records
@@ -77,7 +85,16 @@ Agreed across the original brief and two refinements. These are what the roadmap
 | C14 | A 72-action permission matrix with nine actions that deliberately do not exist | 2 onward | 05 |
 | **C16** | **Configurable approval policies; consequential work needs a second person by default** | 6 | 01 §7 |
 | — | Approval requirements frozen at creation; enforced in three independent layers | 6 | 01 §7, 02 §7 |
-| — | Attribution follows whoever enabled autonomy, closing the scheduling loophole | 6 | 01 §7 |
+| — | **Immutable execution initiator**; a system-initiated run borrows no user's authority | 2 | 01 §7 |
+| — | `SystemPrincipal` as the third principal type, refused every control-plane action | 2 | 01 §7 |
+| — | Authorization checked independently of, and before, approval policy | 6 | 01 §7 |
+
+**Withdrawn from revision 3:** attributing a scheduled execution to whoever last enabled
+its trigger. It would have borrowed a user's authority through a mutable row and let it go
+stale after a demotion or a departure, and it silently disqualified that user from
+approving. Replaced by the immutable initiator above. The residual it leaves — an admin who
+can enable a trigger can schedule a workflow and then approve its steps — is bounded,
+documented in `01-DOMAIN-AND-PROTOCOL.md` §7, and has a v1.1 candidate.
 | **C17** | **Resolve-validate-pin outbound HTTP; no redirects by default; egress policy at the environment** | 3, 7 | 06 |
 | — | SSRF: both IP families, IPv4-mapped and NAT64, metadata names, normalised errors | 3 | 06 §3 |
 
@@ -147,16 +164,17 @@ transactional. That was correct, and it is now the product.
 
 ## 4. Open questions
 
-Narrowed to three. The earlier list's self-approval item is now decided (C16), and the
-island-ordering item is largely answered by the Phase 4 prototype.
+Three. The earlier list's self-approval item is decided (C16), and the island-ordering item
+is largely answered by the Phase 4 prototype.
 
-| # | Question | Default if you say nothing | Cost of changing later |
-|---|----------|---------------------------|----------------------|
-| **O1** | **First real integration: Slack or Gmail?** | Slack — the least painful OAuth, and "post to a channel" is a convincing consequential action to gate. Gmail is the better demo and a much worse first OAuth: restricted scopes mean app review, which is calendar time you cannot compress | Low. A second integration is 3–5 days once the first OAuth flow exists |
-| **O2** | **MCP as the primary tool mechanism?** | Yes. One client turns every MCP server into tools with no AgentWorld code per service. It also bets on an ecosystem outside our control | Medium. Reversing it means writing an adapter per service, which is the work that does not finish |
-| **O3** | **Phase 8 before Phase 9** — the plain workspace polished before the island? | Yes, so the product is proved usable without the island. The Phase 4 prototype means this no longer delays *seeing* the island, only finishing it | Low. The phases share no files and can be swapped |
+| # | Decision | Recommended resolution | Needed by | Cost of changing later |
+|---|----------|----------------------|-----------|----------------------|
+| **O1** | First real integration: Slack or Gmail? | **Slack.** The least painful OAuth, and "post to a channel" is a convincing consequential action to gate. Gmail is the better demo and a much worse first OAuth — restricted scopes mean app review, which is calendar time you cannot compress | **Start of Phase 6** | Low. A second integration is 3-5 days once the first OAuth flow exists |
+| **O2** | MCP as the primary tool mechanism? | **Yes.** One client turns every MCP server into tools with no AgentWorld code per service. It does bet on an ecosystem outside our control | **Start of Phase 6** | Medium. Reversing it means an adapter per service, which is the work that does not finish |
+| **O3** | Plain workspace polished before the island? | **Yes** - Phase 8 then Phase 9, so the product is proved usable without the island. The Phase 4 prototype means this delays *finishing* the island, not seeing it | **Start of Phase 8** | Low. The two phases share no files and can be swapped |
 
-None blocks starting Phase 2. O1 and O2 are needed by Phase 6, O3 by Phase 8.
+**None blocks Phase 2**, which is why implementation can begin now. Each is listed against
+the phase that forces it, so none has to be decided earlier than it must be.
 
 ## 5. Unresolved architectural risks
 
@@ -176,13 +194,47 @@ make the product unusable.
 **What makes it worse:** granting `http_request` and a knowledge source to the same agent,
 which is a combination the builder could propose innocently.
 
-**What would fix it:** per-grant destination allow-lists ("this agent may call these three
-hosts"), and treating any tool call whose arguments derive from retrieved content as
-requiring approval — a taint-tracking model. Both are v1.1 candidates. v1 ships with the
-risk documented, `http_request` off by default in builder-proposed plans, and a Phase 11
-review of every path where model output reaches a tool call.
+**What v1 does protect against**, specifically:
 
-**Severity: high.** This is the risk I would most want a second opinion on before launch.
+- An agent reaching an internal, loopback, link-local, reserved or metadata destination —
+  `06-OUTBOUND-SECURITY.md`, with an automated suite.
+- An agent calling a tool it was not granted — checked at call time, so a revocation takes
+  effect mid-run.
+- A `consequential` tool used without an approval where policy requires one — and the gate
+  is the absence of a dispatch, not a flag.
+- The capability being invisible: the egress summary on every agent surface says, in plain
+  words, that an agent can send data out and where.
+- The event being untraceable afterwards: `Provenance` on retrieved passages and
+  `context_sources` on `tool.invoked` make "which document was in scope when this agent
+  posted our customer list" a query rather than an investigation.
+- The builder quietly granting it: `http_request` is excluded from builder-proposed plans
+  unless the user asked for web access in their own words.
+
+**What v1 does not protect against:**
+
+- An agent that has legitimately been granted `http_request` sending data it can read to
+  any allowed public destination, at the instruction of retrieved content. The destination
+  is permitted, the tool is granted, the request is honest. **Nothing in v1 blocks this.**
+- `http_request` is classified `write`, not `consequential`, so it is not gated by default.
+  Classifying every outbound request as consequential would mean an approval prompt per web
+  fetch, which no user would tolerate and which would train them to click through the ones
+  that matter.
+
+**AgentWorld is not injection-proof and must not be described as such** — not in the
+product, the documentation or any marketing. The accurate claim is narrower and still worth
+making: *an agent can only do what it has been granted, you can see what it has been
+granted, and you can find out afterwards what was in scope when it acted.*
+
+**What would fix it**, both explicit v1.1 candidates: per-tool-grant destination
+allow-lists, and an approval policy for tool calls whose arguments trace to retrieved
+content — which `Provenance` and `context_sources` make possible but do not implement.
+
+**Brought forward to Phase 6** from Phase 11: the adversarial test suite — including a case
+asserting the exfiltration **succeeds**, so the limitation is encoded in CI rather than
+remembered — and the review of the complete path from model output and retrieved content to
+tool execution. Phase 11 keeps a second review against the full tool catalogue.
+
+**Severity: high.** Still the risk I would most want a second opinion on before launch.
 
 ### R2 — At-least-once delivery against receivers that do not dedupe
 
