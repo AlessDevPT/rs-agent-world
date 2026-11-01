@@ -421,9 +421,13 @@ class Agent(Base):
         server_default=sa.text("'provisioning'::agent_status"),
     )
     status_reason: Mapped[str | None]
-    #: The foreign key to `tasks` is added by the migration that creates it;
-    #: the reference is circular.
-    current_task_id: Mapped[UUID | None] = mapped_column(sa.Uuid)
+    #: Declared by migration 0010, once `tasks` exists; the reference is
+    #: circular, so it could not be stated here before then.
+    current_task_id: Mapped[UUID | None] = mapped_column(
+        sa.ForeignKey(
+            "tasks.id", ondelete="SET NULL", use_alter=True, name="agents_current_task_fkey"
+        )
+    )
     last_heartbeat_at: Mapped[dt.datetime | None]
     last_event_at: Mapped[dt.datetime | None]
     heartbeat_ttl_seconds: Mapped[int] = mapped_column(nullable=False, server_default=sa.text("60"))
@@ -891,8 +895,12 @@ class ExecutionStep(Base):
     )
     attempt: Mapped[int] = mapped_column(nullable=False, server_default=sa.text("0"))
     agent_id: Mapped[UUID | None] = mapped_column(sa.ForeignKey("agents.id", ondelete="SET NULL"))
-    #: The FK arrives with `tasks`.
-    task_id: Mapped[UUID | None] = mapped_column(sa.Uuid)
+    #: Declared by migration 0010, once `tasks` exists.
+    task_id: Mapped[UUID | None] = mapped_column(
+        sa.ForeignKey(
+            "tasks.id", ondelete="SET NULL", use_alter=True, name="execution_steps_task_fkey"
+        )
+    )
     input: Mapped[dict[str, Any] | None]
     output: Mapped[dict[str, Any] | None]
     error: Mapped[dict[str, Any] | None]
@@ -1032,6 +1040,264 @@ class Dispatch(Base):
     )
 
 
+# ----------------------------------------------------- Phase 2: agent work ---
+
+#: Computed by PostgreSQL, so no writer can disagree with it and no reader
+#: has to recompute it.
+DURATION_MS = "(EXTRACT(EPOCH FROM (finished_at - started_at)) * 1000)::int"
+
+
+class Task(Base):
+    """The unit of work handed to an agent.
+
+    No longer the top-level concept it was in the previous design: an
+    `agent_task` step materialises one, and `execution_step_id` records where
+    it came from. A standalone task - a plain work queue with no workflow -
+    has NULL there. That keeps the whole claim and heartbeat pipeline,
+    including the `FOR UPDATE SKIP LOCKED` claim, and gives it a place in the
+    new product rather than a competing one.
+    """
+
+    __tablename__ = "tasks"
+
+    id: Mapped[UUID] = _uuid_pk()
+    workspace_id: Mapped[UUID] = mapped_column(
+        sa.ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False
+    )
+    project_id: Mapped[UUID] = mapped_column(
+        sa.ForeignKey("projects.id", ondelete="CASCADE"), nullable=False
+    )
+    #: The caller's own id, so an integrator can address a task by the
+    #: reference their system already uses.
+    task_ref: Mapped[str | None] = mapped_column(CITEXT)
+    #: NULL for a standalone task; set when a workflow step materialised it.
+    execution_step_id: Mapped[UUID | None] = mapped_column(
+        sa.ForeignKey("execution_steps.id", ondelete="SET NULL")
+    )
+    title: Mapped[str] = mapped_column(nullable=False)
+    description: Mapped[str | None]
+    status: Mapped[enums.TaskStatus] = mapped_column(
+        pg_enum(enums.TaskStatus, "task_status"),
+        nullable=False,
+        server_default=sa.text("'pending'::task_status"),
+    )
+    priority: Mapped[enums.TaskPriority] = mapped_column(
+        pg_enum(enums.TaskPriority, "task_priority"),
+        nullable=False,
+        server_default=sa.text("'normal'::task_priority"),
+    )
+    assigned_agent_id: Mapped[UUID | None] = mapped_column(
+        sa.ForeignKey("agents.id", ondelete="SET NULL")
+    )
+    created_by_user_id: Mapped[UUID | None] = mapped_column(
+        sa.ForeignKey("users.id", ondelete="SET NULL")
+    )
+    created_by_agent_id: Mapped[UUID | None] = mapped_column(
+        sa.ForeignKey("agents.id", ondelete="SET NULL")
+    )
+    #: Arrives from an agent over the wire and is rendered directly as a
+    #: progress bar, so it is checked rather than trusted.
+    progress_percent: Mapped[int | None] = mapped_column(sa.SmallInteger)
+    progress_message: Mapped[str | None]
+    input: Mapped[dict[str, Any]] = mapped_column(
+        nullable=False, server_default=sa.text("'{}'::jsonb")
+    )
+    result: Mapped[dict[str, Any] | None]
+    error: Mapped[dict[str, Any] | None]
+    attempt: Mapped[int] = mapped_column(nullable=False, server_default=sa.text("0"))
+    max_attempts: Mapped[int] = mapped_column(nullable=False, server_default=sa.text("1"))
+    labels: Mapped[dict[str, Any]] = mapped_column(
+        nullable=False, server_default=sa.text("'{}'::jsonb")
+    )
+    created_at: Mapped[dt.datetime] = _created_at()
+    queued_at: Mapped[dt.datetime | None]
+    started_at: Mapped[dt.datetime | None]
+    finished_at: Mapped[dt.datetime | None]
+    deadline_at: Mapped[dt.datetime | None]
+    updated_at: Mapped[dt.datetime] = _created_at()
+
+    __table_args__ = (
+        sa.CheckConstraint(
+            "progress_percent IS NULL OR progress_percent BETWEEN 0 AND 100",
+            name="progress_is_a_percentage",
+        ),
+        sa.CheckConstraint("attempt >= 0", name="task_attempt_is_not_negative"),
+        sa.CheckConstraint("max_attempts >= 1", name="task_max_attempts_is_positive"),
+        sa.UniqueConstraint("project_id", "task_ref", name="tasks_project_ref_key"),
+        # Redundant alone; the target of `task_dependencies`, which is what
+        # stops a dependency crossing projects.
+        sa.UniqueConstraint("project_id", "id", name="tasks_project_id_id_key"),
+        # The claim query's index: pending work in priority then arrival order.
+        sa.Index(
+            "tasks_claimable_idx",
+            "project_id",
+            "status",
+            sa.text("priority DESC"),
+            "created_at",
+        ),
+        sa.Index("tasks_assigned_idx", "assigned_agent_id", "status"),
+        sa.Index("tasks_labels_idx", "labels", postgresql_using="gin"),
+        sa.Index("tasks_execution_step_idx", "execution_step_id"),
+    )
+
+
+class TaskDependency(Base):
+    """ "This task waits on that one."
+
+    Both ends are reached through `(project_id, id)`, so a dependency cannot
+    cross projects - which would be nonsense and a cross-tenant information
+    channel.
+    """
+
+    __tablename__ = "task_dependencies"
+
+    workspace_id: Mapped[UUID] = mapped_column(
+        sa.ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False
+    )
+    project_id: Mapped[UUID] = mapped_column(sa.Uuid, nullable=False)
+    task_id: Mapped[UUID] = mapped_column(sa.Uuid, primary_key=True)
+    depends_on_id: Mapped[UUID] = mapped_column(sa.Uuid, primary_key=True)
+
+    __table_args__ = (
+        sa.CheckConstraint("task_id <> depends_on_id", name="no_self_dependency"),
+        sa.ForeignKeyConstraint(
+            ["project_id", "task_id"],
+            ["tasks.project_id", "tasks.id"],
+            name="task_dependencies_task_fkey",
+            ondelete="CASCADE",
+        ),
+        sa.ForeignKeyConstraint(
+            ["project_id", "depends_on_id"],
+            ["tasks.project_id", "tasks.id"],
+            name="task_dependencies_depends_on_fkey",
+            ondelete="CASCADE",
+        ),
+        sa.Index("task_dependencies_depends_on_idx", "depends_on_id"),
+    )
+
+
+class Run(Base):
+    """One attempt at a task, carrying the agent's own trace."""
+
+    __tablename__ = "runs"
+
+    id: Mapped[UUID] = _uuid_pk()
+    workspace_id: Mapped[UUID] = mapped_column(
+        sa.ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False
+    )
+    project_id: Mapped[UUID] = mapped_column(
+        sa.ForeignKey("projects.id", ondelete="CASCADE"), nullable=False
+    )
+    run_ref: Mapped[str | None] = mapped_column(CITEXT)
+    agent_id: Mapped[UUID] = mapped_column(
+        sa.ForeignKey("agents.id", ondelete="CASCADE"), nullable=False
+    )
+    task_id: Mapped[UUID | None] = mapped_column(sa.ForeignKey("tasks.id", ondelete="SET NULL"))
+    #: NULL for a run outside any workflow - an agent doing its own thing.
+    execution_step_id: Mapped[UUID | None] = mapped_column(
+        sa.ForeignKey("execution_steps.id", ondelete="SET NULL")
+    )
+    status: Mapped[enums.RunStatus] = mapped_column(
+        pg_enum(enums.RunStatus, "run_status"),
+        nullable=False,
+        server_default=sa.text("'running'::run_status"),
+    )
+    step_count: Mapped[int] = mapped_column(nullable=False, server_default=sa.text("0"))
+    tool_call_count: Mapped[int] = mapped_column(nullable=False, server_default=sa.text("0"))
+    error: Mapped[dict[str, Any] | None]
+    started_at: Mapped[dt.datetime] = _created_at()
+    finished_at: Mapped[dt.datetime | None]
+    #: Computed by PostgreSQL, so no writer can disagree with it.
+    duration_ms: Mapped[int | None] = mapped_column(
+        sa.Integer, sa.Computed(DURATION_MS, persisted=True)
+    )
+
+    __table_args__ = (
+        sa.CheckConstraint("step_count >= 0", name="step_count_is_not_negative"),
+        sa.CheckConstraint("tool_call_count >= 0", name="tool_call_count_is_not_negative"),
+        sa.UniqueConstraint("project_id", "run_ref", name="runs_project_ref_key"),
+        sa.Index("runs_task_idx", "task_id", sa.text("started_at DESC")),
+        sa.Index("runs_agent_idx", "agent_id", sa.text("started_at DESC")),
+    )
+
+
+class RunStep(Base):
+    """One step of a run: an LLM turn, a tool call, a decision.
+
+    `bigserial` rather than a uuid: written far more often than read, always
+    in order, and a monotonic key keeps the index appending to one page.
+    """
+
+    __tablename__ = "run_steps"
+
+    id: Mapped[int] = mapped_column(sa.BigInteger, primary_key=True, autoincrement=True)
+    run_id: Mapped[UUID] = mapped_column(
+        sa.ForeignKey("runs.id", ondelete="CASCADE"), nullable=False
+    )
+    workspace_id: Mapped[UUID] = mapped_column(
+        sa.ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False
+    )
+    project_id: Mapped[UUID] = mapped_column(
+        sa.ForeignKey("projects.id", ondelete="CASCADE"), nullable=False
+    )
+    seq: Mapped[int] = mapped_column(nullable=False)
+    name: Mapped[str] = mapped_column(nullable=False)
+    #: Free text. The core never branches on it.
+    kind: Mapped[str | None]
+    status: Mapped[enums.RunStatus] = mapped_column(
+        pg_enum(enums.RunStatus, "run_status"),
+        nullable=False,
+        server_default=sa.text("'running'::run_status"),
+    )
+    input: Mapped[dict[str, Any] | None]
+    output: Mapped[dict[str, Any] | None]
+    error: Mapped[dict[str, Any] | None]
+    started_at: Mapped[dt.datetime] = _created_at()
+    finished_at: Mapped[dt.datetime | None]
+
+    __table_args__ = (
+        sa.CheckConstraint("seq >= 0", name="run_step_seq_is_not_negative"),
+        sa.UniqueConstraint("run_id", "seq", name="run_steps_seq_key"),
+    )
+
+
+class AgentStatusHistory(Base):
+    """Every status transition an agent has made.
+
+    Low-volume and the most useful forensic table, so it outlives the
+    partitioned `events` it refers to - which is why `event_id` is a plain
+    uuid and not a foreign key. A dangling reference here is correct; a
+    cascade would delete the forensic record along with the partition.
+    """
+
+    __tablename__ = "agent_status_history"
+
+    id: Mapped[int] = mapped_column(sa.BigInteger, primary_key=True, autoincrement=True)
+    agent_id: Mapped[UUID] = mapped_column(
+        sa.ForeignKey("agents.id", ondelete="CASCADE"), nullable=False
+    )
+    workspace_id: Mapped[UUID] = mapped_column(
+        sa.ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False
+    )
+    project_id: Mapped[UUID] = mapped_column(
+        sa.ForeignKey("projects.id", ondelete="CASCADE"), nullable=False
+    )
+    #: NULL for the first transition, out of nothing.
+    from_status: Mapped[enums.AgentStatus | None] = mapped_column(
+        pg_enum(enums.AgentStatus, "agent_status")
+    )
+    to_status: Mapped[enums.AgentStatus] = mapped_column(
+        pg_enum(enums.AgentStatus, "agent_status"), nullable=False
+    )
+    reason: Mapped[str | None]
+    event_id: Mapped[UUID | None] = mapped_column(sa.Uuid)
+    changed_at: Mapped[dt.datetime] = _created_at()
+
+    __table_args__ = (
+        sa.Index("agent_status_history_agent_idx", "agent_id", sa.text("changed_at DESC")),
+    )
+
+
 #: Tables protected by row-level security in migration `0004_rls`.
 #: `test_rls.py` reads this and asserts the database agrees, so a new
 #: tenant-scoped table cannot be added without a decision about it being
@@ -1060,4 +1326,10 @@ RLS_PROTECTED_TABLES: tuple[str, ...] = (
     "workflow_executions",
     "execution_steps",
     "dispatches",
+    # 0010
+    "tasks",
+    "task_dependencies",
+    "runs",
+    "run_steps",
+    "agent_status_history",
 )
