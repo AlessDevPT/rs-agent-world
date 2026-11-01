@@ -227,3 +227,118 @@ async def test_an_ingest_key_cannot_be_created_without_a_project(
                 },
             )
     assert "ingest_keys_are_project_scoped" in str(caught.value)
+
+
+async def test_only_a_managed_agent_may_name_a_model_profile(
+    owner_database: Database,
+) -> None:
+    """The check constraint behind "runtime and model provider are separate".
+
+    A `dispatchable` or `observed` agent runs somewhere else and chooses its
+    own model, which AgentWorld never calls. Recording a model profile for one
+    would imply a choice this system does not make and cannot enforce, so the
+    database refuses it rather than the service remembering to.
+    """
+    import uuid
+
+    user_id, workspace_id, project_id = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    profile_id = uuid.uuid4()
+
+    async with owner_database.session() as session:
+        await session.execute(
+            text("INSERT INTO users (id, email) VALUES (:i, 'modes@example.com')"),
+            {"i": user_id},
+        )
+        await session.execute(
+            text("INSERT INTO workspaces (id, slug, name, created_by) VALUES (:i, :s, :n, :u)"),
+            {"i": workspace_id, "s": "modes", "n": "Modes", "u": user_id},
+        )
+        await session.execute(
+            text("INSERT INTO projects (id, workspace_id, slug, name) VALUES (:i, :w, :s, :n)"),
+            {"i": project_id, "w": workspace_id, "s": "modes", "n": "Modes"},
+        )
+        await session.execute(
+            text(
+                "INSERT INTO model_profiles (id, workspace_id, name, provider_slug, model_id) "
+                "VALUES (:i, :w, :n, 'anthropic', 'claude-opus-5')"
+            ),
+            {"i": profile_id, "w": workspace_id, "n": "Careful reasoning"},
+        )
+
+    async def insert(mode: str, with_profile: bool) -> None:
+        async with owner_database.session() as session:
+            await session.execute(
+                # Separate binds for agent_key and display_name: one
+                # parameter used for both a citext and a text column leaves
+                # asyncpg unable to deduce a single type for it.
+                text(
+                    "INSERT INTO agents (workspace_id, project_id, agent_key, "
+                    "interaction_mode, display_name, model_profile_id) "
+                    "VALUES (:w, :p, :key, :mode, :name, :profile)"
+                ),
+                {
+                    "w": workspace_id,
+                    "p": project_id,
+                    "key": f"{mode}-{with_profile}",
+                    "name": f"{mode}-{with_profile}",
+                    "mode": mode,
+                    "profile": profile_id if with_profile else None,
+                },
+            )
+
+    # A managed agent may name one, and must be able to.
+    await insert("managed", with_profile=True)
+    # Every mode may omit it.
+    for mode in ("managed", "dispatchable", "observed"):
+        await insert(mode, with_profile=False)
+    # The other two may not name one.
+    for mode in ("dispatchable", "observed"):
+        with pytest.raises(Exception) as caught:
+            await insert(mode, with_profile=True)
+        assert "model_profile_only_when_managed" in str(caught.value)
+
+
+async def test_exactly_one_default_model_profile_per_workspace(
+    owner_database: Database,
+) -> None:
+    """The partial unique index, the same shape as `workspace_single_owner`."""
+    import uuid
+
+    user_id, workspace_id = uuid.uuid4(), uuid.uuid4()
+    async with owner_database.session() as session:
+        await session.execute(
+            text("INSERT INTO users (id, email) VALUES (:i, 'defaults@example.com')"),
+            {"i": user_id},
+        )
+        await session.execute(
+            text("INSERT INTO workspaces (id, slug, name, created_by) VALUES (:i, :s, :n, :u)"),
+            {"i": workspace_id, "s": "defaults", "n": "Defaults", "u": user_id},
+        )
+        await session.execute(
+            text(
+                "INSERT INTO model_profiles (workspace_id, name, provider_slug, model_id, "
+                "is_default) VALUES (:w, 'Fast', 'anthropic', 'm', true)"
+            ),
+            {"w": workspace_id},
+        )
+
+    # A second non-default is fine; a second default is not.
+    async with owner_database.session() as session:
+        await session.execute(
+            text(
+                "INSERT INTO model_profiles (workspace_id, name, provider_slug, model_id, "
+                "is_default) VALUES (:w, 'Careful', 'anthropic', 'm', false)"
+            ),
+            {"w": workspace_id},
+        )
+
+    with pytest.raises(Exception) as caught:
+        async with owner_database.session() as session:
+            await session.execute(
+                text(
+                    "INSERT INTO model_profiles (workspace_id, name, provider_slug, model_id, "
+                    "is_default) VALUES (:w, 'Second default', 'anthropic', 'm', true)"
+                ),
+                {"w": workspace_id},
+            )
+    assert "one_default_model_profile" in str(caught.value)

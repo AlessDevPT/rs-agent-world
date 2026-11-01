@@ -315,3 +315,73 @@ async def test_the_audit_log_is_still_readable_and_writable(
     async with database.session(visible_workspaces=[workspace_a]) as session:
         count = (await session.execute(text("SELECT count(*) FROM audit_log"))).scalar_one()
     assert count == 1
+
+
+async def test_an_agent_in_another_workspace_is_invisible(
+    database: Database, owner_database: Database
+) -> None:
+    """The policy on `agents`, exercised rather than merely present.
+
+    `test_every_protected_table_has_rls_enabled_and_forced` proves the policy
+    exists; this proves it does something. The query below has no tenant
+    filter of its own on purpose - every row it fails to see is the database's
+    doing.
+    """
+    workspace_a, workspace_b, _, _ = await _seed_two_tenants(owner_database)
+    agent_a, agent_b = uuid.uuid4(), uuid.uuid4()
+
+    async with owner_database.session() as session:
+        for agent_id, workspace_id, key in (
+            (agent_a, workspace_a, "worker-a"),
+            (agent_b, workspace_b, "worker-b"),
+        ):
+            project_id = (
+                await session.execute(
+                    text("SELECT id FROM projects WHERE workspace_id = :w LIMIT 1"),
+                    {"w": workspace_id},
+                )
+            ).scalar_one()
+            await session.execute(
+                text(
+                    "INSERT INTO agents (id, workspace_id, project_id, agent_key, "
+                    "interaction_mode, display_name) "
+                    "VALUES (:id, :w, :p, :key, 'observed', :name)"
+                ),
+                {"id": agent_id, "w": workspace_id, "p": project_id, "key": key, "name": key},
+            )
+
+    async def visible(visible_workspaces: list[uuid.UUID] | None) -> set[uuid.UUID]:
+        async with database.session(visible_workspaces=visible_workspaces) as session:
+            rows = await session.execute(text("SELECT id FROM agents"))
+            return set(rows.scalars().all())
+
+    assert await visible(None) == set(), "an unset tenant must see no agents"
+    assert await visible([workspace_a]) == {agent_a}
+    assert await visible([workspace_b]) == {agent_b}
+    assert await visible([workspace_a, workspace_b]) == {agent_a, agent_b}
+
+
+async def test_an_agent_cannot_be_written_into_an_invisible_workspace(
+    database: Database, owner_database: Database
+) -> None:
+    """The WITH CHECK half, on the table that matters most."""
+    workspace_a, workspace_b, _, _ = await _seed_two_tenants(owner_database)
+    async with owner_database.session() as session:
+        project_b = (
+            await session.execute(
+                text("SELECT id FROM projects WHERE workspace_id = :w LIMIT 1"),
+                {"w": workspace_b},
+            )
+        ).scalar_one()
+
+    with pytest.raises(Exception) as caught:
+        async with database.session(visible_workspaces=[workspace_a]) as session:
+            await session.execute(
+                text(
+                    "INSERT INTO agents (workspace_id, project_id, agent_key, "
+                    "interaction_mode, display_name) "
+                    "VALUES (:w, :p, 'sneak', 'observed', 'sneak')"
+                ),
+                {"w": workspace_b, "p": project_b},
+            )
+    assert "row-level security" in str(caught.value).lower()

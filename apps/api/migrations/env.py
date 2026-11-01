@@ -54,6 +54,22 @@ def _configure(connection: Connection) -> None:
         include_object=_include_object,
         compare_type=True,
         compare_server_default=True,
+        # One transaction per migration, not one for the whole chain.
+        #
+        # Required, not a preference: PostgreSQL refuses to *use* an enum
+        # value in the same transaction that added it, so migration 0006's
+        # `ALTER TYPE agent_status ADD VALUE 'paused'` and migration 0007's
+        # index predicate referencing 'paused' cannot share one. With the
+        # default they do, and the upgrade fails with
+        # `UnsafeNewEnumValueUsageError`. Any later migration that adds an
+        # enum member and then uses it would hit the same wall.
+        #
+        # The trade is real and worth stating: a failure part-way through the
+        # chain now leaves the earlier migrations applied, rather than rolling
+        # the whole upgrade back. That is the conventional choice for a
+        # forward-only chain, and the schema drift test is what catches a
+        # database left in a half-migrated state.
+        transaction_per_migration=True,
     )
 
 
