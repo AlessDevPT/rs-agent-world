@@ -1,4 +1,5 @@
 import type { Metadata } from "next";
+import Link from "next/link";
 
 import "./globals.css";
 
@@ -15,15 +16,12 @@ export default function RootLayout({
       <body>
         <div className="shell">
           <header className="shell__header">
-            <span className="shell__mark">AgentWorld</span>
-            <nav className="shell__nav" aria-label="Main">
-              {/* Routes arrive in Phase 5; the shell exists now so the
-                  layout is not invented later under time pressure. */}
-              <span className="shell__nav-item shell__nav-item--active">Overview</span>
-              <span className="shell__nav-item">Agents</span>
-              <span className="shell__nav-item">Tasks</span>
-              <span className="shell__nav-item">Activity</span>
-            </nav>
+            <Link className="shell__mark" href="/">
+              AgentWorld
+            </Link>
+            {/* The dashboard nav - agents, tasks, activity - belongs to a
+                workspace, so it lives in the workspace layout rather than
+                here, where /login would also render it. */}
           </header>
           <main className="shell__main">{children}</main>
         </div>

@@ -1,69 +1,118 @@
-import { getMeta, type Meta } from "@/lib/api/client";
+import Link from "next/link";
+import { redirect } from "next/navigation";
+
+import { readSession } from "@/lib/session";
 
 /**
- * Rendered per request, never prerendered. Without this the API check is
- * evaluated once at build time and the result frozen into the output, so a
- * build run while the API was down would report "unreachable" forever.
+ * Rendered per request, never prerendered. Without this the session check is
+ * evaluated once at build time and the result frozen into the output, so the
+ * first visitor's view would be whatever the build server saw - which is
+ * nobody, signed out, with no API.
  */
 export const dynamic = "force-dynamic";
 
 /**
- * Phase 0 dashboard.
+ * The entry point, and the only page that has to handle every state.
  *
- * It does one real thing: reach the API and report what it found. That makes
- * the frontend/backend split (goal G7) observable from the first commit -
- * if this card shows an error, the two halves are genuinely not talking, and
- * nothing is faking agreement.
+ * Each branch sends the visitor somewhere they can act: a setup instruction,
+ * a sign-in form, their workspace, or an honest statement that the backend is
+ * down. Nothing here is a dead end.
  */
-export default async function OverviewPage() {
-  let meta: Meta | null = null;
-  let error: string | null = null;
+export default async function StartPage() {
+  const session = await readSession();
 
-  try {
-    meta = await getMeta();
-  } catch (e) {
-    error = e instanceof Error ? e.message : "Unknown error";
+  switch (session.kind) {
+    case "unconfigured":
+      return <Unconfigured />;
+    case "api-unreachable":
+      return <ApiDown message={session.message} requestId={session.requestId} />;
+    // `return redirect(...)` rather than a bare call: `redirect` is typed
+    // `never` because it works by throwing, but eslint cannot know that and
+    // reads the next `case` as a fall-through. Returning it states the
+    // control flow instead of adding an unreachable `break`.
+    case "signed-out":
+      return redirect("/login");
+    case "signed-in":
+      // A user with no workspace is not an error state; it is the onboarding
+      // screen. The API says so with `needs_onboarding` rather than leaving
+      // the client to infer it from an empty list.
+      if (session.me.needs_onboarding) return redirect("/onboarding");
+      return redirect(`/w/${session.me.workspaces[0]!.workspace.id}`);
   }
+}
 
+function Unconfigured() {
   return (
-    <section className="stack">
+    <section className="stack stack--narrow">
       <div>
-        <h1 className="title">Overview</h1>
+        <h1 className="title">Almost there</h1>
         <p className="muted">
-          No agents are connected yet. Agent registration and the live island arrive in
-          later phases; this page currently proves the API connection.
+          AgentWorld is running, but no identity provider is configured, so there is
+          nobody to sign in as yet.
         </p>
       </div>
 
       <div className="card">
-        <h2 className="card__title">API connection</h2>
-        {meta ? (
-          <dl className="kv">
-            <dt>Status</dt>
-            <dd>
-              <span className="pill pill--ok">connected</span>
-            </dd>
-            <dt>API version</dt>
-            <dd>{meta.api_version}</dd>
-            <dt>Protocol version</dt>
-            <dd>{meta.protocol_version}</dd>
-            <dt>Adapters</dt>
-            <dd>{meta.adapters.length > 0 ? meta.adapters.join(", ") : "none registered"}</dd>
-            <dt>Server time</dt>
-            <dd>
-              <code>{meta.server_time}</code>
-            </dd>
-          </dl>
-        ) : (
-          <div className="stack">
-            <span className="pill pill--bad">unreachable</span>
-            <p className="muted">{error}</p>
-            <p className="muted">
-              Start the API with <code>npm run api:dev</code> from the repository root.
-            </p>
-          </div>
-        )}
+        <h2 className="card__title">Connect Supabase Auth</h2>
+        <ol className="steps">
+          <li>
+            Create a project at <code>supabase.com</code>, or point at a self-hosted one.
+          </li>
+          <li>
+            Put its URL and <em>anon</em> key in <code>.env</code> at the repository root,
+            as <code>NEXT_PUBLIC_SUPABASE_URL</code> and{" "}
+            <code>NEXT_PUBLIC_SUPABASE_ANON_KEY</code>.
+          </li>
+          <li>
+            Give the API the same project: <code>SUPABASE_URL</code> and{" "}
+            <code>SUPABASE_JWKS_URL</code> (
+            <code>&lt;url&gt;/auth/v1/.well-known/jwks.json</code>).
+          </li>
+          <li>Restart both.</li>
+        </ol>
+        <p className="muted">
+          The anon key is meant to be public and ships to the browser. The service-role
+          key is not, and AgentWorld never needs it.
+        </p>
       </div>
+    </section>
+  );
+}
+
+function ApiDown({
+  message,
+  requestId,
+}: {
+  readonly message: string;
+  readonly requestId?: string | undefined;
+}) {
+  return (
+    <section className="stack stack--narrow">
+      <div>
+        <h1 className="title">The API is not answering</h1>
+        <p className="muted">
+          The web app is fine; it cannot reach the backend. These are separate services
+          on purpose, so this is a normal thing to see while one of them restarts.
+        </p>
+      </div>
+
+      <div className="card">
+        <h2 className="card__title">What happened</h2>
+        <p className="muted">{message}</p>
+        {requestId !== undefined && (
+          <p className="muted">
+            Request id <code>{requestId}</code> - quote it when reporting this.
+          </p>
+        )}
+        <p className="muted">
+          Start it with <code>npm run api:dev</code>, and check{" "}
+          <code>npm run infra:up</code> has Postgres running.
+        </p>
+      </div>
+
+      <p className="muted">
+        <Link href="/">Try again</Link>
+      </p>
     </section>
   );
 }

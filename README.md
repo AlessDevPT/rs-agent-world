@@ -12,9 +12,9 @@ backend event; nothing is simulated.
 
 ## Status
 
-**Phase 1 complete (backend)** — multi-tenant, authenticated, and isolated at two
-independent layers. Phase 2 (the agent protocol and event ingest) is next: the core of
-the product, and the first phase where an agent appears.
+**Phase 1 complete** — multi-tenant, authenticated, and isolated at two independent
+layers, with a web app you can sign into. Phase 2 (the agent protocol and event ingest)
+is next: the core of the product, and the first phase where an agent appears.
 
 | Phase | State |
 |-------|-------|
@@ -30,8 +30,12 @@ can present a key to `GET /v1/self/key` and be told what they are allowed to do.
 error is an RFC 9457 problem document carrying a request id, and every mutation writes an
 audit row in the same transaction as the change.
 
-No agents, no events, no island yet — and no web UI for any of the above, which is the
-remaining half of Phase 1.
+The web app covers the same ground: sign in through Supabase, create your first
+workspace, switch between workspaces, add projects, and mint a key whose plaintext is
+shown once and then gone. It renders a setup page rather than crashing when no Supabase
+project is configured, which is what a fresh checkout looks like.
+
+No agents, no events and no island yet — those are Phases 2 and 6.
 
 ## Quick start
 
@@ -48,6 +52,11 @@ Then in two terminals:
 ```bash
 npm run api:dev         # http://localhost:8000  (/docs for the OpenAPI UI)
 ```
+
+To sign in you need a Supabase project: put its URL and anon key in `.env` as
+`NEXT_PUBLIC_SUPABASE_URL` / `NEXT_PUBLIC_SUPABASE_ANON_KEY`, and give the API the same
+project as `SUPABASE_URL` / `SUPABASE_JWKS_URL`. Without one, the app says so and tells
+you what to set rather than failing.
 
 ```bash
 npm run dev             # http://localhost:3000
@@ -81,7 +90,7 @@ The plan the code is written against.
 | Backend | Python 3.12 + FastAPI |
 | Database | PostgreSQL 16 (partitioned event log, RLS) |
 | Realtime | WebSockets, Redis pub/sub fan-out |
-| Auth | Supabase Auth for users; Argon2id-hashed API keys for agents |
+| Auth | Supabase Auth for users (JWKS-verified, locally); Argon2id-hashed API keys for agents |
 | Integrations | Modular adapter plugins discovered via entry points |
 
 ## The idea in one diagram
@@ -122,6 +131,7 @@ These are mechanically enforced, not left to discipline:
 | The audit log cannot be rewritten | `SELECT, INSERT` grants and nothing more | `UPDATE` and `DELETE` are refused by the database |
 | Exactly one owner per workspace | partial unique index | a second owner insert is refused |
 | A key secret is unrecoverable | Argon2id with a pepper, never stored in clear | every text column searched for the plaintext |
+| A sign-in link cannot bounce off-site | one validated `?next=` helper | ten open-redirect payloads refused |
 | Each role can do exactly what the spec says | one `authorize()` call, one table | every endpoint × every role, over HTTP |
 | Models, migrations and enums agree | Alembic `compare_metadata` + a `pg_enum` comparison | runs against a freshly migrated database |
 

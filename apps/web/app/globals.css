@@ -167,3 +167,221 @@ code {
     margin-bottom: 0.5rem;
   }
 }
+
+/* --------------------------------------------------- Phase 1: auth and forms --- */
+
+.stack--narrow {
+  max-width: 34rem;
+}
+
+.card--highlight {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1px var(--accent) inset;
+}
+
+.form {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+}
+
+.form__row {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+
+.form__label {
+  font-size: 0.85rem;
+  font-weight: 600;
+}
+
+.form__input {
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 0.55rem 0.7rem;
+  font: inherit;
+  width: 100%;
+}
+
+.form__input:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.form__hint,
+.form__error {
+  font-size: 0.85rem;
+  margin: 0;
+}
+
+.form__hint {
+  color: var(--muted);
+}
+
+.form__error {
+  color: var(--bad);
+}
+
+.form__actions {
+  display: flex;
+  gap: 0.6rem;
+  flex-wrap: wrap;
+  align-items: center;
+}
+
+.button {
+  font: inherit;
+  border-radius: var(--radius);
+  padding: 0.5rem 0.9rem;
+  border: 1px solid var(--border);
+  background: var(--panel);
+  color: var(--text);
+  cursor: pointer;
+}
+
+.button:disabled {
+  opacity: 0.6;
+  cursor: progress;
+}
+
+.button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.button--primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #0b0d11;
+  font-weight: 600;
+}
+
+.button--quiet {
+  background: transparent;
+  color: var(--muted);
+}
+
+.button--danger {
+  border-color: var(--bad);
+  color: var(--bad);
+  background: transparent;
+}
+
+.steps {
+  color: var(--muted);
+  padding-left: 1.2rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+}
+
+/* ------------------------------------------------------------- workspace bar --- */
+
+.workspace-bar {
+  display: flex;
+  align-items: center;
+  gap: 1.2rem;
+  flex-wrap: wrap;
+  padding-bottom: 1rem;
+  border-bottom: 1px solid var(--border);
+}
+
+.workspace-bar__nav {
+  display: flex;
+  gap: 1rem;
+}
+
+.workspace-bar__link {
+  color: var(--muted);
+  text-decoration: none;
+  font-size: 0.9rem;
+}
+
+.workspace-bar__link:hover,
+.workspace-bar__link:focus-visible {
+  color: var(--text);
+}
+
+.workspace-bar__user {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  font-size: 0.9rem;
+}
+
+.switcher {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.switcher__label {
+  font-size: 0.8rem;
+  color: var(--muted);
+}
+
+.switcher__select {
+  background: var(--panel);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 0.35rem 0.5rem;
+  font: inherit;
+  font-size: 0.9rem;
+}
+
+.pill--role {
+  background: color-mix(in srgb, var(--accent) 18%, transparent);
+  color: var(--accent);
+  text-transform: lowercase;
+}
+
+/* -------------------------------------------------------------------- lists --- */
+
+.list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+}
+
+.list__item {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 0.85rem 1rem;
+  display: flex;
+  gap: 1rem;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+}
+
+.list__title {
+  font-weight: 600;
+}
+
+.list__item p {
+  margin: 0.2rem 0 0;
+  font-size: 0.85rem;
+}
+
+/* The one-time key display. Wrapped rather than scrolled: a key that runs off
+   the edge invites a partial copy, and a partial key fails in a way nobody
+   connects back to this screen. */
+.secret {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 0.75rem;
+  margin: 0.75rem 0;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+  user-select: all;
+}

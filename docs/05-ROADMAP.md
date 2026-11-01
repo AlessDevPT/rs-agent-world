@@ -65,6 +65,12 @@ CI fails if `domain/` imports SQLAlchemy.
 - Web: Supabase login/callback, workspace switcher, project list, create-project form,
   API-key page with the show-once secret dialog.
 
+  The password form talks to Supabase directly from the browser, so AgentWorld never
+  receives one. Everything else reads the session on the server, which is why the session
+  lives in a cookie rather than in memory: a server component can then call `GET /v1/me`
+  during render and the access token never reaches page JavaScript at all. Middleware
+  refreshes the cookie, because a server component can read one but not write one.
+
 **Tests**
 
 - Role matrix: every endpoint × every role, asserting allow/deny.
