@@ -69,4 +69,48 @@ class KeyPrincipal:
         )
 
 
-Principal = UserPrincipal | KeyPrincipal
+@dataclass(frozen=True, slots=True)
+class SystemPrincipal:
+    """AgentWorld running work nobody is currently asking for.
+
+    A scheduled trigger fires at 07:00 and an execution starts. Whose
+    authority is it running on? The tempting answer - whoever last enabled
+    the trigger - is wrong, and wrong in a way that gets worse with time: that
+    person may have left, had their role reduced, or never intended their
+    account to be the standing authority for work they configured once. Worse,
+    it makes *enabling a trigger* a way to launder a permission, since the
+    work would then run as whoever touched the switch last.
+
+    So the authority comes from the **published workflow version** instead.
+    That version is immutable, was published by someone who held
+    `workflow.publish` at the time, and names exactly the steps, tools and
+    connections the run may use. Nothing about this principal is read from a
+    mutable row.
+
+    What follows is the point of the class: it can perform **no** control-plane
+    action. `authorize()` refuses every member of `Action` for it, and a test
+    asserts that exhaustively. A scheduled run may do what its frozen version
+    says and may not create an agent, mint a key, or widen a grant - however
+    the workflow is written and whoever wrote it.
+
+    `label` is a human-readable description of the cause, copied at execution
+    time, so the audit trail still reads "nightly competitor brief" after the
+    trigger that caused it has been deleted.
+    """
+
+    workspace_id: UUID
+    project_id: UUID
+    #: The frozen definition this run's authority comes from.
+    workflow_version_id: UUID
+    #: What caused it, in words, copied rather than referenced.
+    label: str
+    #: The trigger that fired, for the audit trail only. Never consulted for
+    #: authority, and nullable because the trigger may since have been
+    #: deleted while the execution record must survive it.
+    trigger_id: UUID | None = None
+
+
+#: Every kind of caller. `authorize()` narrows on this union and refuses
+#: two of the three outright, so adding a fourth is a change you cannot make
+#: without the type checker pointing at every place that has to decide.
+Principal = UserPrincipal | KeyPrincipal | SystemPrincipal

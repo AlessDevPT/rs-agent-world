@@ -18,14 +18,19 @@ from agentworld.domain.errors import NotFoundError, PermissionDeniedError
 from agentworld.domain.policy import (
     MINIMUM_ROLE,
     SELF_SERVICE_ACTIONS,
+    SENSITIVE_ACTIONS,
     Action,
+    Condition,
     Resource,
+    approval_floor,
     assert_user,
     authorize,
     authorize_key_scope,
     can,
+    required_role,
 )
-from agentworld.domain.principals import KeyPrincipal, UserPrincipal
+from agentworld.domain.principals import KeyPrincipal, SystemPrincipal, UserPrincipal
+from agentworld.services.context import actor_of
 
 WORKSPACE = uuid.uuid4()
 OTHER_WORKSPACE = uuid.uuid4()
@@ -215,3 +220,153 @@ def test_roles_rank_from_viewer_to_owner() -> None:
 def test_every_role_is_ranked() -> None:
     for role in MemberRole:
         assert isinstance(role.rank, int)
+
+
+# ------------------------------------------------- the system principal ---
+
+
+def system() -> SystemPrincipal:
+    return SystemPrincipal(
+        workspace_id=WORKSPACE,
+        project_id=uuid.uuid4(),
+        workflow_version_id=uuid.uuid4(),
+        label="nightly competitor brief",
+        trigger_id=uuid.uuid4(),
+    )
+
+
+@pytest.mark.parametrize("action", list(Action))
+def test_the_system_principal_may_perform_no_control_action(action: Action) -> None:
+    """Exhaustive over every action, for the same reason the key test is.
+
+    A scheduled run acts on the authority of a frozen workflow version, which
+    is not a role and never becomes one. There is no member of this enum a
+    trigger firing at 07:00 may perform - including the read actions, because
+    reading on nobody's behalf has no meaning in a table whose rows are all
+    "a human changes the ecosystem".
+    """
+    with pytest.raises(PermissionDeniedError):
+        authorize(system(), action, Resource(WORKSPACE))
+
+
+def test_the_refusal_names_the_version_rather_than_a_person() -> None:
+    """Which is the whole argument for the type.
+
+    If the error named whoever enabled the trigger, that person would be
+    accountable for work they did not do - and enabling a trigger would have
+    become a way to lend out a permission.
+    """
+    with pytest.raises(PermissionDeniedError) as caught:
+        authorize(system(), Action.AGENT_CREATE, Resource(WORKSPACE))
+    assert "workflow_version_id" in caught.value.context
+    assert "user_id" not in caught.value.context
+
+
+def test_a_system_run_is_not_a_member_of_anything() -> None:
+    """It carries a workspace, so the temptation is to treat it as a member."""
+    assert not can(system(), Action.WORKFLOW_READ, Resource(WORKSPACE))
+
+
+def test_the_system_actor_has_no_id_to_record() -> None:
+    """There is no user to name, and naming one would be a lie."""
+    assert actor_of(system()) == ("system", None)
+
+
+# ------------------------------------------------ conditional elevation ---
+
+
+def test_a_connection_is_a_member_action_until_it_grants_a_real_tool() -> None:
+    """Granting a capability is at least as privileged as using it."""
+    plain = Resource(WORKSPACE)
+    consequential = Resource(WORKSPACE, conditions=frozenset({Condition.GRANTS_CONSEQUENTIAL_TOOL}))
+
+    assert can(user_with(MemberRole.MEMBER), Action.CONNECTION_CREATE, plain)
+    assert not can(user_with(MemberRole.MEMBER), Action.CONNECTION_CREATE, consequential)
+    assert can(user_with(MemberRole.ADMIN), Action.CONNECTION_CREATE, consequential)
+
+
+def test_an_irrelevant_condition_changes_nothing() -> None:
+    """Elevation is keyed on the pair, so a flag cannot raise the bar for an
+    action nobody wrote a rule for."""
+    flagged = Resource(WORKSPACE, conditions=frozenset({Condition.GRANTS_CONSEQUENTIAL_TOOL}))
+    assert required_role(Action.WORLD_UPDATE, flagged.conditions) is MemberRole.MEMBER
+
+
+@pytest.mark.parametrize("action", list(Action))
+def test_no_condition_ever_lowers_the_required_role(action: Action) -> None:
+    """An elevation that weakened a rule would be a privilege escalation
+    dressed as a refinement."""
+    everything = frozenset(Condition)
+    assert required_role(action, everything).at_least(MINIMUM_ROLE[action])
+
+
+# -------------------------------------------------------- approval floor ---
+
+
+def test_a_policy_may_raise_the_approver_bar() -> None:
+    """A workflow that sends money can require an admin to approve it."""
+    assert approval_floor(Action.WORKFLOW_RUN, MemberRole.ADMIN) is MemberRole.ADMIN
+
+
+def test_a_policy_may_not_lower_it_past_the_underlying_action() -> None:
+    """Otherwise approval would launder a permission nobody holds: a viewer
+    could wave through work they could not perform themselves."""
+    assert approval_floor(Action.WORKFLOW_RUN, MemberRole.VIEWER) is MemberRole.MEMBER
+    assert approval_floor(Action.CREDENTIAL_ROTATE, MemberRole.MEMBER) is MemberRole.ADMIN
+
+
+@pytest.mark.parametrize("action", list(Action))
+@pytest.mark.parametrize("policy_role", list(MemberRole))
+def test_an_approval_floor_is_never_below_the_action_itself(
+    action: Action, policy_role: MemberRole
+) -> None:
+    """Exhaustive, because this is the rule a configuration mistake would
+    otherwise quietly defeat."""
+    assert approval_floor(action, policy_role).at_least(MINIMUM_ROLE[action])
+
+
+# ----------------------------------------------------------- the counts ---
+
+
+def test_the_matrix_is_the_size_the_proposal_says_it_is() -> None:
+    """77 actions, 62 of them new in Phase 2.
+
+    A count is a weak test of anything except itself - but this one is quoted
+    in `05-PERMISSIONS.md` and in the decision record, and a silent drift
+    between the document a reviewer reads and the table the code enforces is
+    exactly what an access-control model cannot afford.
+    """
+    phase_one = {
+        action
+        for action in Action
+        if action.value.split(".", 1)[0] in {"workspace", "member", "project", "api_key"}
+    }
+    assert len(phase_one) == 15
+    assert len(Action) == 77
+    assert len(Action) - len(phase_one) == 62
+
+
+def test_every_sensitive_action_exists_and_is_not_merely_a_read() -> None:
+    """The column drives the audit digest and the builder's consent prompts,
+    so a typo here is a prompt that never appears."""
+    assert set(Action) >= SENSITIVE_ACTIONS
+    harmless = {Action.WORKSPACE_READ, Action.AGENT_READ, Action.WORLD_READ}
+    assert SENSITIVE_ACTIONS.isdisjoint(harmless)
+
+
+def test_the_dangerous_actions_are_all_marked_sensitive() -> None:
+    """Spot-checked against the categories the proposal names: secrets,
+    permissions, spend, and anything externally visible."""
+    for action in Action:
+        if action.value.startswith(("credential.", "integration.")):
+            if action is Action.INTEGRATION_READ:
+                continue  # that a Slack connection exists is not a secret
+            assert action in SENSITIVE_ACTIONS, action
+
+
+def test_no_action_can_read_a_secret() -> None:
+    """`credential.read_secret` does not exist at any role, which is what
+    makes "no role can read credential material" true rather than policy."""
+    assert not any("read_secret" in action.value for action in Action)
+    assert not any(action.value == "agent.set_status" for action in Action)
+    assert not any(action.value == "execution.edit" for action in Action)

@@ -11,7 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from uuid import UUID
 
-from agentworld.domain.principals import Principal, UserPrincipal
+from agentworld.domain.principals import Principal, SystemPrincipal, UserPrincipal
 
 
 @dataclass(frozen=True, slots=True)
@@ -35,11 +35,16 @@ def actor_of(principal: Principal) -> tuple[str, UUID | None]:
     question is which credential did this, and revoking that one key is the
     answer.
 
-    `Principal` is exactly these two types, so there is no fallback branch.
-    The third actor kind the column allows, `system`, is written by the
-    workers in later phases, which act with no principal at all rather than
-    with a placeholder one.
+    A `SystemPrincipal` has no actor id, and that is not a gap. There is no
+    user to name - the whole point of the type is that a scheduled run
+    borrows nobody's authority - and writing the id of whoever enabled the
+    trigger would put a person's name against work they did not do. What
+    identifies the run instead is the execution's own immutable initiator:
+    `initiator_kind = 'system'` and `initiator_label`, which survive the
+    trigger being deleted.
     """
     if isinstance(principal, UserPrincipal):
         return "user", principal.user_id
+    if isinstance(principal, SystemPrincipal):
+        return "system", None
     return "api_key", principal.api_key_id
