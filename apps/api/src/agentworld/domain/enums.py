@@ -54,6 +54,10 @@ class AgentStatus(StrEnum):
     BLOCKED = "blocked"  # waiting on input or a dependency
     ERROR = "error"  # last run failed, not recovered
     MAINTENANCE = "maintenance"  # operator-silenced
+    # Appended in Phase 2 (migration 0006), and appended rather than inserted
+    # because ALTER TYPE ... ADD VALUE puts it last and the drift test
+    # asserts declared order, not just membership.
+    PAUSED = "paused"  # a managed agent an operator really stopped
 
 
 class TaskStatus(StrEnum):
@@ -109,10 +113,192 @@ class DeliveryStatus(StrEnum):
     DEAD = "dead"
 
 
+# --------------------------------------------------------------- ecosystem ---
+# Phase 2. Every one of these has a native PostgreSQL type created by
+# migration 0006 and is checked against the database by the drift test.
+
+
+class AgentInteractionMode(StrEnum):
+    """What AgentWorld may do with an agent, and what it must not claim to.
+
+    The distinction `docs/proposals/.../01-DOMAIN-AND-PROTOCOL.md` section 2
+    calls honesty: an `observed` agent reports and cannot be given work, and
+    attempting to assign it a step is a 422 naming the mode rather than a
+    line drawn on a diagram and hoped over.
+    """
+
+    MANAGED = "managed"  # AgentWorld runs the loop and may really pause it
+    DISPATCHABLE = "dispatchable"  # the customer runs it; we can hand it work
+    OBSERVED = "observed"  # it only reports; no step may be assigned
+
+
+class StepKind(StrEnum):
+    AGENT_TASK = "agent_task"  # hand work to an agent
+    TOOL_CALL = "tool_call"  # call one tool, no agent
+    APPROVAL = "approval"  # stop and wait for a human
+    CONDITION = "condition"  # branch on prior outputs
+    TRANSFORM = "transform"  # reshape data between steps
+    WAIT = "wait"  # for a duration or a signal
+
+
+class ExecutionStatus(StrEnum):
+    PENDING = "pending"
+    RUNNING = "running"
+    WAITING_APPROVAL = "waiting_approval"
+    WAITING_INPUT = "waiting_input"
+    PAUSED = "paused"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+    @property
+    def is_live(self) -> bool:
+        """Whether the execution may still progress.
+
+        Used by the no-stuck-executions invariant: a live execution with no
+        live dispatch, no pending approval and no terminal step is a bug.
+        """
+        return self in _LIVE_EXECUTION_STATUSES
+
+
+_LIVE_EXECUTION_STATUSES: frozenset[ExecutionStatus] = frozenset(
+    {
+        ExecutionStatus.PENDING,
+        ExecutionStatus.RUNNING,
+        ExecutionStatus.WAITING_APPROVAL,
+        ExecutionStatus.WAITING_INPUT,
+        ExecutionStatus.PAUSED,
+    }
+)
+
+
+class StepStatus(StrEnum):
+    PENDING = "pending"
+    READY = "ready"
+    DISPATCHED = "dispatched"
+    RUNNING = "running"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+    SKIPPED = "skipped"
+    CANCELLED = "cancelled"
+
+    @property
+    def is_terminal(self) -> bool:
+        return self in _TERMINAL_STEP_STATUSES
+
+
+_TERMINAL_STEP_STATUSES: frozenset[StepStatus] = frozenset(
+    {
+        StepStatus.SUCCEEDED,
+        StepStatus.FAILED,
+        StepStatus.SKIPPED,
+        StepStatus.CANCELLED,
+    }
+)
+
+
+class InitiatorKind(StrEnum):
+    """Who started an execution.
+
+    Two values and no NULL. A system-initiated execution borrows no user's
+    authority: what it may do comes from the published workflow version, not
+    from whoever configured or enabled its trigger. An execution with no
+    recorded initiator is an audit hole, which is why the column is NOT NULL
+    and the id columns are constrained by XOR.
+    """
+
+    USER = "user"
+    SYSTEM = "system"
+
+
+class ApprovalDecision(StrEnum):
+    PENDING = "pending"
+    GRANTED = "granted"
+    DENIED = "denied"
+    EXPIRED = "expired"
+
+
+class ConnectionKind(StrEnum):
+    """A standing grant or route between components.
+
+    Not a workflow edge. An edge is control flow inside one workflow version;
+    a connection is a capability that outlives any single workflow. The island
+    draws both as paths, which is where the two get conflated.
+    """
+
+    GRANT_TOOL = "grant_tool"  # agent -> tool: may call it
+    GRANT_KNOWLEDGE = "grant_knowledge"  # agent -> source: may search it
+    DELEGATE = "delegate"  # agent -> agent: may hand work over
+    TRIGGER = "trigger"  # workflow -> workflow: completion starts it
+    PUBLISH = "publish"  # component -> integration: may send through
+
+
+class ToolSource(StrEnum):
+    BUILTIN = "builtin"
+    MCP = "mcp"
+    INTEGRATION = "integration"
+
+
+class SideEffect(StrEnum):
+    """How much a capability can be regretted.
+
+    `consequential` is the class that defaults to requiring approval, and it
+    is deliberately narrower than "writes something": it means an effect that
+    reaches outside AgentWorld and cannot be taken back.
+    """
+
+    READ = "read"
+    WRITE = "write"
+    CONSEQUENTIAL = "consequential"
+
+
+class TriggerKind(StrEnum):
+    MANUAL = "manual"
+    SCHEDULE = "schedule"
+    WEBHOOK = "webhook"
+    INTEGRATION_EVENT = "integration_event"
+    WORKFLOW_COMPLETED = "workflow_completed"
+
+
+class CredentialKind(StrEnum):
+    API_KEY = "api_key"
+    OAUTH2 = "oauth2"
+    BASIC = "basic"
+    CUSTOM = "custom"
+
+
+class DispatchKind(StrEnum):
+    MANAGED_AGENT_TURN = "managed_agent_turn"
+    TOOL_CALL = "tool_call"
+    AGENT_PUSH = "agent_push"
+    AGENT_TASK_OFFER = "agent_task_offer"
+    WEBHOOK_EMIT = "webhook_emit"
+
+
+class DispatchStatus(StrEnum):
+    """The outbox state machine.
+
+    `needs_review` is the one worth reading twice: a lease that expired while
+    a consequential side effect was in flight means nobody knows whether it
+    landed. Retrying might send the email twice and failing might not send it
+    at all, so it is escalated to a person rather than guessed at. Nothing
+    retries it automatically - no worker, no timer.
+    """
+
+    PENDING = "pending"
+    LEASED = "leased"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+    DEAD = "dead"
+    NEEDS_REVIEW = "needs_review"
+    CANCELLED = "cancelled"
+
+
 #: Every enum that has a native PostgreSQL type, keyed by that type's name.
 #: The migration and the drift test both read this, so adding an enum in one
 #: place adds it in both.
 PG_ENUMS: dict[str, type[StrEnum]] = {
+    # Phase 1
     "member_role": MemberRole,
     "agent_status": AgentStatus,
     "task_status": TaskStatus,
@@ -121,4 +307,18 @@ PG_ENUMS: dict[str, type[StrEnum]] = {
     "event_severity": EventSeverity,
     "api_key_scope": ApiKeyScope,
     "delivery_status": DeliveryStatus,
+    # Phase 2
+    "agent_interaction_mode": AgentInteractionMode,
+    "step_kind": StepKind,
+    "execution_status": ExecutionStatus,
+    "step_status": StepStatus,
+    "initiator_kind": InitiatorKind,
+    "approval_decision": ApprovalDecision,
+    "connection_kind": ConnectionKind,
+    "tool_source": ToolSource,
+    "side_effect": SideEffect,
+    "trigger_kind": TriggerKind,
+    "credential_kind": CredentialKind,
+    "dispatch_kind": DispatchKind,
+    "dispatch_status": DispatchStatus,
 }
