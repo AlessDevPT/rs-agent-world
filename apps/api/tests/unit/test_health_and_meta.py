@@ -40,9 +40,7 @@ def test_readyz_reports_a_healthy_dependency(app: FastAPI, client: TestClient) -
     assert r.json() == {"status": "ready", "checks": {"postgres": "ok"}}
 
 
-def test_readyz_is_degraded_when_a_dependency_is_down(
-    app: FastAPI, client: TestClient
-) -> None:
+def test_readyz_is_degraded_when_a_dependency_is_down(app: FastAPI, client: TestClient) -> None:
     """503, and it says which dependency.
 
     A readiness probe that only says "not ready" sends whoever is paged to
