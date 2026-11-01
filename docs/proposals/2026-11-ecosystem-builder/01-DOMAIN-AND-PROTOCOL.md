@@ -39,6 +39,52 @@ putting it in the replayable log destroys replay equivalence.
 
 ## 2. Agents
 
+### Four independent axes, and the mistake of collapsing them
+
+"Provider-independent" is four separate statements, and conflating any two of them is how
+a platform quietly becomes a single-framework product:
+
+| Axis | The question | Implementations | Where it lives |
+|------|--------------|-----------------|----------------|
+| **Model provider** | Who serves the LLM? | Anthropic, OpenAI-compatible, (later) Gemini, Bedrock, local | `infra/providers/` |
+| **Agent runtime** | Who executes the agent's loop? | AgentWorld's `step_runner` (`managed`); the customer's own process (`dispatchable`); nobody (`observed`) | `workers/`, or outside AgentWorld entirely |
+| **Tool provider** | Who implements a capability? | builtin, MCP server, integration-provided | `infra/tools/` |
+| **Communication protocol** | How do AgentWorld and an agent exchange work? | native REST ingest, HTTP push, claim-poll, or an adapter translating a third-party shape | `api/v1/ingest`, `api/v1/self`, `adapters/` |
+
+**The axes are orthogonal, and the architecture must not assume otherwise.** The specific
+assumption to avoid: *that an agent's execution framework and its model provider are the
+same choice.*
+
+Three combinations that must all work, and do:
+
+- A **managed** agent on **Anthropic** calling an **MCP** tool hosted by a third party.
+- A **dispatchable** agent the customer runs on **LangGraph** over **Gemini**, reached by
+  **claim-poll**. AgentWorld dispatches work to it and folds its reports, and **never
+  learns which model it used** unless the agent chooses to report it descriptively in
+  `runtime`. No provider plugin is involved; no Gemini support is required.
+- An **observed** agent on a framework nobody here has heard of, reporting through the
+  **generic-webhook** adapter, which never executes anything.
+
+The consequence in the schema: `model_profile_id` is meaningful **only** for a `managed`
+agent, because it is the only mode where AgentWorld calls a model at all. For the other two
+it must be absent, or it would imply a choice AgentWorld does not make and cannot enforce.
+A check constraint says so rather than a comment:
+
+```sql
+CONSTRAINT model_profile_only_when_managed
+  CHECK (interaction_mode = 'managed' OR model_profile_id IS NULL)
+```
+
+A dispatchable agent that wants to record "I run on Gemini" puts it in `runtime`, which is
+descriptive JSON the core never branches on — the Phase 0 rule, unchanged.
+
+The payoff for the roadmap: supporting externally hosted agents **does not require
+supporting their model providers**. `04-ROADMAP-AND-MVP.md` §7 lists two providers in v1
+and all three agent modes, and those numbers are independent precisely because of this
+separation.
+
+### The table
+
 One table, two halves, and the split is enforced by which layer may write each column.
 
 ```sql
@@ -56,6 +102,8 @@ CREATE TABLE agents (
   role           text,              -- "Competitor researcher". One line, shown everywhere.
   description    text,
   instructions   text,              -- the system prompt for a managed agent
+  -- Only for `managed`: see the check constraint below. The other modes
+  -- choose their own model, and AgentWorld does not need to know which.
   model_profile_id uuid REFERENCES model_profiles(id) ON DELETE RESTRICT,
   model_overrides jsonb NOT NULL DEFAULT '{}'::jsonb,
   kind           text,
@@ -81,7 +129,9 @@ CREATE TABLE agents (
   created_by_user_id uuid REFERENCES users(id) ON DELETE SET NULL,
   registered_at  timestamptz NOT NULL DEFAULT now(),
   archived_at    timestamptz,
-  UNIQUE (project_id, agent_key)
+  UNIQUE (project_id, agent_key),
+  CONSTRAINT model_profile_only_when_managed
+    CHECK (interaction_mode = 'managed' OR model_profile_id IS NULL)
 );
 ```
 
@@ -364,12 +414,70 @@ CREATE TABLE knowledge_documents (
 );
 ```
 
-Chunks and embeddings are deliberately **not** in v1's schema. Retrieval in v1 is a
-`knowledge_search` builtin tool over PostgreSQL full-text search, which needs no vector
-extension, no embedding provider and no re-index pipeline, and is adequate for the
-document volumes a first user has. `pgvector` and a chunk table are a Phase-9 change
-behind the same tool interface — the agent calls `knowledge_search`, and what is behind
-it is not part of the contract.
+### Retrieval is an interface, not an implementation
+
+Chunks and embeddings are deliberately **not** in v1's schema. v1 retrieves with
+PostgreSQL full-text search: no vector extension, no embedding provider, no re-index
+pipeline, and adequate for the document volumes a first user has.
+
+That choice must not reach the agent or workflow contract, so retrieval goes behind an
+interface from the start:
+
+```python
+# domain/knowledge/retrieval.py — pure types, no I/O, no provider.
+@dataclass(frozen=True, slots=True)
+class RetrievalQuery:
+    text: str
+    source_ids: Sequence[UUID]          # which granted sources to search
+    top_k: int = 8
+    filters: Mapping[str, str] = field(default_factory=dict)   # on document metadata
+
+@dataclass(frozen=True, slots=True)
+class Passage:
+    document_id: UUID
+    source_id: UUID
+    title: str
+    text: str
+    score: float                        # 0..1, comparable within one result set only
+    locator: str | None                 # page, heading, offset - for citation
+    metadata: Mapping[str, str]
+
+@dataclass(frozen=True, slots=True)
+class RetrievalResult:
+    passages: Sequence[Passage]
+    truncated: bool
+    backend: str                        # for diagnostics, never for branching
+
+class KnowledgeRetriever(Protocol):
+    async def search(self, query: RetrievalQuery) -> RetrievalResult: ...
+    async def index(self, document_id: UUID) -> None: ...
+    async def forget(self, document_id: UUID) -> None: ...
+```
+
+| Implementation | v1 | What changes |
+|---------------|-----|--------------|
+| `PostgresFullTextRetriever` | **yes** | `tsvector` over `knowledge_documents.content` |
+| `PgVectorRetriever` | v1.1 | adds a chunk table, an embedding provider and a re-index job |
+| `HybridRetriever` | v1.2 | full-text and vector, reciprocally rank-fused |
+| `ExternalRetriever` | on demand | a vendor retrieval API behind the same Protocol |
+
+Four properties make the swap genuinely contract-free:
+
+- **The agent's surface is the `knowledge_search` tool**, whose input and output JSON
+  Schemas are defined by `RetrievalQuery` and `RetrievalResult` above. An agent prompt, a
+  workflow `input_mapping` and a step output written against v1 keep working verbatim.
+- **`score` is explicitly comparable only within one result set.** A BM25 score and a
+  cosine similarity are not the same number, so nothing — no step condition, no UI
+  threshold — may compare one across backends. Stated here because a `score > 0.8`
+  condition in somebody's workflow is exactly what would break on the swap.
+- **`index` and `forget` are part of the interface**, so the re-index pipeline a vector
+  backend needs has a place to live without the ingest path changing.
+- **`backend` is for diagnostics.** A test asserts no module outside `infra/knowledge/`
+  reads it, so it cannot become a branch.
+
+`domain/knowledge/retrieval.py` holds only the types and the Protocol — no SQL, no
+embedding call — which keeps it inside the existing contract that `domain/` imports no
+framework and no provider.
 
 ## 6. Credentials — the separate mechanism
 
@@ -643,13 +751,29 @@ CREATE TABLE approvals (
   title         text NOT NULL,         -- "Send this email to 412 recipients?"
   summary       text,
   payload       jsonb NOT NULL DEFAULT '{}'::jsonb,  -- redacted; what is being approved
+
+  -- The resolved requirement, frozen when the approval is created. Resolved
+  -- from the policy below; stored rather than recomputed so that editing the
+  -- policy cannot change what a pending approval demands.
   required_role member_role NOT NULL DEFAULT 'member',
+  requires_different_user boolean NOT NULL DEFAULT false,
+
+  -- Who this approval is "on behalf of", for the different-user rule. Not
+  -- simply the person who pressed Run: see "closing the scheduling loophole".
+  attributed_to_user_id uuid REFERENCES users(id) ON DELETE SET NULL,
+
   requested_at  timestamptz NOT NULL DEFAULT now(),
   expires_at    timestamptz,
   decided_at    timestamptz,
   decided_by_user_id uuid REFERENCES users(id) ON DELETE SET NULL,
   decision_reason text,
-  UNIQUE (execution_step_id)
+  UNIQUE (execution_step_id),
+  CONSTRAINT different_user_respected CHECK (
+    decided_by_user_id IS NULL
+    OR NOT requires_different_user
+    OR attributed_to_user_id IS NULL
+    OR decided_by_user_id <> attributed_to_user_id
+  )
 );
 CREATE INDEX approvals_pending_idx ON approvals (project_id, requested_at)
   WHERE decision = 'pending';
@@ -659,6 +783,140 @@ An approval is a row that must exist and be `granted` before a dispatch exists. 
 no code path from `waiting_approval` to a dispatched step that does not pass through it.
 That is what makes it a gate rather than a notification, and it is structural rather than
 remembered.
+
+The `different_user_respected` check is the same guarantee one layer down. The service
+enforces the rule; the constraint means a bug in the service, or a direct `UPDATE`, cannot
+record a self-approval that the policy forbade. Belt and braces, as with
+`workspace_single_owner`.
+
+### Approval policies
+
+Self-approval is not an unrestricted default. It is a configurable policy with defaults
+chosen so that **low-risk work flows freely and consequential work needs someone else**.
+
+```sql
+CREATE TABLE approval_policies (
+  project_id    uuid PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
+
+  -- The default for an approval whose step declares no requirement.
+  default_required_role member_role NOT NULL DEFAULT 'member',
+  default_requires_different_user boolean NOT NULL DEFAULT false,
+
+  -- The one knob that does most of the work: anything classified
+  -- `consequential` needs a second person, out of the box.
+  consequential_required_role member_role NOT NULL DEFAULT 'member',
+  consequential_requires_different_user boolean NOT NULL DEFAULT true,
+
+  -- A floor for the whole project. A step may tighten past it, never under.
+  min_required_role member_role NOT NULL DEFAULT 'member',
+
+  updated_by_user_id uuid REFERENCES users(id) ON DELETE SET NULL,
+  updated_at    timestamptz NOT NULL DEFAULT now()
+);
+```
+
+A project with no row uses the column defaults, so the policy is opt-in to *edit* and
+always in effect. The defaults are exactly the brief's two rules:
+
+| Work | Default requirement |
+|------|--------------------|
+| `read` or `write` side effects | `member`, self-approval allowed |
+| `consequential` side effects | `member`, **and not the person it is attributed to** |
+
+### Resolution, and the direction policies may move
+
+```python
+# domain/approvals/policy.py — pure, no I/O.
+def resolve_requirement(
+    policy: ApprovalPolicy,
+    step: WorkflowStep,
+    tool: Tool | None,
+    connection: Connection | None,
+) -> ApprovalRequirement:
+    """The requirement for one step. Deterministic, and total."""
+```
+
+Four inputs, resolved by **taking the strictest of all of them**:
+
+1. the project policy's class-appropriate pair,
+2. the project policy's `min_required_role` floor,
+3. the step's own `config.approval`, if it declares one,
+4. the tool's `requires_approval_default` and the connection's `requires_approval`.
+
+**A step can only tighten.** A step declaring `requires_different_user: false` against a
+policy that says `true` resolves to `true`, and `workflow.validate` reports it as a
+`warning` rather than silently honouring the policy — so the author learns their setting
+had no effect instead of believing it did.
+
+**No policy can weaken a security control.** Two hard floors sit under everything, and
+neither is in the table because neither is configurable:
+
+- **The approver's role may never be below the role required to perform the underlying
+  action.** Approving a step that grants or uses a `consequential` tool requires at least
+  the role that could have granted it (`admin`, per `05-PERMISSIONS.md` §4). An `admin`
+  cannot write a policy letting a `viewer` approve an email send.
+- **A policy cannot grant a permission.** Resolution produces a *requirement*, never a
+  capability. `authorize(principal, Action.APPROVAL_DECIDE, …)` runs first and
+  independently; a policy that named `viewer` would still be refused by the permission
+  matrix. The policy can only ask for more.
+
+### Closing the scheduling loophole
+
+`requires_different_user` compares `decided_by_user_id` against
+`attributed_to_user_id`, and the naive choice — whoever pressed Run — has a hole: a user
+who cannot self-approve schedules the workflow instead, and the scheduled run has no
+requester to differ from.
+
+So attribution is resolved per trigger kind:
+
+| Execution started by | `attributed_to_user_id` |
+|---------------------|------------------------|
+| `POST /workflows/{id}/run` | the caller |
+| `manual` trigger | the caller |
+| `schedule` trigger | the user who last performed `trigger.enable` — an `admin` action |
+| `webhook` trigger | the user who last performed `trigger.enable` |
+| `integration_event` | the user who last performed `trigger.enable` |
+| `workflow_completed` | inherited from the originating execution |
+
+The person who turned autonomy on is the person the run is attributed to. Scheduling is
+therefore not a route around a gate.
+
+### When a requirement cannot be satisfied
+
+`requires_different_user` in a workspace with one member means nothing can ever be
+approved — a deadlock built by configuration. It is caught where every other unrunnable
+configuration is caught: `workflow.validate` emits
+
+```jsonc
+{ "severity": "error", "code": "approval_unsatisfiable",
+  "pointer": "/steps/post",
+  "detail": "This step needs approval from somebody other than whoever runs it, and this workspace has only one member who can approve.",
+  "remedy": "Invite another member, or allow self-approval for this step in Settings → Approvals." }
+```
+
+so a workflow that could never complete cannot be published. The same check runs when the
+policy is edited, and refuses an edit that would strand published workflows.
+
+### Enforcement is in the backend
+
+Three independent layers, because the brief asks for backend enforcement and one layer is
+a claim rather than an enforcement:
+
+1. **`services/approvals.py`** checks the role and the different-user rule before writing a
+   decision, and is the only writer of `approvals.decision`.
+2. **The check constraint** above refuses a contradictory row even from raw SQL.
+3. **The gate itself** is the absence of a `dispatches` row. A frontend that hid the button,
+   or showed one it should not, changes nothing: no dispatch exists until the service writes
+   the decision, and nothing else can write one (`05-PERMISSIONS.md` §3 — there is no
+   `dispatch.create` action).
+
+### What is deliberately not built
+
+Not an enterprise four-eyes system. No approval groups, no quorum ("any two of these
+five"), no escalation chains, no delegation or out-of-office, no approval-of-the-approval,
+no per-user approval limits. Each is in `04-ROADMAP-AND-MVP.md` §9 as a v1.1 item, and each
+fits behind `resolve_requirement` returning a richer `ApprovalRequirement` without the gate
+mechanism changing.
 
 `dispatches` — the outbox — is specified in `02-ORCHESTRATION.md` §3, since it is part of
 the orchestration mechanism rather than of the domain.

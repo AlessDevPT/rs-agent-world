@@ -354,25 +354,41 @@ path rather than by a disclaimer.
 
 ```
 step kind = approval, or a tool/connection requiring it
-   -> advance returns RequestApproval
-   -> one transaction: approvals row (pending) + approval.requested event
+   -> advance returns RequestApproval, carrying the requirement resolved by
+      domain/approvals/policy.py from the project policy, the step config,
+      the tool and the connection -- strictest of the four
+   -> one transaction: approvals row (pending, with required_role,
+                       requires_different_user and attributed_to_user_id
+                       FROZEN at this moment)
+                     + approval.requested event
                      + execution.status = 'waiting_approval'
    -> NO dispatch row exists. There is nothing to execute and no worker will find one.
 
-human decides (control plane, role-gated, audited)
+human decides (control plane, role-gated, different-user-gated, audited)
    -> granted: approval.granted event + advance() again -> now a dispatch appears
    -> denied:  approval.denied  event + step failed, on_failure policy applies
    -> expired: a worker writes approval.expired; same as denied
 ```
 
 The gate is the *absence of a dispatch*, not a flag a worker is trusted to check. A bug in
-the approval UI cannot cause an unapproved send, because the thing that sends has no row
-to act on.
+the approval UI cannot cause an unapproved send, because the thing that sends has no row to
+act on — and there is no `dispatch.create` action for anything else to use.
 
-`required_role` on the approval means a viewer can be shown a pending approval and not be
-able to decide it. Decisions are `audit_log` rows as well as events, because "who approved
-the 412-recipient email" is an accountability question and `events` is partitioned with a
-90-day retention.
+**The requirement is frozen when the approval is created**, not recomputed when it is
+decided. Editing the project policy therefore cannot change what a pending approval
+demands, in either direction: a tightened policy does not strand an approval mid-flight,
+and a loosened one cannot be used to wave through something already waiting.
+
+**Self-approval is policy, not an accident.** `requires_different_user` comes from
+`approval_policies`, which defaults to `false` for `read`/`write` work and `true` for
+anything `consequential`. The full resolution rules, the two hard floors no policy can go
+under, and how scheduling is prevented from becoming a route around the gate are in
+`01-DOMAIN-AND-PROTOCOL.md` §7. Three layers enforce it: the service, a check constraint
+on `approvals`, and the absence of a dispatch.
+
+`required_role` means a viewer can be shown a pending approval and be unable to decide it.
+Decisions are `audit_log` rows as well as events, because "who approved the 412-recipient
+email" is an accountability question and `events` is partitioned with a 90-day retention.
 
 ## 8. Reliability: failure, retry, dead letters, recovery
 

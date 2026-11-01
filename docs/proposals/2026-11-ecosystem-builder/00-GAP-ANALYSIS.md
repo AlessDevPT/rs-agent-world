@@ -6,8 +6,9 @@
 > then.
 
 Deliverables 1–3 of the revision brief: what exists, what survives, what has to change.
-The decision list in §4 now runs to C14; C12–C14 came from the refinement brief and are
-marked.
+The decision list in §4 runs to C18; C12–C14 came from the first refinement and C15–C18
+from the second, each marked. `07-DECISION-RECORD.md` records where every decision
+*stands* — implemented, approved, deferred or open — and this document explains why.
 
 ## 1. What the repository actually contains
 
@@ -267,10 +268,11 @@ VALUE` handles it and the drift test will demand the migration.
 
 **Now:** absent. `task_dependencies` is the nearest thing and expresses only "after".
 
-**Change:** 15 genuinely new tables — `model_profiles`, `workflows`,
+**Change:** 16 genuinely new tables — `model_profiles`, `workflows`,
 `workflow_versions`, `workflow_steps`, `workflow_edges`, `connections`, `tools`,
 `credentials`, `knowledge_sources`, `knowledge_documents`, `triggers`,
-`workflow_executions`, `execution_steps`, `approvals`, `dispatches` — plus new
+`workflow_executions`, `execution_steps`, `approvals`, `approval_policies`,
+`dispatches` — plus new
 columns on `agents` and `integrations`. The nine tables the previous design already
 specified (`agents`, `tasks`, `runs`, `run_steps`, `events`, `logs`,
 `metric_samples`, `integrations`, `world_*`) are built as designed, with the
@@ -399,7 +401,7 @@ include the Phase 4 builder tests passing unmodified.
 
 **Now:** this document's first draft said "approximately 45 new authorization rules".
 
-**Change:** a worked matrix of 57 new actions (72 total) with scope, required role and a
+**Change:** a worked matrix of 62 new actions (77 total) with scope, required role and a
 sensitivity flag per action — plus, more usefully, the nine actions that deliberately **do
 not exist**, the three whose required role is conditional, and the five that are `admin`
 rather than `member` with the reason for each. In `05-PERMISSIONS.md`.
@@ -414,6 +416,79 @@ and the URL is checked against a deny-list at request time rather than only at s
 **Cost to built code:** additive rows in the existing `MINIMUM_ROLE` table. The two Phase 1
 tests that keep it honest — `test_every_action_has_a_minimum_role` and
 `test_the_matrix_covers_every_mutating_route` — generalise without modification.
+
+### C15 — Provider independence is four axes, not one  *(refinement 2, item 3)*
+
+**Now:** one `infra/providers/` directory and an implicit assumption that an agent's
+framework and its model provider are one choice.
+
+**Change:** four orthogonal axes, stated and enforced — **model provider** (who serves the
+LLM), **agent runtime** (who executes the loop), **tool provider** (who implements a
+capability), **communication protocol** (how work is exchanged).
+
+**Why:** the assumption is load-bearing in the wrong direction. A customer running LangGraph
+over Gemini must be dispatchable and monitorable **without AgentWorld supporting Gemini at
+all** — AgentWorld never calls their model. Collapsing the axes would make "support
+externally hosted agents" require "support every provider", which is the difference between
+a shipping v1 and an endless one. The schema says so too: `model_profile_id` is valid only
+for a `managed` agent, by check constraint.
+
+**Cost to built code:** none. It renames nothing and adds one constraint.
+
+### C16 — Approval policies, with self-approval as a decision  *(refinement 2, item 1)*
+
+**Now:** `approvals.required_role` only. Revision 2 noted, as an open question, that v1
+permitted self-approval.
+
+**Change:** an `approval_policies` row per project, resolved by a pure
+`resolve_requirement` taking the strictest of project policy, step config, tool default and
+connection. Defaults: `read`/`write` work may be self-approved; **`consequential` work needs
+a different person**. Two hard floors are not configurable at all — an approver's role may
+never fall below the role required to perform the underlying action, and a policy produces a
+requirement rather than a capability.
+
+**Why:** an unrestricted self-approval default makes the gate theatre for a single-member
+workspace, which is most of them at first. The design also closes a loophole the obvious
+implementation leaves: attribution follows whoever last *enabled the trigger*, so scheduling
+a workflow is not a way around a gate you could not pass by hand.
+
+**Cost to built code:** none. One new table, one new permission pair, and
+`member_role` reused rather than a new role invented.
+
+### C17 — Outbound HTTP is resolve-validate-pin, not a deny-list  *(refinement 2, item 2)*
+
+**Now:** revision 2 said `dispatch.url` was checked against a deny-list of private ranges.
+
+**Change:** a single guarded client that resolves the host, validates **every** resolved
+address, and connects to a validated address with the original `Host` and SNI — so there is
+no second resolution to poison. No redirects by default. Normalised errors. Network-level
+egress policy at the execution environment as the boundary that holds if the application
+layer has a bug. In `06-OUTBOUND-SECURITY.md`.
+
+**Why:** a deny-list checks a *name* and then connects to an *address*, which DNS rebinding
+defeats in one second of TTL. It also misses IPv4-mapped IPv6 (`::ffff:169.254.169.254` is
+the metadata endpoint), NAT64, redirects, and non-`http` schemes. Each is a known technique,
+not a hypothetical.
+
+**Cost to built code:** none, and it adds a sixth import-linter contract confining
+`httpx.AsyncClient` to `infra/net/` — with `infra/auth/supabase.py` named as the one
+exemption, since its URL is operator configuration and it runs before any tenant context
+exists.
+
+### C18 — Knowledge retrieval is an interface  *(refinement 2, item 4)*
+
+**Now:** "full-text in v1, pgvector later behind the same tool".
+
+**Change:** a `KnowledgeRetriever` Protocol with explicit `RetrievalQuery`, `Passage` and
+`RetrievalResult` types, and `index` / `forget` alongside `search` so a vector backend's
+re-index pipeline has somewhere to live.
+
+**Why:** "behind the same tool" was a sentence, not a contract. The specific thing it was
+missing: `score` means different things in BM25 and cosine similarity, so the interface now
+states that scores are comparable only within one result set — which forbids the
+`score > 0.8` workflow condition that would otherwise break on the swap.
+
+**Cost to built code:** none.
 
 ## 5. Two decisions this revision deliberately does *not* make
 

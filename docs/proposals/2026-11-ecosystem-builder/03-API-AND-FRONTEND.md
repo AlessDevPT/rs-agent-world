@@ -33,7 +33,7 @@ src/agentworld/
 │   │                                field), KnowledgeSource, Trigger, Execution,
 │   │                                ExecutionStep, Approval
 │   ├── enums.py                   + 8 new enums
-│   ├── policy.py                  + 57 new actions, same table (05-PERMISSIONS)
+│   ├── policy.py                  + 62 new actions, same table (05-PERMISSIONS)
 │   ├── protocol/
 │   │   ├── envelope.py            NEW  subject + correlation
 │   │   ├── types.py               NEW  the registry and payload models
@@ -361,6 +361,48 @@ Every animation above is keyed to a row in `events`. The projector takes `recent
 and emits `AnimationIntent`s; it has no timer and invents nothing. A Playwright test
 ingests one `workflow.step_dispatched` and asserts the scene receives a `walk_to` for that
 entity — the same test the previous roadmap specified, against the new event.
+
+### Legibility: the island must answer six questions without a click
+
+The island's purpose is to show the state and structure of a whole ecosystem **at a
+glance**. An island that requires opening every building to find out what is happening is a
+worse agents list, and the failure is gradual enough to go unnoticed — which is why it gets
+explicit criteria rather than a judgement call.
+
+Six things must be readable from a static view, with no selection and no hover:
+
+| Question | How it is answered visually | Encoded by |
+|----------|----------------------------|-----------|
+| **What is each agent's status?** | building tint and a corner badge glyph | colour **and** shape, never colour alone |
+| **How far has each workflow got?** | the factory's banner shows `3/5`, and completed steps are lit along the line | position and a number |
+| **Which connections are active right now?** | the route animates in Live Mode; idle routes are static and dimmer | motion |
+| **Which integrations are disconnected?** | the portal is dark with a broken-link glyph; its routes are drawn dashed | shape and line style |
+| **What is waiting for me?** | the town hall carries a count badge, and a persistent banner names the oldest item | number and text |
+| **What needs attention?** | an amber or red marker above the object, **and** the same items listed in a side rail that does not require the island at all | redundant channels |
+
+Three rules that keep it legible rather than decorative:
+
+- **Never colour alone.** Every state uses a glyph or a shape as well, so the island works
+  for a colour-blind user and in a screenshot pasted into a chat.
+- **Attention is never only on the island.** The side rail reads the same `attention` field
+  from `GET /v1/projects/{id}/overview` that the nav badge does, so a user who never opens
+  the island misses nothing. One source, three presentations.
+- **Counts are exact, not indicative.** `3/5` comes from `execution_steps`. A progress bar
+  interpolated by a timer would be inventing activity, which the whole design forbids.
+
+Clicking any building or character opens a **contextual panel**: what this object is, its
+current state, its recent history, and its configuration in Simple mode with a link to
+Advanced. It is the same component the object's own page uses, so there is one form to keep
+correct. Clicking a route opens the connection it represents; clicking the town hall opens
+the approval queue.
+
+**The acceptance test is a legibility protocol, not an opinion.** Five people who have not
+seen the project are shown one static screenshot of an island in a contrived state — two
+agents working, one errored, one offline, a workflow half done, a disconnected Slack portal,
+one pending approval — and asked the six questions above. The criterion is **at least four
+of five correct on every question**, with no explanation given beforehand. It is run again
+at the end of Phase 9 with real art. Cheap, repeatable, and it fails loudly when the island
+has drifted into decoration.
 
 ### The layout is its own persisted model
 

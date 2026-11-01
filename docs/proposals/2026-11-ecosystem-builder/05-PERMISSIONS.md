@@ -3,17 +3,17 @@
 > Proposal, 2026-11-01. Deliverable 5 of the refinement brief.
 
 The earlier proposal said "approximately 45 new authorization rules". Worked through
-properly it comes to **57 new actions, 72 in total**. The number went up because least
+properly it comes to **62 new actions, 77 in total** — counted from the tables in §2, not estimated. The number went up because least
 privilege means splitting actions, not merging them — and the useful parts of this
 document are not the count but the four tables after the matrix: which actions
 deliberately **do not exist**, which ones **change role depending on what is being
-granted**, which are **admin rather than member and why**, and what keeps 72 rules
+granted**, which are **admin rather than member and why**, and what keeps 77 rules
 honest as they grow.
 
 ## 1. Principles
 
 1. **One function, one table.** `authorize(principal, action, resource)` keeps its Phase 1
-   shape. 72 rows in one dict is reviewable in a sitting; 72 checks scattered across
+   shape. 77 rows in one dict is reviewable in a sitting; 77 checks scattered across
    routes is not.
 2. **Least privilege, by splitting.** Where one action would bundle a harmless capability
    with a dangerous one, it becomes two. `integration.read` is a `member`;
@@ -103,16 +103,29 @@ sensitive — tool grants and approval gates still apply inside a test run.
 | execution | `execution.retry_step` | project | member | yes |
 | execution | `execution.provide_input` | project | member | |
 | approval | `approval.read` | project | viewer | |
-| approval | `approval.decide` | project | **per-approval `required_role`**, default member | **yes** |
+| approval | `approval.decide` | project | **per-approval `required_role`**, default member, **and not the attributed user when the approval says so** | **yes** |
+| approval_policy | `approval_policy.read` | project | viewer | |
+| approval_policy | `approval_policy.update` | project | **admin** | **yes** |
 
 `workflow.publish` and `workflow.run` are `member` because a workflow is only as dangerous
 as the grants its steps already have, and those grants were authorized separately. Running
 it autonomously on a schedule is a different matter — see `trigger.enable`.
 
 `approval.decide` is the only action whose required role is **data, not code**: it comes
-from `approvals.required_role`, set per step when the workflow is authored. A workflow that
+from `approvals.required_role`, frozen when the approval was created by resolving the
+project's `approval_policies` row against the step, tool and connection. A workflow that
 sends money can require `admin` approval while one that posts to Slack requires `member`,
-without inventing a role.
+without inventing a role. The approval may additionally require that the decider is not the
+user the execution is attributed to — see `01-DOMAIN-AND-PROTOCOL.md` §7.
+
+`approval_policy.update` is `admin`. AgentWorld has no per-project owner role, so `admin` is
+the nearest thing to the brief's "project owners"; per-project roles are a deferred feature
+(`04-ROADMAP-AND-MVP.md` §9). An `admin` can loosen the policy for low-risk work, which is
+audited and within what an admin can already do — but **cannot loosen it past the two hard
+floors**, because those are not in the table: an approver's role may never fall below the
+role required to perform the underlying action, and a policy produces a *requirement*, never
+a capability. `authorize(principal, APPROVAL_DECIDE, …)` runs first and independently, so a
+policy naming `viewer` would still be refused by this matrix.
 
 ### Connections, tools and providers
 
@@ -197,6 +210,7 @@ More useful than the matrix, because an absent action cannot be granted by mista
 | `audit_log.delete`, `audit_log.update` | Same, and already enforced in Phase 1 | Nothing |
 | `step.force_succeed` | Marking a step done that never ran would let a workflow report a result it never produced | Retry it, or fail it and branch |
 | `approval.decide_on_behalf_of` | An approval is accountability. Delegation needs a model of who may act for whom | A second approver — deferred to v1.1 |
+| `approval_policy.override_floor` | The two hard floors in `01` §7 are not configurable at all. A policy that could reach under them would make every other row here advisory | Nothing. Change the underlying permission instead |
 | `world.update_execution_state` | The presentation tables have no execution columns to update | Nothing |
 | `dispatch.create` | Only `advance()` creates dispatches, inside its transaction. A human-creatable dispatch would bypass every gate | `execution.retry_step` |
 
@@ -254,7 +268,7 @@ secret, but because together they map which external systems hold which credenti
 which scopes. That is the reconnaissance step before an attack, and a `viewer` has no need
 of it.
 
-## 6. What keeps 72 rules honest
+## 6. What keeps 77 rules honest
 
 Phase 1 already built the two mechanisms, and they generalise without change:
 
@@ -264,7 +278,7 @@ so an action added to the enum and forgotten in the table raises `KeyError` at r
 
 **`test_the_matrix_covers_every_mutating_route`** — walks the live FastAPI route table and
 fails if any route has no row in the HTTP role matrix, with a small explicit exemption list.
-A new endpoint merged without a permission decision does not pass CI. This is why 57 new
+A new endpoint merged without a permission decision does not pass CI. This is why 62 new
 actions is maintainable: forgetting one is a build failure rather than a review miss.
 
 Both extend to the new mechanisms:
@@ -305,5 +319,13 @@ nothing.
   one later is a deliberate, visible change.
 - `builder.apply` with a plan exceeding the caller's permissions fails at plan time, names
   the action that exceeded them, and creates nothing.
-- An `agent.configure` setting `dispatch.url` to a loopback, link-local or private address
-  is refused at save time and at request time.
+- An `agent.configure` setting `dispatch.url` to a blocked destination is refused at save
+  time **and** at request time, for every range in `06-OUTBOUND-SECURITY.md` §3.
+- A `member` cannot decide an approval whose `required_role` is `admin`, and **cannot decide
+  one attributed to themselves when `requires_different_user` is set** — refused by the
+  service and, independently, by the check constraint on `approvals`.
+- An `admin` editing `approval_policies` cannot produce a requirement below either hard
+  floor, and an edit that would strand a published workflow is refused with the
+  `approval_unsatisfiable` finding.
+- A workflow whose approval requirement cannot be satisfied by anyone in the workspace
+  cannot be published.

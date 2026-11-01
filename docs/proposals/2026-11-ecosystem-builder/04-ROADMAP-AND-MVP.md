@@ -136,9 +136,16 @@ The first phase where something runs, and the first where something is visible.
 **Build — Track A**
 - `infra/secrets/`: `SecretStore`, envelope encryption, AAD binding, KEK map and rotation;
   `Settings` fails fast without `CREDENTIAL_KEKS` outside local and test.
-- `infra/providers/`: `base.py` Protocol, `anthropic.py`, registry. **The
-  OpenAI-compatible implementation is the last task of this phase**, written specifically
-  to prove the Protocol is not shaped around one vendor while the first one is still fresh.
+- `infra/net/guarded.py` — the single guarded HTTP client: resolve, validate every
+  resolved address, pin the connection to it, no redirects. The full blocked set for both
+  IP families, metadata names, scheme and port allow-lists, and normalised errors
+  (`06-OUTBOUND-SECURITY.md`). It lands here because this is the first phase that makes any
+  outbound call at all, and retrofitting it after four callers exist means auditing four.
+- `infra/providers/`: `base.py` Protocol, `anthropic.py`, registry, over the guarded
+  client. **The OpenAI-compatible implementation is the last task of this phase**, written
+  specifically to prove the Protocol is not shaped around one vendor while the first one is
+  still fresh — and to confirm the four axes in `01-DOMAIN-AND-PROTOCOL.md` §2 are really
+  separate.
 - `domain/orchestration/advance.py` + `decisions.py` — the pure decision function.
 - `services/executions.py` — apply decisions in one transaction: event + state + outbox.
 - `workers/step_runner.py`, `workers/dispatch_reaper.py`.
@@ -171,6 +178,17 @@ The first phase where something runs, and the first where something is visible.
 - [ ] An agent going `offline` stays visible and renders shuttered.
 - [ ] Deleting `world/phaser/` leaves the backend suite and the non-world web suite green.
 - [ ] Planting `import anthropic` in `services/` fails the new import contract.
+- [ ] Planting `httpx.AsyncClient(...)` outside `infra/net/` fails its contract.
+- [ ] Every range in `06-OUTBOUND-SECURITY.md` §3 is refused, parametrised one case per
+      row, for both IP families — including `::ffff:169.254.169.254` and the NAT64 form.
+- [ ] A resolver returning a public address then `10.0.0.5` still connects to the first:
+      the address is pinned, not re-resolved.
+- [ ] `Host` and TLS SNI carry the original hostname when connecting by IP, against a real
+      TLS test server.
+- [ ] A blocked destination, a non-existent host and a refused connection are
+      indistinguishable in step output, event payload and problem document.
+- [ ] A `dispatchable` or `observed` agent cannot be saved with a `model_profile_id` —
+      the check constraint, not a service check.
 
 ---
 
@@ -228,6 +246,15 @@ and complete end to end.
       and what to do instead — it does not attempt it.
 - [ ] A `member` whose plan would require an admin action is told at plan time, naming the
       action.
+- [ ] **The legibility protocol passes:** five people who have not seen the project are
+      shown one static screenshot of a contrived island state and asked the six questions in
+      `03-API-AND-FRONTEND.md` §5. At least four of five correct on every question, with no
+      explanation beforehand.
+- [ ] No state is conveyed by colour alone: every status has a glyph or shape too.
+- [ ] Clicking any building opens the same contextual panel its own page uses — asserted by
+      there being one component.
+- [ ] The `attention` side rail and the nav badge read the same `overview` field, so a user
+      who never opens the island misses nothing.
 - [ ] The whole demo is reproducible from a script in `docs/demo/`.
 
 ---
@@ -265,8 +292,16 @@ and complete end to end.
 ### Phase 6 — Approvals, tools, integrations  *(Track A, 3 w)* → **M2**
 
 **Build**
-- `approvals` table and the gate: `RequestApproval`, the decide endpoint, `approval.*`
-  events, the expiry worker, `required_role` per approval.
+- `approvals` and `approval_policies`, and the gate: `RequestApproval`, the decide
+  endpoint, `approval.*` events, the expiry worker.
+- `domain/approvals/policy.py` — the pure `resolve_requirement`, taking the strictest of
+  project policy, step config, tool default and connection, with the two hard floors no
+  policy can reach under. Requirements frozen on the approval at creation.
+- Attribution per trigger kind, so scheduling is not a route around a gate.
+- The `approval_unsatisfiable` validation finding, and a policy edit that would strand a
+  published workflow refused.
+- `domain/knowledge/retrieval.py` — the `KnowledgeRetriever` Protocol and its types;
+  `PostgresFullTextRetriever` as the only v1 implementation.
 - `infra/tools/`: `base.py`, `executor.py`, builtins (`http_request`, `web_search`,
   `knowledge_search`), `mcp_client.py`.
 - MCP tool discovery and refresh; `tools` rows with `source='mcp'`.
@@ -297,6 +332,24 @@ only after a human grants it.
 - [ ] OAuth refresh happens on an expired token without re-prompting.
 - [ ] An MCP server disappearing degrades to a clear tool error, not a hung step.
 - [ ] A `member` cannot grant an agent a `consequential` tool.
+- [ ] **Self-approval is allowed for `read`/`write` work and refused for `consequential`
+      work**, out of the box, with no policy row present.
+- [ ] A step declaring `requires_different_user: false` against a policy requiring `true`
+      resolves to `true`, and `validate` warns that the setting had no effect.
+- [ ] A self-approval that the policy forbids is refused by the service **and**,
+      independently, by the check constraint on `approvals`.
+- [ ] A scheduled execution is attributed to whoever last enabled the trigger, so that user
+      cannot approve its consequential steps.
+- [ ] A policy cannot produce a requirement below either hard floor, and cannot grant a
+      permission: a policy naming `viewer` is still refused by `authorize`.
+- [ ] A workflow whose approval nobody in the workspace could satisfy cannot be published,
+      and reports `approval_unsatisfiable`.
+- [ ] Editing a policy does not change what a pending approval demands, in either
+      direction.
+- [ ] `knowledge_search` input and output match the `RetrievalQuery` / `RetrievalResult`
+      schemas, and no module outside `infra/knowledge/` reads `RetrievalResult.backend`.
+- [ ] The `http_request` tool refuses every destination in `06-OUTBOUND-SECURITY.md` §3,
+      and a `302` to a blocked destination is not followed.
 
 ---
 
@@ -323,8 +376,11 @@ only after a human grants it.
 - [ ] A webhook token is rate-limited and can start only its own workflow.
 - [ ] A bash-and-curl agent completes a step in CI — "no SDK required" is true.
 - [ ] SDK and raw HTTP produce identical event streams for the same lifecycle.
-- [ ] `agent.configure` pointing `dispatch.url` at a loopback, link-local or private
-      address is refused at save time **and** at request time.
+- [ ] `agent.configure` pointing `dispatch.url` at any blocked destination is refused at
+      save time **and** at request time, by the same function — asserted by there being one.
+- [ ] `agent_push` and `webhook_emit` do not follow a `302` at all.
+- [ ] A dispatchable agent on a model provider AgentWorld does not support completes a
+      step — the four axes, demonstrated rather than asserted.
 - [ ] A dispatchable agent that never reports is resolved by the step timeout.
 
 ---
@@ -375,6 +431,8 @@ Extends I2; replaces nothing.
 - [ ] Every animation on screen traces to a row in `events` — audited by a test that
       asserts the projector has no timer and no random source.
 - [ ] A stranger watching the island can describe what the agents are doing.
+- [ ] The Phase 4 legibility protocol is re-run with real art and still passes, including
+      the two states added since: disconnected integrations and pending approvals.
 
 ---
 
@@ -583,7 +641,16 @@ Consolidated from `01-DOMAIN-AND-PROTOCOL.md` §6 and §10, `02-ORCHESTRATION.md
 | Revocation and deletion behaviour | 6 | 01 §6 |
 | No secret-shaped property in the OpenAPI document | 6 | 01 §6 |
 | Consequential grants require admin | 6 | 05 §4 |
-| SSRF deny-list on `dispatch.url`, enforced at request time | 7 | 05 §5 |
+| Resolve-validate-pin outbound client; no redirects by default | 3 | 06 §2 |
+| Full blocked set, both IP families, IPv4-mapped and NAT64 | 3 | 06 §3 |
+| Normalised outbound errors, so blocked and absent are indistinguishable | 3 | 06 §5 |
+| `httpx.AsyncClient` confined to `infra/net/` | 3 | 06 §2 |
+| Approval policies: consequential work needs a second person by default | 6 | 01 §7 |
+| Approval requirements frozen at creation, enforced in three layers | 6 | 01 §7, 02 §7 |
+| Attribution closes the scheduling loophole | 6 | 01 §7 |
+| No policy can reach under the two hard floors, or grant a permission | 6 | 01 §7, 05 §4 |
+| Request-time validation of `dispatch.url` | 7 | 06 §7 |
+| Network-level egress policy at the execution environment | 11 | 06 §5 |
 | Webhook token rate limits | 7 | 03 §1 |
 | Builder bounded by the caller's permissions, at plan time | 4 | 05 §4 |
 | Builder inputs are data, not instructions | 10 | 04 §P10 |
@@ -597,7 +664,9 @@ Consolidated from `01-DOMAIN-AND-PROTOCOL.md` §6 and §10, `02-ORCHESTRATION.md
 |----------|-----|---------|
 | Loops and map-over-collection | Turns an orchestrator into a workflow language: iteration state, fan-out limits, partial-failure semantics | v1.1 |
 | Sub-workflows | Nested cancellation and approval inheritance | v1.1 |
-| Four-eyes and multi-approver approvals | A single approver covers the demo and most real cases. Note that v1 **permits self-approval**: the author of a workflow can approve its steps | v1.1 |
+| Approval groups, quorum, escalation, delegation, approval-of-approval | v1 has configurable policies with a different-user requirement, which covers the real cases without a four-eyes engine (`01` §7) | v1.1 |
+| Per-project roles — a real "project owner" | Roles are workspace-level today; `approval_policy.update` is `admin` as the nearest equivalent | v1.1 |
+| Per-grant destination allow-lists, and taint tracking from retrieved content to tool arguments | The mitigation for risk R1 in `07-DECISION-RECORD.md` §5 | v1.1 |
 | Per-service integration adapters (Gmail, Drive, Notion, GitHub) | Each is OAuth scopes, API quirks and app review; MCP covers most demand for one implementation | v1.1, demand-ordered |
 | pgvector knowledge retrieval | Full-text is adequate at first-user volumes, and swapping it is behind the `knowledge_search` tool | v1.1 |
 | Cost and token analytics | The data is already in `metric_samples`; this is a UI | v1.1 |
@@ -624,9 +693,14 @@ transactional". That was correct, and it is now the product.
 | **The product concept does not land** | M1 at week eight, with the domain model written and almost nothing on top of it. This is the risk the revision exists to address |
 | The early prototypes become throwaway work | Both are built on the final architecture: the island on the real projector/interpreter/dispatch split, the builder on the final plan schema with a capability enum. Phase 10's acceptance criteria include the Phase 4 builder tests passing unmodified |
 | Parallel tracks fragment attention | Phases 3 and 4 are the only ones with more than one track, and each has a single milestone to converge on |
-| Prompt injection reaching a tool call | Grants checked at call time, `consequential` tools gated by approval, model output never an authorization input, a dedicated Phase 11 review |
+| Prompt injection reaching a tool call | Grants checked at call time, `consequential` tools gated by approval, model output never an authorization input, a dedicated Phase 11 review. **Partially unresolved — see risk R1 in `07-DECISION-RECORD.md` §5, the highest-severity open risk in the proposal** |
 | The builder creates something harmful or expensive | Propose/apply, `requires_consent`, object caps, nothing published or enabled on apply, bounded by the caller's role at plan time |
 | Beginners still find it too complex | Simple mode with a vocabulary lint, safe-by-default approvals, and Phase 8 before Phase 9 so the plain UI is tested first |
 | The island becomes the source of truth | `interpret()` is pure and cannot fetch; `world/dispatch/` is the only layer that may call an API; the isolation test keeps the product working without Phaser; the layout tables hold no execution state |
 | Secrets leak | Entities with no field for them, AAD tenant binding, declared `secret_fields`, four redaction channels, and the canary test |
 | Scope expands until nothing ships | §7's right-hand column, and one reliable instance per category |
+
+Six risks the design bounds rather than solves — prompt injection to an allowed
+destination, at-least-once against non-deduping receivers, the single-writer orchestrator,
+expression-language creep, the island drifting from the workspace, and the builder's growing
+blast radius — are set out with severities in `07-DECISION-RECORD.md` §5.
