@@ -20,7 +20,12 @@ from datetime import datetime
 from typing import Any
 from uuid import UUID
 
-from agentworld.domain.enums import ApiKeyScope, MemberRole
+from agentworld.domain.enums import (
+    AgentInteractionMode,
+    AgentStatus,
+    ApiKeyScope,
+    MemberRole,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -118,3 +123,76 @@ class ApiKey:
         exists for listings, not for authentication decisions.
         """
         return self.revoked_at is None
+
+
+@dataclass(frozen=True, slots=True)
+class ModelProfile:
+    """A named model configuration: provider, model, parameters, credential.
+
+    Workspace-scoped rather than project-scoped, because one API key and one
+    choice of model is normally a company decision rather than a per-project
+    one. No field holds credential material - `credential_id` names a row in
+    `credentials`, whose secret nothing in this layer can read.
+    """
+
+    id: UUID
+    workspace_id: UUID
+    name: str
+    provider_slug: str
+    model_id: str
+    parameters: Mapping[str, Any] = field(default_factory=dict)
+    credential_id: UUID | None = None
+    is_default: bool = False
+    created_at: datetime | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class Agent:
+    """A participant in an ecosystem.
+
+    The fields divide into three groups, and the division is the permission
+    model rather than tidiness. **Definition** - name, role, description,
+    instructions, labels - is what a builder edits and a `member` may change.
+    **Configuration** - the model profile, its overrides, and dispatch - is
+    the narrow part that spends money and reaches outside, and takes
+    `agent.configure`, which is `admin`. **Derived** - status, heartbeat,
+    current task - is folded from events and no API writes it at all; there
+    is deliberately no `agent.set_status` action, because a human asserting
+    "this agent is working" would be asserting something only the agent can
+    know.
+    """
+
+    id: UUID
+    workspace_id: UUID
+    project_id: UUID
+    agent_key: str
+    interaction_mode: AgentInteractionMode
+    display_name: str
+
+    # ---- definition ----
+    role: str | None = None
+    description: str | None = None
+    instructions: str | None = None
+    kind: str | None = None
+    labels: Mapping[str, Any] = field(default_factory=dict)
+
+    # ---- configuration ----
+    model_profile_id: UUID | None = None
+    model_overrides: Mapping[str, Any] = field(default_factory=dict)
+    dispatch: Mapping[str, Any] = field(default_factory=dict)
+    heartbeat_ttl_seconds: int = 60
+
+    # ---- derived: read-only here, written only by folding events ----
+    status: AgentStatus = AgentStatus.PROVISIONING
+    status_reason: str | None = None
+    capabilities: Sequence[str] = field(default_factory=tuple)
+    runtime: Mapping[str, Any] = field(default_factory=dict)
+    current_task_id: UUID | None = None
+    last_heartbeat_at: datetime | None = None
+    last_event_at: datetime | None = None
+    registered_at: datetime | None = None
+    archived_at: datetime | None = None
+
+    @property
+    def is_archived(self) -> bool:
+        return self.archived_at is not None

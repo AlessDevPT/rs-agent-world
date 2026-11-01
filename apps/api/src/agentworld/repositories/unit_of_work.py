@@ -28,6 +28,10 @@ from agentworld.infra.db import Database
 from agentworld.repositories.api_keys import ApiKeyRepository, ApiKeyUnscopedRepository
 from agentworld.repositories.audit import AuditLogRepository
 from agentworld.repositories.base import TenantScope
+from agentworld.repositories.definitions import (
+    AgentRepository,
+    ModelProfileRepository,
+)
 from agentworld.repositories.derived import DerivedStateRepository
 from agentworld.repositories.events import EventRepository, TelemetryRepository
 from agentworld.repositories.projects import ProjectLookupRepository, ProjectRepository
@@ -97,6 +101,13 @@ class UnitOfWork:
 
     def audit(self, scope: TenantScope) -> AuditLogRepository:
         return AuditLogRepository(self._session, scope)
+
+    def agents(self, scope: TenantScope) -> AgentRepository:
+        """Definition, not derived state - see `repositories.definitions`."""
+        return AgentRepository(self._session, scope)
+
+    def model_profiles(self, scope: TenantScope) -> ModelProfileRepository:
+        return ModelProfileRepository(self._session, scope)
 
     def events(self, scope: TenantScope) -> EventRepository:
         """Appending events. Needs `scope.project_id`, and says so."""
