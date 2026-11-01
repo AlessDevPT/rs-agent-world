@@ -173,10 +173,27 @@ _LIVE_EXECUTION_STATUSES: frozenset[ExecutionStatus] = frozenset(
 
 
 class StepStatus(StrEnum):
+    """Where one step of an execution has got to.
+
+    `WAITING_APPROVAL` was added in migration 0014, while writing the
+    reducers, because without it a step held by a human gate is
+    indistinguishable from one that has not been reached. The execution
+    carries a status of the same name, but that answers "is this blocked?"
+    and the approval desk needs "blocked *where*?" - and deriving it by
+    joining against the approvals table would make the island's hottest query
+    depend on a table that only sometimes has a row.
+
+    Which status is written by whom matters here: this one is set by folding
+    an `approval.*` event, while the execution's status is derived from its
+    steps by `advance()`. One writer per field, because two is how the two
+    disagree.
+    """
+
     PENDING = "pending"
     READY = "ready"
     DISPATCHED = "dispatched"
     RUNNING = "running"
+    WAITING_APPROVAL = "waiting_approval"
     SUCCEEDED = "succeeded"
     FAILED = "failed"
     SKIPPED = "skipped"
