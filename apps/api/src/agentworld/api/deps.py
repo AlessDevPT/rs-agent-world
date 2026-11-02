@@ -37,6 +37,7 @@ from agentworld.services.definitions import (
     ModelProfileService,
     WorkflowService,
 )
+from agentworld.services.executions import ExecutionService
 from agentworld.services.identity import IdentityService, resolve_principal
 from agentworld.services.ingest import IngestService
 from agentworld.services.projects import ProjectService
@@ -249,6 +250,15 @@ def get_api_key_service(factory: FactoryDep, settings: SettingsDep) -> ApiKeySer
     return ApiKeyService(factory, pepper=settings.api_key_pepper, environment=settings.environment)
 
 
+def get_execution_service(factory: FactoryDep) -> ExecutionService:
+    """Publishing, running, and applying decisions.
+
+    No settings: every limit this service respects is either a database
+    constraint or a decision `advance()` already took.
+    """
+    return ExecutionService(factory)
+
+
 def get_credential_service(factory: FactoryDep, settings: SettingsDep) -> CredentialService:
     """The keyring comes from settings, which refused to boot without it.
 
@@ -269,3 +279,4 @@ ModelProfileServiceDep = Annotated[ModelProfileService, Depends(get_model_profil
 ConnectionServiceDep = Annotated[ConnectionService, Depends(get_connection_service)]
 WorkflowServiceDep = Annotated[WorkflowService, Depends(get_workflow_service)]
 CredentialServiceDep = Annotated[CredentialService, Depends(get_credential_service)]
+ExecutionServiceDep = Annotated[ExecutionService, Depends(get_execution_service)]

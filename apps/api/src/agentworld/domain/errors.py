@@ -98,6 +98,28 @@ class OutboundRequestFailedError(DomainError):
     title = "Outbound request failed"
 
 
+class WorkflowNotPublishableError(ValidationFailedError):
+    """A draft that cannot be published, with every reason.
+
+    Carries `findings` as its own attribute rather than in `context`, because
+    `LOCATOR_KEYS` deliberately keeps `context` out of a response - and these
+    are the one thing the caller must see. "No" on its own is useless to the
+    person who has to fix the graph, which is the same reason `validate`
+    returns a report rather than a boolean.
+
+    `agentworld.api.errors` renders them into the problem document's
+    `errors` array, the same shape a pydantic failure produces, so a client
+    has one parser for both.
+    """
+
+    code = "workflow_not_publishable"
+    title = "Workflow not publishable"
+
+    def __init__(self, detail: str, *, findings: list[dict[str, str]], **context: Any) -> None:
+        super().__init__(detail, **context)
+        self.findings = findings
+
+
 class RateLimitedError(DomainError):
     code = "rate_limited"
     title = "Rate limited"

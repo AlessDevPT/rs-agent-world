@@ -26,6 +26,7 @@ from agentworld.api.v1 import (
     agents,
     api_keys,
     credentials,
+    executions,
     ingest,
     me,
     projects,
@@ -147,6 +148,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(workflows.connections_router)
     app.include_router(workflows.workflows_router)
     app.include_router(credentials.router)
+    app.include_router(executions.workflow_router)
+    app.include_router(executions.router)
 
     return app
 

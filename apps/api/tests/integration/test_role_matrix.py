@@ -175,6 +175,14 @@ ENDPOINTS = [
         "POST", "/v1/workspaces/{workspace}/credentials/{credential}/revoke", MemberRole.ADMIN
     ),
     Endpoint("DELETE", "/v1/workspaces/{workspace}/credentials/{credential}", MemberRole.ADMIN),
+    # ---- Phase 3 / T5 ------------------------------------------------------
+    # Publishing freezes a graph and running one spends money and reaches the
+    # outside world. Both are `member`, which is the row `docs` specifies -
+    # and the reason they are separate routes rather than one "save and run".
+    Endpoint("POST", "/v1/projects/{project}/workflows/{workflow}/publish", MemberRole.MEMBER),
+    Endpoint("POST", "/v1/projects/{project}/workflows/{workflow}/run", MemberRole.MEMBER, {}),
+    Endpoint("GET", "/v1/projects/{project}/executions", MemberRole.VIEWER),
+    Endpoint("GET", "/v1/projects/{project}/executions/{execution}", MemberRole.VIEWER),
 ]
 
 
@@ -188,6 +196,9 @@ class Scenario:
     profile_id: str
     connection_id: str
     workflow_id: str
+    #: An execution of that workflow, so the read rows have something to
+    #: read. Created by the fixture, not by the row under test.
+    execution_id: str
     credential_id: str
     #: A member who is never one of the callers, so that removing them is
     #: never self-service - which a viewer may do regardless of role.
@@ -204,6 +215,7 @@ class Scenario:
             "profile": self.profile_id,
             "connection": self.connection_id,
             "workflow": self.workflow_id,
+            "execution": self.execution_id,
             "credential": self.credential_id,
             "target": self.target_user_id,
         }
@@ -301,11 +313,34 @@ async def scenario(
         },
         headers=actor.headers,
     ).json()
+    # Publishable on purpose: the publish and run rows must answer a
+    # permission question, and an empty graph would answer "unpublishable"
+    # for every role instead.
     workflow = client.post(
         f"/v1/projects/{project['id']}/workflows",
-        json={"name": "Matrix Flow"},
+        json={
+            "name": "Matrix Flow",
+            "graph": {
+                "steps": [
+                    {"step_key": "work", "kind": "agent_task", "agent_key": agent["agent_key"]}
+                ],
+                "edges": [],
+            },
+        },
         headers=actor.headers,
     ).json()
+    workflow_id = workflow["workflow"]["id"]
+    published = client.post(
+        f"/v1/projects/{project['id']}/workflows/{workflow_id}/publish",
+        headers=actor.headers,
+    )
+    assert published.status_code == 201, published.text
+    execution = client.post(
+        f"/v1/projects/{project['id']}/workflows/{workflow_id}/run",
+        json={},
+        headers=actor.headers,
+    )
+    assert execution.status_code == 202, execution.text
     credential = client.post(
         f"/v1/workspaces/{workspace['id']}/credentials",
         json={
@@ -325,7 +360,8 @@ async def scenario(
         other_agent_id=other_agent["id"],
         profile_id=profile["id"],
         connection_id=connection["id"],
-        workflow_id=workflow["workflow"]["id"],
+        workflow_id=workflow_id,
+        execution_id=execution.json()["id"],
         credential_id=credential["id"],
         target_user_id=str(target_user_id),
         actors=actors,
@@ -432,6 +468,7 @@ def app_routes(client: TestClient) -> set[str]:
             .replace("{workflow_id}", "{workflow}")
             .replace("{profile_id}", "{profile}")
             .replace("{credential_id}", "{credential}")
+            .replace("{execution_id}", "{execution}")
             .replace("{user_id}", "{target}")
         )
         for method in operations:

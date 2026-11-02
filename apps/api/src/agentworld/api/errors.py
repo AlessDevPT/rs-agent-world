@@ -21,6 +21,10 @@ PROBLEM_BASE_URL = "https://docs.agentworld.dev/errors"
 CONTENT_TYPE = "application/problem+json"
 
 _STATUS_BY_ERROR: dict[type[domain_errors.DomainError], int] = {
+    # Before ValidationFailedError, which it subclasses: the loop in
+    # `_status_for` returns the first isinstance match, so the subclass
+    # has to come first or it would never be reached.
+    domain_errors.WorkflowNotPublishableError: 422,
     domain_errors.ValidationFailedError: 422,
     domain_errors.AuthenticationFailedError: 401,
     domain_errors.NotFoundError: 404,
@@ -140,11 +144,21 @@ def register_error_handlers(app: FastAPI) -> None:
             headers = {"WWW-Authenticate": exc.challenge}
         if status >= 500:
             log.error("domain_error", code=exc.code, detail=exc.detail, **exc.context)
+        # The one error that carries a list for the caller. `context` is
+        # still not rendered - see LOCATOR_KEYS - but a publish refusal is
+        # useless without the reasons, so they travel on their own attribute
+        # and land in the same `errors` array a pydantic failure uses.
+        errors = (
+            list(exc.findings)
+            if isinstance(exc, domain_errors.WorkflowNotPublishableError)
+            else None
+        )
         return problem(
             status=status,
             code=exc.code,
             title=exc.title,
             detail=exc.detail,
+            errors=errors,
             headers=headers,
             locator=_locator(exc),
         )
