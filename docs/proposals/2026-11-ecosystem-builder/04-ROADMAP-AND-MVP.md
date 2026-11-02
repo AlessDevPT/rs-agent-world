@@ -190,8 +190,16 @@ The first phase where something runs, and the first where something is visible.
   non-editable install would have shipped without it; and the policy's allow-list could be
   used to smuggle a NAT64-wrapped private address. Redirect following and the per-workspace
   concurrency limit are deferred to the tasks that will have a caller for them.
-- `infra/providers/`: `base.py` Protocol, `anthropic.py`, registry, over the guarded
-  client. **The OpenAI-compatible implementation is the last task of this phase**, written
+- ~~`infra/providers/`: `base.py` Protocol, `anthropic.py`, registry, over the guarded
+  client.~~ **Done (T3), with one criterion unmet.** No vendor SDK: the Messages API is
+  spoken directly, because an SDK brings its own HTTP client and "every provider call goes
+  through the guarded client" would then depend on an internal of theirs. The live call
+  against the real API has **not** been made — it needs an `ANTHROPIC_API_KEY` this session
+  does not have; `scripts/live_provider_smoke.py` is the manual check, a script rather than
+  a `skipif` test so CI keeps reporting zero skips. An eighth import contract confines
+  provider SDKs, and a source search covers what no contract can: a vendor's *name* in a
+  string, a constant or a comment. See `12-T3-PROVIDERS.md`.
+  **The OpenAI-compatible implementation is still the last task of this phase**, written
   specifically to prove the Protocol is not shaped around one vendor while the first one is
   still fresh — and to confirm the four axes in `01-DOMAIN-AND-PROTOCOL.md` §2 are really
   separate.
