@@ -26,6 +26,7 @@ _STATUS_BY_ERROR: dict[type[domain_errors.DomainError], int] = {
     domain_errors.NotFoundError: 404,
     domain_errors.PermissionDeniedError: 403,
     domain_errors.ConflictError: 409,
+    domain_errors.CredentialUnreadableError: 500,
     domain_errors.RateLimitedError: 429,
     domain_errors.DependencyUnavailableError: 503,
 }

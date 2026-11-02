@@ -28,6 +28,7 @@ from agentworld.infra.db import Database
 from agentworld.repositories.api_keys import ApiKeyRepository, ApiKeyUnscopedRepository
 from agentworld.repositories.audit import AuditLogRepository
 from agentworld.repositories.base import TenantScope
+from agentworld.repositories.credentials import CredentialRepository
 from agentworld.repositories.definitions import (
     AgentRepository,
     ConnectionRepository,
@@ -110,6 +111,10 @@ class UnitOfWork:
 
     def model_profiles(self, scope: TenantScope) -> ModelProfileRepository:
         return ModelProfileRepository(self._session, scope)
+
+    def credentials(self, scope: TenantScope) -> CredentialRepository:
+        """The only reader of the material columns - see its docstring."""
+        return CredentialRepository(self._session, scope)
 
     def connections(self, scope: TenantScope) -> ConnectionRepository:
         return ConnectionRepository(self._session, scope)

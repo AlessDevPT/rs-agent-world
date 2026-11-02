@@ -146,6 +146,35 @@ ENDPOINTS = [
     ),
     Endpoint("POST", "/v1/projects/{project}/workflows/{workflow}/validate", MemberRole.MEMBER),
     Endpoint("DELETE", "/v1/projects/{project}/workflows/{workflow}", MemberRole.ADMIN),
+    # ---- Phase 3 / T1 ------------------------------------------------------
+    # Every credential route is `admin`, and the table is uniform on purpose:
+    # there is no viewer row, no member row, and no row at any role that
+    # reads material, because no such route exists.
+    Endpoint("GET", "/v1/workspaces/{workspace}/credentials", MemberRole.ADMIN),
+    Endpoint(
+        "POST",
+        "/v1/workspaces/{workspace}/credentials",
+        MemberRole.ADMIN,
+        # A different provider from the one the scenario already stored for,
+        # so the call is answering a permission question rather than hitting
+        # `credentials_name_key`.
+        {
+            "name": "Matrix Credential",
+            "kind": "api_key",
+            "provider_slug": "openai",
+            "secret": "sk-matrix-0123456789abcdef",
+        },
+    ),
+    Endpoint(
+        "POST",
+        "/v1/workspaces/{workspace}/credentials/{credential}/rotate",
+        MemberRole.ADMIN,
+        {"secret": "sk-matrix-rotated-0123456789"},
+    ),
+    Endpoint(
+        "POST", "/v1/workspaces/{workspace}/credentials/{credential}/revoke", MemberRole.ADMIN
+    ),
+    Endpoint("DELETE", "/v1/workspaces/{workspace}/credentials/{credential}", MemberRole.ADMIN),
 ]
 
 
@@ -159,6 +188,7 @@ class Scenario:
     profile_id: str
     connection_id: str
     workflow_id: str
+    credential_id: str
     #: A member who is never one of the callers, so that removing them is
     #: never self-service - which a viewer may do regardless of role.
     target_user_id: str
@@ -174,6 +204,7 @@ class Scenario:
             "profile": self.profile_id,
             "connection": self.connection_id,
             "workflow": self.workflow_id,
+            "credential": self.credential_id,
             "target": self.target_user_id,
         }
 
@@ -275,6 +306,16 @@ async def scenario(
         json={"name": "Matrix Flow"},
         headers=actor.headers,
     ).json()
+    credential = client.post(
+        f"/v1/workspaces/{workspace['id']}/credentials",
+        json={
+            "name": "Matrix Key",
+            "kind": "api_key",
+            "provider_slug": "anthropic",
+            "secret": "sk-matrix-seeded-0123456789",
+        },
+        headers=actor.headers,
+    ).json()
 
     return Scenario(
         workspace_id=workspace["id"],
@@ -285,6 +326,7 @@ async def scenario(
         profile_id=profile["id"],
         connection_id=connection["id"],
         workflow_id=workflow["workflow"]["id"],
+        credential_id=credential["id"],
         target_user_id=str(target_user_id),
         actors=actors,
     )
@@ -389,6 +431,7 @@ def app_routes(client: TestClient) -> set[str]:
             .replace("{connection_id}", "{connection}")
             .replace("{workflow_id}", "{workflow}")
             .replace("{profile_id}", "{profile}")
+            .replace("{credential_id}", "{credential}")
             .replace("{user_id}", "{target}")
         )
         for method in operations:

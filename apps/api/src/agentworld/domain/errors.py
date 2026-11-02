@@ -68,6 +68,21 @@ class ValidationFailedError(DomainError):
     title = "Validation failed"
 
 
+class CredentialUnreadableError(DomainError):
+    """A stored credential exists and this server cannot decrypt it.
+
+    A server fault, not a caller fault, so it is a 500: a retired
+    key-encryption key, a restore that moved a row between workspaces, or
+    tampering. Which of those it was goes to the logs with the row's id and
+    `key_id`; the caller is told only that it could not be decrypted, because
+    the difference is diagnostic for an operator and an oracle for anyone
+    else.
+    """
+
+    code = "credential_unreadable"
+    title = "Credential unreadable"
+
+
 class RateLimitedError(DomainError):
     code = "rate_limited"
     title = "Rate limited"

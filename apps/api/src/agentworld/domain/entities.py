@@ -16,7 +16,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID
 
@@ -25,6 +25,7 @@ from agentworld.domain.enums import (
     AgentStatus,
     ApiKeyScope,
     ConnectionKind,
+    CredentialKind,
     MemberRole,
 )
 
@@ -124,6 +125,58 @@ class ApiKey:
         exists for listings, not for authentication decisions.
         """
         return self.revoked_at is None
+
+
+@dataclass(frozen=True, slots=True)
+class Credential:
+    """An integration credential as anyone ever sees it: no material.
+
+    The same property `ApiKey` relies on, for a stronger reason. There is no
+    field for the ciphertext, the nonce, the wrapped key or the plaintext, so
+    no response model, `repr`, log line or serialiser can carry one - not
+    because each of those was careful, but because the attribute does not
+    exist. The four binary columns are read in `repositories.credentials`,
+    handed to `infra/secrets/` as an `EncryptedBlob`, and never travel in an
+    entity.
+
+    `display_hint` is derived from the material at write time - a few
+    characters an operator can recognise a key by - and is the only thing
+    about the secret that any caller is ever shown. It is not accepted from a
+    request body, because a caller-supplied hint could carry the whole secret.
+    """
+
+    id: UUID
+    workspace_id: UUID
+    project_id: UUID | None
+    name: str
+    kind: CredentialKind
+    provider_slug: str
+    #: Which KEK wraps this row's data key. Metadata, not material: it names
+    #: a key held in the environment, and is here so an operator can see
+    #: which rows a rotation has still to touch.
+    key_id: str
+    display_hint: str | None = None
+    scopes: Sequence[str] | None = None
+    expires_at: datetime | None = None
+    refresh_after: datetime | None = None
+    created_by_user_id: UUID | None = None
+    created_at: datetime | None = None
+    last_used_at: datetime | None = None
+    revoked_at: datetime | None = None
+    deleted_at: datetime | None = None
+
+    @property
+    def is_usable(self) -> bool:
+        """Whether an outbound call may still use this credential.
+
+        Expiry is compared against this process's clock, which is good enough
+        for a listing and for refusing an obviously dead credential before
+        making a request. It is not an authentication decision: the remote
+        service is the authority on whether its own credential still works.
+        """
+        if self.revoked_at is not None or self.deleted_at is not None:
+            return False
+        return self.expires_at is None or self.expires_at > datetime.now(UTC)
 
 
 @dataclass(frozen=True, slots=True)

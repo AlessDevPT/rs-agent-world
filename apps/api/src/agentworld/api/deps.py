@@ -25,10 +25,12 @@ from agentworld.domain.principals import KeyPrincipal, UserPrincipal
 from agentworld.infra.auth.provider import AuthProvider
 from agentworld.infra.auth.supabase import CHALLENGE as BEARER_CHALLENGE
 from agentworld.infra.db import Database
+from agentworld.infra.secrets import EnvelopeSecretStore
 from agentworld.repositories.unit_of_work import UnitOfWorkFactory
 from agentworld.services.api_keys import CHALLENGE as KEY_CHALLENGE
 from agentworld.services.api_keys import ApiKeyService
 from agentworld.services.context import CallContext
+from agentworld.services.credentials import CredentialService
 from agentworld.services.definitions import (
     AgentService,
     ConnectionService,
@@ -247,6 +249,16 @@ def get_api_key_service(factory: FactoryDep, settings: SettingsDep) -> ApiKeySer
     return ApiKeyService(factory, pepper=settings.api_key_pepper, environment=settings.environment)
 
 
+def get_credential_service(factory: FactoryDep, settings: SettingsDep) -> CredentialService:
+    """The keyring comes from settings, which refused to boot without it.
+
+    Built per request like every other service here. The keyring is a few
+    microseconds of base64 and holding one on `app.state` instead would keep
+    key material alive in a longer-lived object for no gain.
+    """
+    return CredentialService(factory, store=EnvelopeSecretStore(settings.credential_keyring))
+
+
 IdentityServiceDep = Annotated[IdentityService, Depends(get_identity_service)]
 WorkspaceServiceDep = Annotated[WorkspaceService, Depends(get_workspace_service)]
 ProjectServiceDep = Annotated[ProjectService, Depends(get_project_service)]
@@ -256,3 +268,4 @@ AgentServiceDep = Annotated[AgentService, Depends(get_agent_service)]
 ModelProfileServiceDep = Annotated[ModelProfileService, Depends(get_model_profile_service)]
 ConnectionServiceDep = Annotated[ConnectionService, Depends(get_connection_service)]
 WorkflowServiceDep = Annotated[WorkflowService, Depends(get_workflow_service)]
+CredentialServiceDep = Annotated[CredentialService, Depends(get_credential_service)]
