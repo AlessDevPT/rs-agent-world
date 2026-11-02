@@ -203,7 +203,15 @@ The first phase where something runs, and the first where something is visible.
   specifically to prove the Protocol is not shaped around one vendor while the first one is
   still fresh — and to confirm the four axes in `01-DOMAIN-AND-PROTOCOL.md` §2 are really
   separate.
-- `domain/orchestration/advance.py` + `decisions.py` — the pure decision function.
+- ~~`domain/orchestration/advance.py` + `decisions.py` — the pure decision function.~~
+  **Done (T4).** Plus `state.py`: what the function is told, with no field that could only
+  be filled by a query. Purity and the absence of a clock are asserted from the module's
+  own syntax tree rather than from what it imported at load time. Five of the eight
+  decisions in `02-ORCHESTRATION.md` §4 are implemented and three are deliberately absent -
+  `RequestApproval` with approvals, `RetryStep` with the retry policy, and
+  `PauseExecution` not at all, since pausing is something done *to* an execution rather
+  than something a decision function decides. The non-vacuity pass found three untested
+  guards, including a join that would have run on half its input. See `13-T4-ADVANCE.md`.
 - `services/executions.py` — apply decisions in one transaction: event + state + outbox.
 - `workers/step_runner.py`, `workers/dispatch_reaper.py`.
 - `POST /v1/workflows/{id}/run`, `GET /v1/executions/{id}`.
