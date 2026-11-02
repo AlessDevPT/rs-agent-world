@@ -1065,6 +1065,36 @@ one is visible in review. All of them join `RLS_PROTECTED_TABLES`.
 
 ## 9. The event protocol
 
+### Who may originate an event
+
+**Added in T0 (D1).** This section originally described what each event type is *about*
+and which tables it folds into, and said nothing about who may send one — which left
+ingest with no type check at all. The consequence is set out in `02-ORCHESTRATION.md` §7:
+`approval.granted` was ingestible, and the reducer folds it to a ready step that
+`advance()` then dispatches, so a worker credential could open its own approval gate.
+
+`EventSpec` therefore carries a `producer`, and `services/ingest.py` enforces it.
+
+| Producer | Who writes it | Types |
+|---|---|---|
+| `AGENT` | any ingest key for the pinned project, subject to the agent allowlist | `agent.*`, `task.*`, `run.*`, `tool.*`, `log.emitted`, `metric.recorded`, and every unknown or `custom.*` type |
+| `AGENT_FOR_DISPATCHED_STEP` | an ingest key, but only for a step currently `dispatched` or `running` and held by an agent that key may act as | `workflow.step_succeeded`, `workflow.step_failed` |
+| `ORCHESTRATOR` | `services/executions.py`, in the transaction that also writes the state and the outbox row. Never ingestible | every other `workflow.*` |
+| `CONTROL_PLANE` | a role-gated control-plane service, with an `audit_log` row beside the event. Never ingestible | `approval.*` |
+
+Three things worth stating about the shape of this:
+
+- **The second row exists because a blanket ban was not available.** §6 of the
+  orchestration document *requires* a `dispatchable` agent to report its own step outcome.
+  The rule is therefore scoped to the step that agent is actually holding, rather than
+  being a boolean over the namespace.
+- **`workflow.step_started` is deliberately not in the second row.** Nothing in the design
+  needs an external agent to announce starting, and the narrower default is the one worth
+  having.
+- **An unknown type stays ingestible**, which keeps the first compatibility promise
+  intact. It is safe because a type with no spec folds into nothing, so it cannot move
+  state whatever it is called.
+
 ### Envelope
 
 ```jsonc

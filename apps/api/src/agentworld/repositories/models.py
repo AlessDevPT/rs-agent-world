@@ -986,8 +986,11 @@ class Dispatch(Base):
     execution_id: Mapped[UUID | None] = mapped_column(
         sa.ForeignKey("workflow_executions.id", ondelete="CASCADE")
     )
-    execution_step_id: Mapped[UUID | None] = mapped_column(
-        sa.ForeignKey("execution_steps.id", ondelete="CASCADE")
+    #: Mandatory. NULLs are distinct in a unique constraint, so a nullable
+    #: column here meant `dispatches_step_attempt_key` constrained nothing
+    #: for a step-less row. Every dispatch kind belongs to a step.
+    execution_step_id: Mapped[UUID] = mapped_column(
+        sa.ForeignKey("execution_steps.id", ondelete="CASCADE"), nullable=False
     )
     kind: Mapped[enums.DispatchKind] = mapped_column(
         pg_enum(enums.DispatchKind, "dispatch_kind"), nullable=False
@@ -1012,8 +1015,16 @@ class Dispatch(Base):
     idempotency_token: Mapped[UUID] = mapped_column(
         sa.Uuid, nullable=False, server_default=sa.text("gen_random_uuid()")
     )
+    #: The identity of this attempt, written once at insert. A `BEFORE UPDATE`
+    #: trigger refuses to change it, because `UNIQUE (execution_step_id, kind,
+    #: attempt)` is what makes a double `advance()` collide - and a key that
+    #: moves guards nothing. Retrying inserts a new row; see `claim_count`.
     attempt: Mapped[int] = mapped_column(nullable=False, server_default=sa.text("0"))
     max_attempts: Mapped[int] = mapped_column(nullable=False, server_default=sa.text("3"))
+    #: How many times a worker has leased this row. Lease bookkeeping, kept
+    #: apart from `attempt` so extending or re-taking a lease never touches
+    #: the unique key.
+    claim_count: Mapped[int] = mapped_column(nullable=False, server_default=sa.text("0"))
     #: A lease, not a lock: a worker that dies holds nothing.
     leased_by: Mapped[str | None]
     leased_until: Mapped[dt.datetime | None]
@@ -1031,6 +1042,7 @@ class Dispatch(Base):
     __table_args__ = (
         _project_fk("dispatches"),
         sa.CheckConstraint("attempt >= 0", name="dispatch_attempt_is_not_negative"),
+        sa.CheckConstraint("claim_count >= 0", name="dispatch_claim_count_is_not_negative"),
         sa.CheckConstraint("max_attempts >= 1", name="dispatch_max_attempts_is_positive"),
         # A row marked leased with no lease could never be reclaimed by the
         # reaper, so it would be stuck forever. Make it unrepresentable.

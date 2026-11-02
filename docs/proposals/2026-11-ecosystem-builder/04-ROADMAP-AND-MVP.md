@@ -142,6 +142,32 @@ behaviour changes.
 
 The first phase where something runs, and the first where something is visible.
 
+> **Scope decision, 2026-11-02.** Staged, as in option (a) of
+> `08-PHASE-3-READINESS.md` §7: this phase is T0–T8 and T13. Approvals, MCP tool execution
+> and dispatchable agents move to **Phase 3a**, so the first milestone is a real end-to-end
+> managed agent execution rather than a larger phase with nothing demonstrable until late.
+>
+> **T0 comes first and is a prerequisite, not a task.** The readiness review found six
+> defects in Phase 2 that the orchestrator would otherwise be built on top of, the sharpest
+> being that any ingest key could post `approval.granted` — which folds a step to `ready`,
+> which `advance()` dispatches. They are listed in `09-T0-PLAN.md` and were closed in
+> migrations 0017–0019 plus the `Producer` vocabulary.
+>
+> **Until approvals exist in Phase 3a, consequential external actions are not executable.**
+> `advance()` does not emit a decision whose `side_effect_class` is `consequential`, so no
+> dispatch row exists for one — the same shape as the approval gate itself, which means
+> Phase 3a replaces a refusal with a gate rather than restructuring anything. A workflow
+> granting a consequential tool is refused at publish with a validation finding, rather
+> than running and stopping halfway. The first managed execution uses explicitly granted,
+> read-only capabilities, and a model response is never itself authority to act.
+>
+> **Provider tests are deterministic.** No Anthropic key in ordinary CI; recorded responses
+> there, plus one manually initiated live smoke test before the milestone completes, kept
+> separate from the automated suite.
+>
+> **`advance()` runs in-process** in the API and reaper paths. A separate orchestrator
+> process waits for load that justifies it.
+
 **Build — Track A**
 - `infra/secrets/`: `SecretStore`, envelope encryption, AAD binding, KEK map and rotation;
   `Settings` fails fast without `CREDENTIAL_KEKS` outside local and test.

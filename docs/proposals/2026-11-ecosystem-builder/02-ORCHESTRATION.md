@@ -178,7 +178,7 @@ receiver cooperates. Which is why §8 is explicit about what happens where it do
 ```sql
 UPDATE dispatches SET status='leased', leased_by=:worker,
        leased_until=now() + make_interval(secs => :lease_seconds),
-       attempt=attempt+1
+       claim_count=claim_count+1
 WHERE id IN (
   SELECT id FROM dispatches
   WHERE status='pending' AND run_after <= now()
@@ -192,6 +192,22 @@ RETURNING *;
 `lease_seconds` is per kind: a tool call leases for 60s, a managed agent turn for 600s. A
 worker that needs longer extends its own lease rather than taking a generous one up front,
 so a crash is noticed in seconds rather than minutes.
+
+> **Corrected in T0 (D4).** This statement used to increment `attempt` rather than
+> `claim_count`, and that could not coexist with the other two things said about `attempt`
+> in this document. Layer 1 of idempotent dispatch above relies on
+> `UNIQUE (execution_step_id, kind, attempt)` to make a double `advance` collide — which
+> requires the key to be *stable*. If claiming moves `attempt`, the key moves out from
+> under the row it is meant to pin, so it stops guarding creation at all. And a row claimed
+> once, incremented to `attempt = 1`, then collides with the retry row §8 says a human
+> creates at `attempt + 1` — the retry failing for a reason unrelated to the retry.
+>
+> So `attempt` is now the **identity of an attempt**: written once at insert, and a
+> `BEFORE UPDATE` trigger in migration 0019 refuses to change it. Lease bookkeeping lives
+> in `claim_count`, which a worker may increment freely because nothing depends on it.
+> `execution_step_id` became `NOT NULL` in the same migration, because NULLs are distinct
+> in a unique constraint and a step-less row therefore had no duplicate protection
+> whatsoever (D5).
 
 ## 4. The orchestrator is a pure function
 
@@ -373,6 +389,26 @@ human decides (control plane, role-gated, different-user-gated, audited)
 The gate is the *absence of a dispatch*, not a flag a worker is trusted to check. A bug in
 the approval UI cannot cause an unapproved send, because the thing that sends has no row to
 act on — and there is no `dispatch.create` action for anything else to use.
+
+> **What that argument did not cover, closed in T0 (D1).** It defends against a buggy
+> approval UI. It did not defend against a *forged* `approval.granted` event, because the
+> forged event does not need to create a dispatch — the reducer folds it to
+> `execution_steps.status = ready`, and `advance()` then creates the dispatch itself, doing
+> exactly what it is supposed to do with a step that is ready. Until T0, `EventSpec`
+> described what an event was about and which tables it folded into but said nothing about
+> who may originate one, and ingest checked the key's scope, its project pin, the clock skew
+> and the agent allowlist — never the type. So any holder of an ingest key could post
+> `approval.granted`, or `workflow.step_succeeded` with any `output` that a later step then
+> read through the expression language.
+>
+> `Producer` now answers "who may originate this type", and ingest enforces it. All four
+> `approval.*` types are `CONTROL_PLANE`: never ingestible. Every `workflow.*` type is
+> `ORCHESTRATOR`, except `step_succeeded` and `step_failed`, which §6 requires a
+> `dispatchable` agent to send — those are `AGENT_FOR_DISPATCHED_STEP`, accepted only for a
+> step that is *currently* dispatched or running and held by an agent the key may act as.
+> Everything else keeps the old rule. So the gate now has two independent halves: the
+> absence of a dispatch, and the fact that nothing outside the control plane can write the
+> event that would cause one.
 
 **The requirement is frozen when the approval is created**, not recomputed when it is
 decided. Editing the project policy therefore cannot change what a pending approval

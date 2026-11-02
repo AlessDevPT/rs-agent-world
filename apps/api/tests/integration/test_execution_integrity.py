@@ -57,12 +57,16 @@ async def seeded(owner_database: Database) -> Fixture:
             ),
             {"i": f.workflow_id, "w": f.workspace_id, "p": f.project_id, "s": "run", "n": "Run"},
         )
+        # Unpublished at first, published after the steps are in. Migration
+        # 0018 refuses an insert into `workflow_steps` whose version is
+        # already published, so this is the order a real publish has to use
+        # too - and this fixture is the first thing that would have found out.
         for version_id, number in ((f.version_a, 1), (f.version_b, 2)):
             await session.execute(
                 text(
                     "INSERT INTO workflow_versions "
-                    "(id, workflow_id, workspace_id, project_id, version, graph, published_at) "
-                    "VALUES (:i, :wf, :w, :p, :v, '{}'::jsonb, now())"
+                    "(id, workflow_id, workspace_id, project_id, version, graph) "
+                    "VALUES (:i, :wf, :w, :p, :v, '{}'::jsonb)"
                 ),
                 {
                     "i": version_id,
@@ -88,6 +92,10 @@ async def seeded(owner_database: Database) -> Fixture:
                     "name": "Shape",
                 },
             )
+        await session.execute(
+            text("UPDATE workflow_versions SET published_at = now() WHERE id IN (:a, :b)"),
+            {"a": f.version_a, "b": f.version_b},
+        )
         # An execution bound to version A, initiated by a user.
         await session.execute(
             text(
@@ -437,6 +445,95 @@ async def test_a_dispatch_gets_an_idempotency_token_by_default(
             await session.execute(text("SELECT idempotency_token FROM dispatches"))
         ).scalar_one()
     assert token is not None
+
+
+# ----------------------------------------- attempt identity and claims (T0) ---
+
+
+async def test_attempt_cannot_be_updated(owner_database: Database, with_step: Fixture) -> None:
+    """`attempt` is the identity of an attempt, not a mutable counter.
+
+    The claiming SQL in an earlier draft of the design incremented it, which
+    would have made `dispatches_step_attempt_key` guard nothing - the key
+    would move out from under the row it was supposed to pin - and a row
+    claimed once would then collide with the retry row a human creates at the
+    same number. Enforced by trigger rather than by convention, because the
+    constraint exists precisely for the case where the worker is wrong.
+    """
+    await _insert_dispatch(owner_database, with_step, attempt=0)
+
+    with pytest.raises(Exception) as caught:
+        async with owner_database.session() as session:
+            await session.execute(text("UPDATE dispatches SET attempt = attempt + 1"))
+    assert "attempt" in str(caught.value)
+
+
+async def test_claiming_may_increment_claim_count(
+    owner_database: Database, with_step: Fixture
+) -> None:
+    """The non-vacuity pair. Lease bookkeeping has to stay possible, or the
+    trigger above has simply broken claiming."""
+    await _insert_dispatch(owner_database, with_step, attempt=0)
+
+    async with owner_database.session() as session:
+        await session.execute(
+            text(
+                "UPDATE dispatches SET claim_count = claim_count + 1, status = 'leased', "
+                " leased_by = 'worker-1', leased_until = now() + interval '60 seconds'"
+            )
+        )
+        attempt, claims = (
+            await session.execute(text("SELECT attempt, claim_count FROM dispatches"))
+        ).one()
+    assert (attempt, claims) == (0, 1)
+
+
+async def test_a_retry_row_does_not_collide_with_a_claimed_row(
+    owner_database: Database, with_step: Fixture
+) -> None:
+    """The exact collision D4 predicted, asserted not to happen.
+
+    A row claimed twice, then a human retry at `attempt = 1`. If claiming had
+    moved `attempt`, the claimed row would already be sitting on 1 and this
+    insert would fail for a reason that has nothing to do with the retry.
+    """
+    await _insert_dispatch(owner_database, with_step, attempt=0)
+    async with owner_database.session() as session:
+        await session.execute(text("UPDATE dispatches SET claim_count = claim_count + 2"))
+
+    await _insert_dispatch(owner_database, with_step, attempt=1)
+
+    async with owner_database.session() as session:
+        rows = (
+            await session.execute(
+                text("SELECT attempt, claim_count FROM dispatches ORDER BY attempt")
+            )
+        ).all()
+    assert [tuple(row) for row in rows] == [(0, 2), (1, 0)]
+
+
+async def test_claim_count_cannot_go_negative(owner_database: Database, with_step: Fixture) -> None:
+    await _insert_dispatch(owner_database, with_step)
+    with pytest.raises(Exception) as caught:
+        async with owner_database.session() as session:
+            await session.execute(text("UPDATE dispatches SET claim_count = -1"))
+    assert "dispatch_claim_count_is_not_negative" in str(caught.value)
+
+
+async def test_a_dispatch_requires_a_step(owner_database: Database, with_step: Fixture) -> None:
+    """D5. NULLs are distinct in a unique constraint, so a step-less row got
+    no duplicate protection at all from `dispatches_step_attempt_key`."""
+    with pytest.raises(Exception) as caught:
+        async with owner_database.session() as session:
+            await session.execute(
+                text(
+                    "INSERT INTO dispatches "
+                    "(workspace_id, project_id, kind, side_effect_class, instruction) "
+                    "VALUES (:w, :p, 'tool_call', 'write', '{}'::jsonb)"
+                ),
+                {"w": with_step.workspace_id, "p": with_step.project_id},
+            )
+    assert "execution_step_id" in str(caught.value)
 
 
 async def test_execution_tables_are_tenant_isolated(
