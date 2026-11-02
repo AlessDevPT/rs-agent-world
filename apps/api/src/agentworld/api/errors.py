@@ -27,6 +27,7 @@ _STATUS_BY_ERROR: dict[type[domain_errors.DomainError], int] = {
     domain_errors.PermissionDeniedError: 403,
     domain_errors.ConflictError: 409,
     domain_errors.CredentialUnreadableError: 500,
+    domain_errors.OutboundRequestFailedError: 502,
     domain_errors.RateLimitedError: 429,
     domain_errors.DependencyUnavailableError: 503,
 }
@@ -42,6 +43,7 @@ _TITLE_BY_STATUS: dict[int, str] = {
     422: "Validation failed",
     429: "Rate limited",
     500: "Internal server error",
+    502: "Bad gateway",
     503: "Service unavailable",
 }
 

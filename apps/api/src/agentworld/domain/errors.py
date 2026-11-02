@@ -83,6 +83,21 @@ class CredentialUnreadableError(DomainError):
     title = "Credential unreadable"
 
 
+class OutboundRequestFailedError(DomainError):
+    """A request this server made on a caller's behalf did not succeed.
+
+    502, because the failure is upstream of this server rather than in the
+    caller's request. The detail comes from `OutboundFailure.public_detail`
+    and is deliberately uninformative: a blocked destination and a host that
+    does not exist produce the same sentence, so an agent cannot use failure
+    messages to map an internal network. Which it really was goes to the log
+    with the reason attached.
+    """
+
+    code = "outbound_request_failed"
+    title = "Outbound request failed"
+
+
 class RateLimitedError(DomainError):
     code = "rate_limited"
     title = "Rate limited"

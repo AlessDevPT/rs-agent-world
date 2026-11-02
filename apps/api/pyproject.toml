@@ -160,6 +160,37 @@ forbidden_modules = [
 ]
 
 [[tool.importlinter.contracts]]
+# 06-OUTBOUND-SECURITY.md section 2: one client, so there is one place to
+# review and one place that can be wrong. A worker or a tool that builds its
+# own httpx client gets no address validation and no connection pinning, and
+# would look exactly like code that does.
+#
+# `infra` is a source module here, so the rule binds the layer that owns the
+# client as well as the layers above it. The two exemptions below are the
+# whole of the exception, and they are in this file rather than in a comment
+# somewhere: `infra.net.guarded` is the implementation, and
+# `infra.auth.supabase` is the JWKS fetch named in section 7 - operator
+# configuration rather than user input, running before any tenant context
+# exists.
+name = "Outbound HTTP goes through infra/net"
+type = "forbidden"
+source_modules = [
+    "agentworld.api",
+    "agentworld.services",
+    "agentworld.repositories",
+    "agentworld.domain",
+    "agentworld.adapters",
+    "agentworld.workers",
+    "agentworld.infra",
+]
+forbidden_modules = ["httpx"]
+allow_indirect_imports = true
+ignore_imports = [
+    "agentworld.infra.net.guarded -> httpx",
+    "agentworld.infra.auth.supabase -> httpx",
+]
+
+[[tool.importlinter.contracts]]
 # The same shape as the rule above, for the same reason. `infra/secrets/` is
 # the only module that may encrypt or decrypt credential material, so the
 # AEAD primitives are not importable anywhere else - a second call site is
