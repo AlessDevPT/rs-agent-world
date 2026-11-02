@@ -27,8 +27,9 @@ from uuid import UUID
 import sqlalchemy as sa
 from sqlalchemy.orm import InstrumentedAttribute
 
-from agentworld.domain.enums import EventSeverity
+from agentworld.domain.enums import EventSeverity, StepStatus
 from agentworld.domain.protocol import EventEnvelope
+from agentworld.domain.protocol.refs import split_step_ref
 from agentworld.repositories import models as m
 from agentworld.repositories.base import ScopedRepository
 
@@ -146,6 +147,48 @@ class EventRepository(ScopedRepository):
             )
         ).scalar_one_or_none()
         return found is not None
+
+    async def dispatched_step_agent(self, step_ref: str) -> str | None:
+        """The `agent_key` holding the step `step_ref` names, if any. T0 / D1.
+
+        Answers one question: may the caller report an outcome for this step?
+        It returns a key only when the step exists in this project, is in a
+        state where work is genuinely outstanding, and names an agent. A step
+        that is `pending`, already settled, or has no agent returns None, and
+        so does a ref that resolves to nothing - the caller cannot tell those
+        apart, which is deliberate: the shape of another tenant's execution
+        graph is not something a refusal should describe.
+
+        `running` is accepted as well as `dispatched` because a push-style
+        agent may report `step_started` through the orchestrator and then its
+        outcome, and refusing the second would strand the step.
+        """
+        reference = split_step_ref(step_ref, execution_ref=None)
+        if reference is None:
+            return None
+        try:
+            execution_id = UUID(reference.execution_ref)
+        except ValueError:
+            # An execution ref that is not an id names no row. Same answer as
+            # a step that does not exist, for the same reason.
+            return None
+        found = (
+            await self._session.execute(
+                sa.select(m.Agent.agent_key)
+                .select_from(m.ExecutionStep)
+                .join(m.Agent, m.Agent.id == m.ExecutionStep.agent_id)
+                .where(
+                    m.ExecutionStep.project_id == self.scope.require_project(),
+                    m.ExecutionStep.execution_id == execution_id,
+                    m.ExecutionStep.step_key == reference.step_key,
+                    m.ExecutionStep.status.in_(
+                        [StepStatus.DISPATCHED, StepStatus.RUNNING],
+                    ),
+                )
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        return str(found) if found is not None else None
 
     async def resolve(self, envelope: EventEnvelope) -> ResolvedRefs:
         """Turn the producer's names into ids, where they name something.

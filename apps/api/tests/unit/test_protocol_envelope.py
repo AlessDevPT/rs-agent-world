@@ -18,6 +18,7 @@ from agentworld.domain.errors import ValidationFailedError
 from agentworld.domain.protocol import (
     KNOWN_EVENTS,
     PROTOCOL_VERSION,
+    Producer,
     SubjectKind,
     folds,
     is_custom,
@@ -283,3 +284,72 @@ def test_log_and_metric_events_fold_into_no_state() -> None:
     """They are recorded. Folding them would make the log its own state."""
     assert not folds("log.emitted")
     assert not folds("metric.recorded")
+
+
+# ------------------------------------------------- producer authority (D1) ---
+
+
+def test_every_folding_event_declares_a_producer_deliberately() -> None:
+    """Totality over the taxonomy, so a new type cannot take the default by
+    accident.
+
+    `Producer.AGENT` is the permissive value and also the default, which is
+    the right default - a worker's own events are the common case - but it
+    means a `workflow.*` or `approval.*` type added without thinking would be
+    ingestible. This test is the thing that makes that a failure.
+    """
+    agent_producible = {
+        event_type for event_type, spec in KNOWN_EVENTS.items() if spec.producer is Producer.AGENT
+    }
+    namespaces = {event_type.split(".", 1)[0] for event_type in agent_producible}
+    assert namespaces == {"agent", "task", "run", "tool", "log", "metric"}, (
+        "a namespace outside a worker's own reporting became agent-producible"
+    )
+
+
+def test_no_approval_event_is_ingestible() -> None:
+    """The one that matters most.
+
+    `approval.granted` folds a step to `ready`, and `advance()` dispatches
+    ready steps - so an ingestible approval event is an approval bypass,
+    whatever the approval UI does.
+    """
+    for event_type, spec in KNOWN_EVENTS.items():
+        if event_type.startswith("approval."):
+            assert spec.producer is Producer.CONTROL_PLANE, event_type
+            assert not spec.producer.is_ingestible, event_type
+
+
+def test_only_terminal_step_events_may_come_from_an_agent() -> None:
+    """Orchestration needs a `dispatchable` agent to report its own outcome,
+    and nothing more than that."""
+    from_agent = {
+        event_type
+        for event_type, spec in KNOWN_EVENTS.items()
+        if spec.producer is Producer.AGENT_FOR_DISPATCHED_STEP
+    }
+    assert from_agent == {"workflow.step_succeeded", "workflow.step_failed"}
+
+
+def test_every_other_workflow_event_is_orchestrator_only() -> None:
+    orchestrator_only = {
+        event_type
+        for event_type, spec in KNOWN_EVENTS.items()
+        if spec.producer is Producer.ORCHESTRATOR
+    }
+    workflow_types = {e for e in KNOWN_EVENTS if e.startswith("workflow.")}
+    assert orchestrator_only == workflow_types - {
+        "workflow.step_succeeded",
+        "workflow.step_failed",
+    }
+    assert all(not Producer.ORCHESTRATOR.is_ingestible for _ in orchestrator_only)
+
+
+def test_an_unknown_type_defaults_to_agent() -> None:
+    """The compatibility promise: an unrecognised type is still accepted.
+
+    Safe because a type with no spec folds into nothing, so it cannot move
+    state however it is labelled.
+    """
+    assert spec_for("custom.anything") is None
+    assert spec_for("future.namespace") is None

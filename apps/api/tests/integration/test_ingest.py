@@ -21,8 +21,11 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import text
 
-from agentworld.domain.protocol import PROTOCOL_VERSION
+from agentworld.domain.protocol import PROTOCOL_VERSION, parse_envelope
+from agentworld.domain.reducers import fold
 from agentworld.infra.db import Database
+from agentworld.repositories.base import TenantScope
+from agentworld.repositories.unit_of_work import UnitOfWorkFactory
 from helpers import Actor
 
 pytestmark = pytest.mark.integration
@@ -240,13 +243,25 @@ async def test_a_failed_batch_writes_nothing(
 
 
 async def test_folding_a_workflow_trace_creates_no_dispatches(
-    client: TestClient, ingest: Fixture, agents: dict[str, uuid.UUID], owner_database: Database
+    factory: UnitOfWorkFactory,
+    ingest: Fixture,
+    agents: dict[str, uuid.UUID],
+    owner_database: Database,
 ) -> None:
     """The structural argument is in `test_reducers.py`; this is the live one.
 
     Every event below is one the orchestrator would have written *after*
     deciding. Folding them must reproduce what was decided and decide nothing
     itself - no dispatch row, which is the only thing that can cause work.
+
+    **Why this no longer goes through the ingest endpoint.** It used to, and
+    T0 made that a 403: `workflow.execution_started` and
+    `workflow.step_dispatched` are `Producer.ORCHESTRATOR`, so an API key may
+    not write them at all. That is the point of D1 and is asserted in
+    `test_producer_authority.py`. The property *this* test is about - that
+    folding a decision log decides nothing - belongs at the layer the
+    orchestrator itself will use, which is where it now runs: append, fold,
+    apply, in one transaction, exactly as `services/executions.py` will.
     """
     execution = str(uuid.uuid4())
     trace = [
@@ -268,12 +283,25 @@ async def test_folding_a_workflow_trace_creates_no_dispatches(
             correlation={"execution_ref": execution},
         ),
     ]
-    assert post(client, ingest, *trace).status_code == 202
+
+    scope = TenantScope(workspace_id=ingest.workspace_id, project_id=ingest.project_id)
+    async with factory.begin(visible_workspaces={ingest.workspace_id}) as work:
+        events_repo = work.events(scope)
+        derived = work.derived(scope)
+        for raw in trace:
+            envelope = parse_envelope(raw)
+            event_id = await events_repo.append(
+                envelope,
+                seq=await events_repo.next_seq(),
+                refs=await events_repo.resolve(envelope),
+            )
+            for mutation in fold(envelope):
+                await derived.apply(mutation, event_id=event_id)
 
     async with owner_database.session() as session:
         dispatches = (await session.execute(text("SELECT count(*) FROM dispatches"))).scalar_one()
-        events = (await session.execute(text("SELECT count(*) FROM events"))).scalar_one()
-    assert events == 3
+        stored = (await session.execute(text("SELECT count(*) FROM events"))).scalar_one()
+    assert stored == 3
     assert dispatches == 0, "folding the log caused work"
 
 

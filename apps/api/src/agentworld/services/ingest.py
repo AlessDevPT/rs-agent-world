@@ -50,10 +50,16 @@ from uuid import UUID
 from agentworld.domain.enums import ApiKeyScope
 from agentworld.domain.errors import PermissionDeniedError, ValidationFailedError
 from agentworld.domain.principals import KeyPrincipal
-from agentworld.domain.protocol import PROTOCOL_VERSION, EventEnvelope, parse_envelope
+from agentworld.domain.protocol import (
+    PROTOCOL_VERSION,
+    EventEnvelope,
+    Producer,
+    parse_envelope,
+    spec_for,
+)
 from agentworld.domain.reducers import fold
 from agentworld.repositories.base import TenantScope
-from agentworld.repositories.events import LogLine, MetricPoint
+from agentworld.repositories.events import EventRepository, LogLine, MetricPoint
 from agentworld.repositories.unit_of_work import UnitOfWorkFactory
 
 
@@ -132,7 +138,9 @@ class IngestService:
             # by aborting the whole batch rather than reporting a duplicate.
             await events.lock_project_cursor()
 
-            for envelope in envelopes:
+            for index, envelope in enumerate(envelopes):
+                await self._check_step_ownership(principal, events, envelope, index)
+
                 if await events.seen(envelope.dedup_key):
                     outcomes.append(EventOutcome(envelope.dedup_key, accepted=False))
                     continue
@@ -206,6 +214,19 @@ class IngestService:
                 skew_seconds=round(skew_ms / 1000),
             )
 
+        producer = spec.producer if (spec := spec_for(envelope.type)) else Producer.AGENT
+        if not producer.is_ingestible:
+            # An `approval.*` or orchestrator event arriving over ingest is
+            # not late news, it is a forgery - and `approval.granted` folds a
+            # step to `ready`, which `advance()` then dispatches. Refused on
+            # the type alone, before anything is looked up.
+            raise PermissionDeniedError(
+                f"Events of type '{envelope.type}' are not accepted from an API key",
+                event_type=envelope.type,
+                producer=producer.value,
+                index=index,
+            )
+
         agent_key = envelope.correlation.agent_key or (
             envelope.subject.ref if envelope.subject.kind == "agent" else None
         )
@@ -219,6 +240,40 @@ class IngestService:
                 index=index,
             )
         return envelope
+
+    async def _check_step_ownership(
+        self,
+        principal: KeyPrincipal,
+        events: EventRepository,
+        envelope: EventEnvelope,
+        index: int,
+    ) -> None:
+        """A step outcome may only be reported by the agent holding the step.
+
+        The narrow half of D1. `workflow.step_succeeded` and `step_failed` are
+        how a `dispatchable` agent reports work it was handed, so they cannot
+        be refused outright - but an unscoped allowance would let any key
+        settle any step, with any `output`, and the next step reads that
+        output through the expression language.
+
+        The check is here rather than in `_validated` because it needs the
+        step's current state, and it runs before `append` so a refused event
+        is not stored. Every failure is the same 403, deliberately: which of
+        "no such step", "not dispatched" and "dispatched elsewhere" applies
+        would describe someone else's execution graph.
+        """
+        spec = spec_for(envelope.type)
+        if spec is None or spec.producer is not Producer.AGENT_FOR_DISPATCHED_STEP:
+            return
+
+        holder = await events.dispatched_step_agent(envelope.subject.ref)
+        if holder is None or not principal.may_act_as(holder):
+            raise PermissionDeniedError(
+                "This key may not report an outcome for that step",
+                event_type=envelope.type,
+                step_ref=envelope.subject.ref,
+                index=index,
+            )
 
     def _reject_repeats_within_batch(self, envelopes: Sequence[EventEnvelope]) -> None:
         """Two events with one key in one batch is a producer bug.
