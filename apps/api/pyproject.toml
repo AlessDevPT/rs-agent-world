@@ -160,6 +160,44 @@ forbidden_modules = [
 ]
 
 [[tool.importlinter.contracts]]
+# K15: a provider SDK may be imported only by the package that implements
+# that provider. The contract has teeth even though none of these packages
+# is currently installed - import-linter reads the source rather than
+# importing it, so a planted `import anthropic` is caught statically.
+#
+# `infra.providers` is not a source module here, which is the exemption and
+# the only one. Everything else, including the rest of `infra`, is covered:
+# a worker that reaches for an SDK directly would get a client this system
+# does not control and a response shape the domain would then learn.
+name = "Provider SDKs stay inside infra/providers"
+type = "forbidden"
+source_modules = [
+    "agentworld.api",
+    "agentworld.services",
+    "agentworld.repositories",
+    "agentworld.domain",
+    "agentworld.adapters",
+    "agentworld.workers",
+    "agentworld.infra.net",
+    "agentworld.infra.auth",
+    "agentworld.infra.secrets",
+]
+forbidden_modules = [
+    "anthropic",
+    "openai",
+    # `google.generativeai` cannot be named: import-linter refuses a
+    # subpackage of an external package. `google` as a whole is too broad to
+    # forbid, so the Gemini SDK is covered by the vendor-name search test
+    # rather than by this contract. Stated here so the gap is known rather
+    # than assumed closed.
+    "boto3",
+    "langchain",
+    "langgraph",
+    "litellm",
+]
+allow_indirect_imports = true
+
+[[tool.importlinter.contracts]]
 # 06-OUTBOUND-SECURITY.md section 2: one client, so there is one place to
 # review and one place that can be wrong. A worker or a tool that builds its
 # own httpx client gets no address validation and no connection pinning, and
