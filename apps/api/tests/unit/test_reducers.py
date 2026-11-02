@@ -40,6 +40,12 @@ from agentworld.domain.reducers import (
     fold,
 )
 from agentworld.domain.reducers import fold as fold_module
+from agentworld.domain.reducers.fold import (
+    _SETTLED_EXECUTIONS,
+    _SETTLED_RUN_STEPS,
+    _SETTLED_RUNS,
+    _SETTLED_STEPS,
+)
 
 AT = "2026-11-04T07:00:11.204Z"
 WHEN = dt.datetime(2026, 11, 4, 7, 0, 11, 204000, tzinfo=dt.UTC)
@@ -320,6 +326,7 @@ def test_a_trace_step_appends_then_patches_and_counts() -> None:
                 "status": StepStatus.RUNNING,
                 "input": None,
                 "started_at": WHEN,
+                "last_event_at": WHEN,
             },
         ),
     )
@@ -345,7 +352,9 @@ def test_a_failed_run_records_when_and_why() -> None:
         "status": RunStatus.FAILED,
         "finished_at": WHEN,
         "error": {"code": "rate_limited"},
+        "last_event_at": WHEN,
     }
+    assert patch.not_before == ("last_event_at", WHEN)
 
 
 # ------------------------------------------------------------------- the tool ---
@@ -373,7 +382,11 @@ def test_a_tool_call_with_no_run_folds_to_nothing() -> None:
 
 def test_an_execution_records_its_own_life_cycle() -> None:
     started = folded("workflow.execution_started", "workflow_execution", "exec-1")[0]
-    assert started.fields == {"status": ExecutionStatus.RUNNING, "started_at": WHEN}
+    assert started.fields == {
+        "status": ExecutionStatus.RUNNING,
+        "started_at": WHEN,
+        "last_event_at": WHEN,
+    }
 
     completed = folded(
         "workflow.execution_completed", "workflow_execution", "exec-1", {"output": {"n": 4}}
@@ -388,7 +401,9 @@ def test_pausing_an_execution_does_not_finish_it() -> None:
     """`paused` is live, so writing `finished_at` would make a resumable
     execution look over."""
     patch = folded("workflow.execution_paused", "workflow_execution", "exec-1")[0]
-    assert patch.fields == {"status": ExecutionStatus.PAUSED}
+    assert patch.fields == {"status": ExecutionStatus.PAUSED, "last_event_at": WHEN}
+    # And `paused` is not in the settled set, so a resume can still move it.
+    assert "paused" not in patch.unless[1]
 
 
 def test_a_step_ref_splits_on_the_first_colon() -> None:
@@ -407,6 +422,7 @@ def test_a_retry_clears_the_previous_failure() -> None:
         "error": None,
         "finished_at": None,
         "attempt": 2,
+        "last_event_at": WHEN,
     }
 
 
@@ -429,13 +445,20 @@ def test_granting_an_approval_readies_the_step_and_dispatches_nothing() -> None:
         execution_step_ref="exec-1:post",
         execution_ref="exec-1",
     )
-    assert mutations == (Patch(StepRef("exec-1", "post"), {"status": StepStatus.READY}),)
+    assert mutations == (
+        Patch(
+            StepRef("exec-1", "post"),
+            {"status": StepStatus.READY, "last_event_at": WHEN},
+            not_before=("last_event_at", WHEN),
+            unless=_SETTLED_STEPS,
+        ),
+    )
     assert all(m.target is not MutationTarget.WORKFLOW_EXECUTIONS for m in mutations)
 
 
 def test_a_requested_approval_shows_which_step_is_waiting() -> None:
     patch = folded("approval.requested", "approval", "appr-1", execution_step_ref="exec-1:post")[0]
-    assert patch.fields == {"status": StepStatus.WAITING_APPROVAL}
+    assert patch.fields == {"status": StepStatus.WAITING_APPROVAL, "last_event_at": WHEN}
 
 
 @pytest.mark.parametrize("decision", ["denied", "expired"])
@@ -602,8 +625,16 @@ def test_every_patch_that_moves_current_state_is_guarded() -> None:
     """A patch with no guard is one a stale event can win.
 
     Checked over every folding type rather than per reducer, because the
-    reducer most likely to forget is the one written next. Run steps and
-    execution steps are exempt and say why below.
+    reducer most likely to forget is the one written next.
+
+    This test used to exempt `runs`, `run_steps`, `workflow_executions` and
+    `execution_steps` on the grounds that their events come from the
+    orchestrator rather than from a worker flushing a backlog. The exemption
+    was wrong twice over: a `dispatchable` agent reports its own step
+    outcomes, so those events *do* come over ingest; and `advance()` reads a
+    step's status to decide what happens next, so a reverted status is a
+    re-dispatch rather than a wrong colour. Migration 0017 gave all four the
+    column, and the list below is now empty rather than populated.
     """
     unguarded: list[str] = []
     for event_type, spec in KNOWN_EVENTS.items():
@@ -631,11 +662,57 @@ def test_every_patch_that_moves_current_state_is_guarded() -> None:
             if isinstance(mutation, Patch) and mutation.not_before is None:
                 unguarded.append(f"{event_type} -> {mutation.target.value}")
 
-    # `runs`, `run_steps`, `workflow_executions` and `execution_steps` carry
-    # no "as of when do we know this" column yet. Their events come from the
-    # orchestrator and its runners rather than from a worker flushing a
-    # backlog, so the exposure is different - but it is an exemption, not an
-    # absence of risk, and it is listed here so it cannot be forgotten.
-    exempt_targets = {"runs", "run_steps", "workflow_executions", "execution_steps"}
-    surprising = [entry for entry in unguarded if entry.split(" -> ")[1] not in exempt_targets]
-    assert surprising == [], f"these patches can be overwritten by a stale event: {surprising}"
+    assert unguarded == [], f"these patches can be overwritten by a stale event: {unguarded}"
+
+
+def test_only_a_retry_may_reopen_a_settled_step() -> None:
+    """The monotonicity guard, and its one deliberate exception.
+
+    A timestamp guard is not enough on its own: `not_before` compares with
+    `<=`, so two events stamped with the same `occurred_at` both apply and the
+    last one wins. `Patch.unless` closes that by refusing to touch a status
+    that is already final - except for `workflow.step_retried`, which exists
+    to reopen one.
+    """
+    unprotected: list[str] = []
+    for event_type, spec in KNOWN_EVENTS.items():
+        if "execution_steps" not in spec.folds_into:
+            continue
+        kind = spec.subjects[0].value
+        for mutation in folded(
+            event_type,
+            kind,
+            "exec-1:post",
+            {},
+            **({"execution_step_ref": "exec-1:post"} if kind == "approval" else {}),
+        ):
+            if (
+                isinstance(mutation, Patch)
+                and mutation.target is MutationTarget.EXECUTION_STEPS
+                and mutation.unless is None
+            ):
+                unprotected.append(event_type)
+
+    assert unprotected == ["workflow.step_retried"], (
+        "exactly one step patch may reopen a settled step, and it is the retry"
+    )
+
+
+def test_a_retry_keeps_its_timestamp_guard() -> None:
+    """Dropping `unless` must not have dropped the other guard with it."""
+    (patch,) = folded("workflow.step_retried", "execution_step", "exec-1:post", {"attempt": 2})
+    assert patch.unless is None
+    assert patch.not_before == ("last_event_at", WHEN)
+
+
+def test_the_settled_sets_name_the_right_enum() -> None:
+    """`run_steps.status` is `run_status`, not `step_status`.
+
+    A status string from the wrong enum would never match, so the guard would
+    be silently inert - the failure mode this whole work item exists to stop.
+    """
+    assert _SETTLED_RUN_STEPS == _SETTLED_RUNS
+    assert "skipped" not in _SETTLED_RUN_STEPS[1]
+    assert "skipped" in _SETTLED_STEPS[1]
+    assert "paused" not in _SETTLED_EXECUTIONS[1]
+    assert "completed" in _SETTLED_EXECUTIONS[1]

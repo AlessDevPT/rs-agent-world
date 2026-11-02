@@ -179,6 +179,19 @@ class Patch:
     #: `(column, when)` - apply only if the row's `column` is null or not
     #: already newer than `when`. See the note below.
     not_before: tuple[str, dt.datetime] | None = None
+    #: `(column, values)` - refuse the patch when the row's `column` already
+    #: holds one of `values`.
+    #:
+    #: Separate from `not_before` because time is the wrong invariant for a
+    #: status that is meant to be final. `not_before` compares with `<=`, so
+    #: two events carrying the same `occurred_at` both apply and the last one
+    #: wins; a producer that stamps a whole batch with one timestamp could
+    #: therefore still revert a step that has already succeeded. Monotonicity
+    #: on the status itself does not have that gap.
+    #:
+    #: `workflow.step_retried` deliberately carries no `unless`: reopening a
+    #: terminal step is exactly what a retry is for.
+    unless: tuple[str, frozenset[str]] | None = None
 
     @property
     def target(self) -> MutationTarget:

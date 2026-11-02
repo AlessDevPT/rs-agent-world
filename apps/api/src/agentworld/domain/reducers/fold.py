@@ -49,6 +49,34 @@ from agentworld.domain.reducers.mutations import (
 #: reader can tell it apart from a reducer that forgot to return.
 _NOTHING: Final[tuple[Mutation, ...]] = ()
 
+# -------------------------------------------------- the monotonicity sets ---
+#
+# What `Patch.unless` is given: the statuses that are already final, so a late
+# or duplicate event cannot reopen them. Four sets rather than one, because
+# four different native enums are involved and a status string from the wrong
+# one would silently never match.
+#
+# These are *settled* rather than *terminal* in the type's sense: an execution
+# that is `paused` may still progress, so it is not here.
+
+_Settled = tuple[str, frozenset[str]]
+
+_SETTLED_RUNS: Final[_Settled] = (
+    "status",
+    frozenset({RunStatus.SUCCEEDED, RunStatus.FAILED, RunStatus.CANCELLED}),
+)
+#: `run_steps.status` is the `run_status` enum, not `step_status`, so it shares
+#: the set above rather than the step one below.
+_SETTLED_RUN_STEPS: Final[_Settled] = _SETTLED_RUNS
+_SETTLED_EXECUTIONS: Final[_Settled] = (
+    "status",
+    frozenset(status for status in ExecutionStatus if not status.is_live),
+)
+_SETTLED_STEPS: Final[_Settled] = (
+    "status",
+    frozenset(status for status in StepStatus if status.is_terminal),
+)
+
 
 #: Every reducer has this shape, which is also the whole of what a reducer
 #: may do: envelope in, mutations out, no second argument to reach through.
@@ -246,11 +274,27 @@ def _run(envelope: EventEnvelope) -> tuple[Mutation, ...]:
     name = envelope.type.split(".", 1)[1]
     run = RunRef(run_ref=envelope.subject.ref)
     payload = envelope.payload
+    seen = {"last_event_at": envelope.occurred_at}
+    fresh = ("last_event_at", envelope.occurred_at)
 
     if name == "started":
-        return (Patch(run, {"status": RunStatus.RUNNING, "started_at": envelope.occurred_at}),)
+        return (
+            Patch(
+                run,
+                {"status": RunStatus.RUNNING, "started_at": envelope.occurred_at, **seen},
+                not_before=fresh,
+                unless=_SETTLED_RUNS,
+            ),
+        )
     if name == "finished":
-        return (Patch(run, {"status": RunStatus.SUCCEEDED, "finished_at": envelope.occurred_at}),)
+        return (
+            Patch(
+                run,
+                {"status": RunStatus.SUCCEEDED, "finished_at": envelope.occurred_at, **seen},
+                not_before=fresh,
+                unless=_SETTLED_RUNS,
+            ),
+        )
     if name == "failed":
         return (
             Patch(
@@ -259,7 +303,10 @@ def _run(envelope: EventEnvelope) -> tuple[Mutation, ...]:
                     "status": RunStatus.FAILED,
                     "finished_at": envelope.occurred_at,
                     "error": _error(payload),
+                    **seen,
                 },
+                not_before=fresh,
+                unless=_SETTLED_RUNS,
             ),
         )
 
@@ -279,6 +326,7 @@ def _run(envelope: EventEnvelope) -> tuple[Mutation, ...]:
                     "status": StepStatus.RUNNING,
                     "input": payload.get("input"),
                     "started_at": envelope.occurred_at,
+                    **seen,
                 },
             ),
         )
@@ -292,7 +340,10 @@ def _run(envelope: EventEnvelope) -> tuple[Mutation, ...]:
                     "output": payload.get("output"),
                     "error": _error(payload),
                     "finished_at": envelope.occurred_at,
+                    **seen,
                 },
+                not_before=fresh,
+                unless=_SETTLED_RUN_STEPS,
             ),
             # `runs.step_count` is a counter rather than a query, because the
             # island reads it per frame and counting rows per agent per frame
@@ -354,10 +405,12 @@ def _workflow(envelope: EventEnvelope) -> tuple[Mutation, ...]:
     """
     name = envelope.type.split(".", 1)[1]
     payload = envelope.payload
+    seen = {"last_event_at": envelope.occurred_at}
+    fresh = ("last_event_at", envelope.occurred_at)
 
     if (status := _EXECUTION_STATUS.get(name)) is not None:
         selector = ExecutionRef(execution_ref=envelope.subject.ref)
-        fields: dict[str, Any] = {"status": status}
+        fields: dict[str, Any] = {"status": status, **seen}
         if name == "execution_started":
             fields["started_at"] = envelope.occurred_at
         if not status.is_live:
@@ -366,7 +419,7 @@ def _workflow(envelope: EventEnvelope) -> tuple[Mutation, ...]:
             fields["output"] = output
         if error := _error(payload):
             fields["error"] = error
-        return (Patch(selector, fields),)
+        return (Patch(selector, fields, not_before=fresh, unless=_SETTLED_EXECUTIONS),)
 
     step_status = _STEP_STATUS.get(name)
     if step_status is None and name != "step_retried":
@@ -383,12 +436,20 @@ def _workflow(envelope: EventEnvelope) -> tuple[Mutation, ...]:
 
     if name == "step_retried":
         attempt = payload.get("attempt")
-        fields = {"status": StepStatus.READY, "error": None, "finished_at": None}
+        fields = {
+            "status": StepStatus.READY,
+            "error": None,
+            "finished_at": None,
+            **seen,
+        }
         if isinstance(attempt, int) and not isinstance(attempt, bool) and attempt >= 0:
             fields["attempt"] = attempt
-        return (Patch(step, fields),)
+        # No `unless`. Every other step patch refuses to touch a settled step;
+        # this one exists precisely to reopen one, and a retry that could not
+        # would make the whole retry path a no-op against a failed step.
+        return (Patch(step, fields, not_before=fresh),)
 
-    fields = {"status": step_status}
+    fields = {"status": step_status, **seen}
     if name == "step_started":
         fields["started_at"] = envelope.occurred_at
     if step_status in (StepStatus.SUCCEEDED, StepStatus.FAILED, StepStatus.SKIPPED):
@@ -397,7 +458,7 @@ def _workflow(envelope: EventEnvelope) -> tuple[Mutation, ...]:
         fields["output"] = output
     if error := _error(payload):
         fields["error"] = error
-    return (Patch(step, fields),)
+    return (Patch(step, fields, not_before=fresh, unless=_SETTLED_STEPS),)
 
 
 # ----------------------------------------------------------------- approval ---
@@ -426,11 +487,27 @@ def _approval(envelope: EventEnvelope) -> tuple[Mutation, ...]:
 
     selector = StepRef(execution_ref=reference.execution_ref, step_key=reference.step_key)
     name = envelope.type.split(".", 1)[1]
+    seen = {"last_event_at": envelope.occurred_at}
+    fresh = ("last_event_at", envelope.occurred_at)
 
     if name == "requested":
-        return (Patch(selector, {"status": StepStatus.WAITING_APPROVAL}),)
+        return (
+            Patch(
+                selector,
+                {"status": StepStatus.WAITING_APPROVAL, **seen},
+                not_before=fresh,
+                unless=_SETTLED_STEPS,
+            ),
+        )
     if name == "granted":
-        return (Patch(selector, {"status": StepStatus.READY}),)
+        return (
+            Patch(
+                selector,
+                {"status": StepStatus.READY, **seen},
+                not_before=fresh,
+                unless=_SETTLED_STEPS,
+            ),
+        )
     if name in ("denied", "expired"):
         return (
             Patch(
@@ -443,7 +520,10 @@ def _approval(envelope: EventEnvelope) -> tuple[Mutation, ...]:
                         "message": _text(envelope.payload.get("reason"))
                         or f"the approval was {name}",
                     },
+                    **seen,
                 },
+                not_before=fresh,
+                unless=_SETTLED_STEPS,
             ),
         )
     return _NOTHING

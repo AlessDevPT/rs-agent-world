@@ -16,7 +16,12 @@ rediscover:
    Skew in the other direction is recorded and accepted: being late is normal.
 4. **Dedupe, then allocate `seq`.** This way round, so a duplicate costs no
    sequence number - a gap is cheap but a gap caused by every retry is a
-   cursor that outruns its data.
+   cursor that outruns its data. The project's cursor row is locked *before*
+   the first dedup check rather than on the first accepted event: dedup is a
+   read followed by a write, so two concurrent batches carrying one
+   `dedup_key` would otherwise both find nothing and the loser would hit the
+   partition's unique index, failing the whole batch instead of reporting a
+   duplicate. Migration 0015 already called this serialised; it now is.
 5. **Append, fold, apply - in one transaction.** The event row, the state it
    implies and nothing else, so there is no moment where the log claims
    something the state does not show.
@@ -119,6 +124,13 @@ class IngestService:
         async with self._factory.begin(visible_workspaces={principal.workspace_id}) as work:
             events = work.events(scope)
             derived = work.derived(scope)
+
+            # Before the first `seen()`, not lazily on the first accepted
+            # event. Dedup is a read followed by a write, so it is only sound
+            # if nothing else is writing this project's events meanwhile -
+            # and the partition's unique index would otherwise catch the race
+            # by aborting the whole batch rather than reporting a duplicate.
+            await events.lock_project_cursor()
 
             for envelope in envelopes:
                 if await events.seen(envelope.dedup_key):

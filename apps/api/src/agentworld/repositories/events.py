@@ -68,6 +68,26 @@ class ResolvedRefs:
 class EventRepository(ScopedRepository):
     """The `events` table, pinned to one project."""
 
+    async def lock_project_cursor(self) -> None:
+        """Take this project's ingest lock for the rest of the transaction.
+
+        `next_seq` already locks the cursor row, but it is only reached for
+        the *first event that is not a duplicate* - so the dedup check ran
+        unserialised, and an all-duplicate batch took no lock at all. Two
+        concurrent batches carrying one `dedup_key` could therefore both see
+        `seen() is False`, and the second would lose to the partition's
+        unique index mid-transaction, failing the whole batch instead of
+        reporting one duplicate.
+
+        Calling this once before the loop is what migration 0015 already
+        says the design is: a project's ingest is serialised. The lock was
+        simply being taken too late to serialise the part that needed it.
+
+        Idempotent within a transaction - taking a row lock twice is free -
+        so `next_seq` keeps its own and remains correct when called alone.
+        """
+        await self._ensure_cursor()
+
     async def next_seq(self) -> int:
         """Reserve this project's next sequence number.
 
@@ -78,25 +98,31 @@ class EventRepository(ScopedRepository):
         all the work of folding its events.
         """
         project_id = self.scope.require_project()
-
-        await self._session.execute(
-            sa.dialects.postgresql.insert(m.ProjectEventCursor)
-            .values(workspace_id=self.scope.workspace_id, project_id=project_id, next_seq=1)
-            .on_conflict_do_nothing(index_elements=["project_id"])
-        )
-        current = (
-            await self._session.execute(
-                sa.select(m.ProjectEventCursor.next_seq)
-                .where(m.ProjectEventCursor.project_id == project_id)
-                .with_for_update()
-            )
-        ).scalar_one()
+        current = await self._ensure_cursor()
         await self._session.execute(
             sa.update(m.ProjectEventCursor)
             .where(m.ProjectEventCursor.project_id == project_id)
             .values(next_seq=current + 1, updated_at=sa.func.now())
         )
         return int(current)
+
+    async def _ensure_cursor(self) -> int:
+        """Create the cursor row if absent, lock it, and return `next_seq`."""
+        project_id = self.scope.require_project()
+        await self._session.execute(
+            sa.dialects.postgresql.insert(m.ProjectEventCursor)
+            .values(workspace_id=self.scope.workspace_id, project_id=project_id, next_seq=1)
+            .on_conflict_do_nothing(index_elements=["project_id"])
+        )
+        return int(
+            (
+                await self._session.execute(
+                    sa.select(m.ProjectEventCursor.next_seq)
+                    .where(m.ProjectEventCursor.project_id == project_id)
+                    .with_for_update()
+                )
+            ).scalar_one()
+        )
 
     async def seen(self, dedup_key: str) -> bool:
         """Whether this project already holds an event with that key.

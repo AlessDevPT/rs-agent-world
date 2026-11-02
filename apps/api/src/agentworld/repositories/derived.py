@@ -87,6 +87,12 @@ class DerivedStateRepository(ScopedRepository):
             column = getattr(table, column_name)
             # Null means nothing has been recorded yet, so anything is newer.
             where = sa.and_(where, sa.or_(column.is_(None), column <= when))
+        if mutation.unless is not None:
+            column_name, values = mutation.unless
+            column = getattr(table, column_name)
+            # `notin_` and not `!=`: the column is a native enum, and the
+            # comparison has to hold for every member of the forbidden set.
+            where = sa.and_(where, column.notin_(sorted(values)))
         return await self._rows(sa.update(table).where(where).values(**fields))
 
     async def _increment(self, mutation: Increment) -> int:

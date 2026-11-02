@@ -852,6 +852,10 @@ class WorkflowExecution(Base):
     started_at: Mapped[dt.datetime | None]
     finished_at: Mapped[dt.datetime | None]
     created_at: Mapped[dt.datetime] = _created_at()
+    #: As of when we know this row's state, for the staleness guard in
+    #: `repositories.derived`. Null means nothing has been folded yet,
+    #: so any event is newer - hence no default.
+    last_event_at: Mapped[dt.datetime | None]
 
     __table_args__ = (
         _project_fk("workflow_executions"),
@@ -922,6 +926,10 @@ class ExecutionStep(Base):
     error: Mapped[dict[str, Any] | None]
     started_at: Mapped[dt.datetime | None]
     finished_at: Mapped[dt.datetime | None]
+    #: As of when we know this row's state, for the staleness guard in
+    #: `repositories.derived`. Null means nothing has been folded yet,
+    #: so any event is newer - hence no default.
+    last_event_at: Mapped[dt.datetime | None]
 
     __table_args__ = (
         _project_fk("execution_steps"),
@@ -1226,6 +1234,10 @@ class Run(Base):
     error: Mapped[dict[str, Any] | None]
     started_at: Mapped[dt.datetime] = _created_at()
     finished_at: Mapped[dt.datetime | None]
+    #: As of when we know this row's state, for the staleness guard in
+    #: `repositories.derived`. Null means nothing has been folded yet,
+    #: so any event is newer - hence no default.
+    last_event_at: Mapped[dt.datetime | None]
     #: Computed by PostgreSQL, so no writer can disagree with it.
     duration_ms: Mapped[int | None] = mapped_column(
         sa.Integer, sa.Computed(DURATION_MS, persisted=True)
@@ -1272,6 +1284,10 @@ class RunStep(Base):
     error: Mapped[dict[str, Any] | None]
     started_at: Mapped[dt.datetime] = _created_at()
     finished_at: Mapped[dt.datetime | None]
+    #: As of when we know this row's state, for the staleness guard in
+    #: `repositories.derived`. Null means nothing has been folded yet,
+    #: so any event is newer - hence no default.
+    last_event_at: Mapped[dt.datetime | None]
 
     __table_args__ = (
         _project_fk("run_steps"),
