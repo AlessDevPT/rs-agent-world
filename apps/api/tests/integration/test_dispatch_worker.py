@@ -64,6 +64,10 @@ class FakeProvider:
     port: int = 0
     status: int = 200
     delay: float = 0.0
+    #: Extra response headers. `Retry-After` is why this exists: T6a needs
+    #: the provider to ask for a specific delay, and without it the
+    #: assertion passes against the fallback backoff instead.
+    extra_headers: dict[str, str] = field(default_factory=dict)
     requests: list[dict[str, str]] = field(default_factory=list)
 
     @property
@@ -111,8 +115,9 @@ async def provider() -> AsyncIterator[FakeProvider]:
 
         if state.delay:
             await asyncio.sleep(state.delay)
+        extra = "".join(f"{k}: {v}\r\n" for k, v in state.extra_headers.items())
         writer.write(
-            f"HTTP/1.1 {state.status} X\r\nContent-Type: application/json\r\n"
+            f"HTTP/1.1 {state.status} X\r\nContent-Type: application/json\r\n{extra}"
             f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n".encode()
             + body
         )

@@ -247,6 +247,31 @@ def test_settings_are_immutable(isolated_settings: SettingsFactory) -> None:
         s.environment = "production"  # type: ignore[misc]
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("reaper_interval_seconds", 0),
+        ("reaper_interval_seconds", 3601),
+        ("reaper_batch_limit", 0),
+        ("reaper_batch_limit", 10_001),
+        ("reaper_max_consecutive_errors", 0),
+        ("reaper_max_consecutive_errors", 101),
+    ],
+)
+def test_the_reaper_settings_are_bounded(
+    isolated_settings: SettingsFactory, field: str, value: int
+) -> None:
+    """A misconfigured reaper fails at boot rather than at the first sweep.
+
+    An interval of 0 would spin, and one of a day would leave crashed work
+    idle for a day. The non-vacuity pass asked for this test: removing the
+    `Field(ge=..., le=...)` bounds broke nothing, because nothing had ever
+    asserted them.
+    """
+    with pytest.raises(ValidationError):
+        isolated_settings(**{field: value})
+
+
 @pytest.mark.parametrize("value", [0, 4, 3601])
 def test_heartbeat_ttl_is_bounded(isolated_settings: SettingsFactory, value: int) -> None:
     with pytest.raises(ValidationError):

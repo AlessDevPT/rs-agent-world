@@ -71,6 +71,23 @@ class Settings(BaseSettings):
     ingest_max_batch_events: int = Field(default=500, ge=1, le=5_000)
     ingest_max_future_skew_seconds: int = Field(default=300, ge=0)
 
+    #: How often the reaper sweeps for expired leases. A quarter of the
+    #: 120-second lease, so a crashed worker's dispatch moves within about a
+    #: quarter of the window rather than at the end of it. An interval longer
+    #: than the lease leaves a gap in which a row is expired and nothing has
+    #: noticed - not corruption, since every guard is on the row rather than
+    #: on the schedule, but delay nobody chose.
+    reaper_interval_seconds: int = Field(default=30, ge=1, le=3600)
+    #: Expired leases taken back per workspace per sweep. Promoted from the
+    #: repository's own default so a backlog can be drained faster without a
+    #: code change.
+    reaper_batch_limit: int = Field(default=100, ge=1, le=10_000)
+    #: Consecutive failed sweeps before the loop exits non-zero. A reaper
+    #: spinning against a database that is refusing it is a reaper nobody
+    #: notices; exiting hands the problem to the supervisor, where it is
+    #: visible.
+    reaper_max_consecutive_errors: int = Field(default=5, ge=1, le=100)
+
     cors_origins: str = "http://localhost:3000"
 
     otel_exporter_otlp_endpoint: str = ""

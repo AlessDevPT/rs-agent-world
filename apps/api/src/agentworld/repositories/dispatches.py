@@ -74,6 +74,28 @@ class ClaimedDispatch:
     leased_until: dt.datetime
 
 
+@dataclass(frozen=True, slots=True)
+class ExpiredLease:
+    """A lease whose worker is gone, and what it was doing.
+
+    Everything here is read before `reclaim` overwrites it. The pair that
+    matters most is `side_effect_in_flight` - which decides retry versus
+    escalate - and `previous_error`, which is the history a recovery would
+    otherwise destroy.
+    """
+
+    id: UUID
+    #: True when `side_effect_started_at` was set: the call was in flight and
+    #: **nobody knows whether it landed**.
+    side_effect_in_flight: bool
+    attempt: int
+    max_attempts: int
+    claim_count: int
+    leased_by: str | None
+    previous_error: str | None
+    previous_error_code: str | None
+
+
 class DispatchClaimRepository(ScopedRepository):
     """Claiming work **inside one workspace**, and nothing wider.
 
@@ -255,13 +277,18 @@ class DispatchClaimRepository(ScopedRepository):
         ).scalar_one_or_none()
         return updated is not None
 
-    async def expire_leases(self, *, limit: int = 100) -> Sequence[tuple[UUID, bool, int, int]]:
-        """Take back every lease that has run out. The reaper's one statement.
+    async def expire_leases(self, *, limit: int = 100) -> Sequence[ExpiredLease]:
+        """Take back every lease that has run out. The reaper's one query.
 
-        Returns `(id, side_effect_was_in_flight, attempt, max_attempts)` per
-        row so the caller can decide what each one becomes without a second
-        query. The decision is not made here, because "retry or escalate" is
-        policy and this is storage.
+        Returns everything the caller needs to decide what each row becomes
+        *and* to record what it was, so the recovery needs no second read.
+        The decision itself is not made here - "retry or escalate" is policy
+        and this is storage.
+
+        `previous_error` and `previous_error_code` are carried out because
+        `reclaim` is about to overwrite them. Without that, a second recovery
+        erases the first and the only record of why a dispatch has been round
+        twice is gone.
         """
         rows = (
             await self._session.execute(
@@ -270,6 +297,10 @@ class DispatchClaimRepository(ScopedRepository):
                     m.Dispatch.side_effect_started_at.is_not(None).label("in_flight"),
                     m.Dispatch.attempt,
                     m.Dispatch.max_attempts,
+                    m.Dispatch.claim_count,
+                    m.Dispatch.leased_by,
+                    m.Dispatch.last_error,
+                    m.Dispatch.last_error_code,
                 )
                 .where(
                     m.Dispatch.workspace_id == self.scope.workspace_id,
@@ -281,7 +312,19 @@ class DispatchClaimRepository(ScopedRepository):
                 .with_for_update(skip_locked=True)
             )
         ).all()
-        return [(row.id, bool(row.in_flight), row.attempt, row.max_attempts) for row in rows]
+        return [
+            ExpiredLease(
+                id=row.id,
+                side_effect_in_flight=bool(row.in_flight),
+                attempt=row.attempt,
+                max_attempts=row.max_attempts,
+                claim_count=row.claim_count,
+                leased_by=row.leased_by,
+                previous_error=row.last_error,
+                previous_error_code=row.last_error_code,
+            )
+            for row in rows
+        ]
 
     async def reclaim(self, dispatch_id: UUID, *, status: DispatchStatus, reason: str) -> bool:
         """Move an expired lease to whatever the reaper decided.

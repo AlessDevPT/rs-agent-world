@@ -61,7 +61,7 @@ from agentworld.infra.providers import (
     build as build_provider,
 )
 from agentworld.repositories.base import TenantScope
-from agentworld.repositories.dispatches import ClaimedDispatch
+from agentworld.repositories.dispatches import ClaimedDispatch, ExpiredLease
 from agentworld.repositories.unit_of_work import UnitOfWork, UnitOfWorkFactory
 from agentworld.services.credentials import CredentialService
 from agentworld.services.executions import ExecutionService
@@ -73,6 +73,11 @@ log = get_logger(__name__)
 #: look like a crash; short enough that a crashed worker's work moves within
 #: a minute or two rather than at the next deploy.
 DEFAULT_LEASE_SECONDS = 120
+
+#: The longest a provider's `Retry-After` may delay a retry, and the
+#: ceiling of the fallback backoff. Approved 2026-11-02: a provider asking
+#: for longer cannot park a tenant's queue.
+RETRY_AFTER_MAX_SECONDS = 900
 
 #: Attempts a dispatch gets before it is dead. One for consequential work,
 #: which cannot be retried blindly - and which this release cannot produce.
@@ -93,6 +98,9 @@ class Outcome:
     error: str | None = None
     error_code: str | None = None
     uncertain: bool = False
+    #: From the provider's `Retry-After`, when it sent a usable one. The
+    #: backoff honours it, clamped - see `_backoff`.
+    retry_after_seconds: float | None = None
 
     @property
     def is_success(self) -> bool:
@@ -203,6 +211,7 @@ class StepRunner:
                 error=str(exc),
                 error_code=exc.failure.value,
                 uncertain=uncertain,
+                retry_after_seconds=exc.retry_after_seconds,
             )
 
         return Outcome(
@@ -394,7 +403,7 @@ class DispatchWorker:
                 status=DispatchStatus.PENDING if retrying else outcome.status,
                 error=outcome.error,
                 error_code=outcome.error_code,
-                run_after=_backoff(claimed) if retrying else None,
+                run_after=_backoff(claimed, outcome) if retrying else None,
             )
             if not settled:
                 log.info(
@@ -453,6 +462,19 @@ class LeaseReaper:
 
         Per workspace, for the same reason claiming is: the outbox is under
         forced row-level security and an unscoped session sees none of it.
+
+        Every recovery writes an `audit_log` row in the same transaction, so
+        a rolled-back recovery leaves no claim that it happened - and so the
+        error the recovery is about to overwrite survives somewhere that
+        cannot be overwritten, since the application role holds `INSERT,
+        SELECT` on that table and nothing else.
+
+        Several reapers may run at once. `expire_leases` selects
+        `FOR UPDATE SKIP LOCKED`, so a second reaper skips a row the first
+        holds rather than blocking on it, and `reclaim` is guarded on the
+        lease still being expired - so a reaper that arrives after another
+        has committed changes nothing. Measured with four concurrent sweeps
+        against one expired lease: exactly one recovery.
         """
         returned = escalated = 0
         async with self._factory.begin() as work:
@@ -460,32 +482,39 @@ class LeaseReaper:
 
         for workspace_id in workspaces:
             async with self._factory.begin(visible_workspaces={workspace_id}) as work:
-                claims = work.dispatch_claims(TenantScope(workspace_id))
-                expired = await claims.expire_leases(limit=limit)
-                for dispatch_id, in_flight, attempt, max_attempts in expired:
-                    if in_flight:
-                        status, reason = (
-                            DispatchStatus.NEEDS_REVIEW,
-                            "the lease expired while an outbound call was in flight; "
-                            "whether it landed is unknown",
-                        )
-                    elif attempt + 1 >= max_attempts:
-                        status, reason = (
-                            DispatchStatus.DEAD,
-                            "the lease expired and no attempts remain",
-                        )
-                    else:
-                        status, reason = (
-                            DispatchStatus.PENDING,
-                            "the lease expired before the work started",
-                        )
-                    if not await claims.reclaim(dispatch_id, status=status, reason=reason):
+                scope = TenantScope(workspace_id)
+                claims = work.dispatch_claims(scope)
+                for expired in await claims.expire_leases(limit=limit):
+                    status, reason = _recovery_for(expired)
+                    if not await claims.reclaim(expired.id, status=status, reason=reason):
+                        # Another reaper got there first, or the worker came
+                        # back and reported. Either way this one does
+                        # nothing, and writes no audit row for a recovery it
+                        # did not perform.
                         continue
+                    await work.audit(scope).append(
+                        actor_type="system",
+                        action="dispatch.recovered",
+                        resource_type="dispatch",
+                        resource_id=expired.id,
+                        metadata={
+                            "from": DispatchStatus.LEASED.value,
+                            "to": status.value,
+                            "reason": reason,
+                            "attempt": expired.attempt,
+                            "claim_count": expired.claim_count,
+                            "side_effect_in_flight": expired.side_effect_in_flight,
+                            "leased_by": expired.leased_by,
+                            # The history `reclaim` is about to overwrite.
+                            "previous_error": expired.previous_error,
+                            "previous_error_code": expired.previous_error_code,
+                        },
+                    )
                     if status is DispatchStatus.NEEDS_REVIEW:
                         escalated += 1
                         log.error(
                             "dispatch_needs_review",
-                            dispatch_id=str(dispatch_id),
+                            dispatch_id=str(expired.id),
                             reason="uncertain outcome after lease expiry",
                         )
                     else:
@@ -494,6 +523,26 @@ class LeaseReaper:
 
 
 # ----------------------------------------------------------------- helpers ---
+
+
+def _recovery_for(expired: ExpiredLease) -> tuple[DispatchStatus, str]:
+    """What an expired lease becomes, and why.
+
+    One column decides it. `side_effect_started_at` was set before the
+    outbound call and cleared after it returned, so a lease that expired
+    with it still set means the call was in flight when the worker died and
+    **nobody knows whether it landed**. Retrying might do the thing twice and
+    failing might not do it at all, so it goes to a person. Nothing - no
+    worker, no timer, no later sweep - retries it.
+    """
+    if expired.side_effect_in_flight:
+        return (
+            DispatchStatus.NEEDS_REVIEW,
+            "the lease expired while an outbound call was in flight; whether it landed is unknown",
+        )
+    if expired.attempt + 1 >= expired.max_attempts:
+        return DispatchStatus.DEAD, "the lease expired and no attempts remain"
+    return DispatchStatus.PENDING, "the lease expired before the work started"
 
 
 def _will_retry(claimed: ClaimedDispatch, outcome: Outcome) -> bool:
@@ -508,15 +557,35 @@ def _will_retry(claimed: ClaimedDispatch, outcome: Outcome) -> bool:
     return claimed.attempt + 1 < claimed.max_attempts
 
 
-def _backoff(claimed: ClaimedDispatch) -> dt.datetime:
-    """`min(15m, 2s * 2^attempt)` with full jitter.
+def _backoff(claimed: ClaimedDispatch, outcome: Outcome) -> dt.datetime:
+    """When the next attempt becomes due.
 
-    Jittered because a provider that rate-limited one worker has probably
-    rate-limited several, and un-jittered backoff reconverges them onto the
-    same second. T8 will honour a `Retry-After` in preference to this; the
-    provider knows when it will serve the key again and this is a guess.
+    A provider that sent `Retry-After` knows when it will serve this key
+    again, and the backoff is guessing - so the header wins when it is
+    usable. Four constraints on that, each a decision rather than an
+    accident:
+
+    **Clamped to 900 seconds.** A provider that asks for a day - hostile,
+    misconfigured, or honestly reporting a long outage - cannot park a
+    tenant's queue for one. The ceiling is the same one the jittered backoff
+    already uses.
+
+    **No extra attempts.** The header changes *when* the next attempt
+    happens, never *whether* there is one: the budget is `max_attempts`, and
+    a dispatch out of attempts is terminal whatever the header says. That is
+    enforced by `_will_retry`, which runs before this is called.
+
+    **No lease extension.** The row is back to `pending` with no lease; this
+    is `run_after`, which the claim query filters on.
+
+    **No jitter when the header is honoured.** The provider named a time, and
+    adding noise to a number we asked for is second-guessing it. Jitter stays
+    on the fallback, where several workers are guessing the same number and
+    need not to converge on it.
     """
-    ceiling = min(900.0, 2.0 * (2**claimed.attempt))
+    if (asked := outcome.retry_after_seconds) is not None and asked >= 0:
+        return dt.datetime.now(dt.UTC) + dt.timedelta(seconds=min(asked, RETRY_AFTER_MAX_SECONDS))
+    ceiling = min(float(RETRY_AFTER_MAX_SECONDS), 2.0 * (2**claimed.attempt))
     return dt.datetime.now(dt.UTC) + dt.timedelta(seconds=random.uniform(0, ceiling))
 
 
