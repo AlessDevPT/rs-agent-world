@@ -11,12 +11,13 @@ and hides a missed wake-up behind "it will catch up next tick".
 
 Four properties, each of which is a test rather than a claim:
 
-**Pure.** The import list is the proof: `datetime` for a type annotation,
-this package, and `domain`. No session, no client, no settings. The
-architecture contracts already forbid a framework or a provider SDK in
-`domain/`; `test_advance_imports_nothing_it_should_not` asserts the narrower
-thing, which is that this module reaches for nothing outside the domain at
-all.
+**Pure.** The import list is the proof: `collections.abc`, `enum` and
+`typing` for annotations, and `agentworld.domain`. No session, no client, no
+settings - and no `datetime` either, because nothing here needs one: `now`
+arrives on the state. The architecture contracts already forbid a framework
+or a provider SDK anywhere in `domain/`;
+`test_advance_imports_nothing_it_should_not` asserts the narrower thing, which
+is that this module reaches for nothing outside the domain at all.
 
 **Deterministic.** `now` is a field on the state, not a call. Nothing here
 generates an id - `dispatches.id` and `idempotency_token` come from database

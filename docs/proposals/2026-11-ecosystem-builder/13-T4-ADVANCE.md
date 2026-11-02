@@ -227,7 +227,66 @@ stub would break that for reasons unrelated to the test.
 
 ---
 
-## 9. Open
+## 9. Verification pass
+
+Requested after T4 was committed. Everything below was run against the final tree.
+
+### Every path that can create a dispatch row
+
+**There are none.** No statement anywhere in `src/` inserts, updates or deletes a
+`dispatches` row — verified by search, and now enforced by
+`tests/unit/test_dispatch_containment.py`, whose allow-list of permitted writers is
+**empty**. T5 adds `services/executions.py` to that list in the same commit that adds the
+writer, so the one-line diff is the moment a reviewer looks at the only code in the system
+that can cause an irreversible action.
+
+Four layers stand behind the guarantee, and they are not equally strong:
+
+| Layer | What it stops | Enforced by |
+|---|---|---|
+| `MutationTarget` has no `dispatches` member | a folded event creating work | a closed vocabulary, checked by a test |
+| `DerivedStateRepository._TABLES` is keyed by that vocabulary | the repository writing one if asked | construction |
+| `advance()` never returns `side_effect_class = consequential` | consequential work being decided at all | a constant, plus the test that reads it |
+| no statement in `src/` targets the table | anything else | the containment test |
+
+**The database is not one of those layers, and that is worth stating.** `agentworld_app`
+holds `INSERT`, `UPDATE`, `DELETE` and `SELECT` on `dispatches` — unlike `events`, which is
+append-only by privilege. It has to, because T5 and T6 will write and claim rows. Revoking
+the grant until then would be a migration that T5 immediately reverses, so the containment
+today rests on application code and tests, not on privilege. RLS is enabled and forced on
+the table, so a row written in the wrong tenant context would be invisible rather than
+harmless — but nothing writes one.
+
+### Reporting into a settled execution
+
+Two independent guards, and the verification found that they overlap:
+
+- the early return for an execution that is not live, and
+- the in-flight check in `_settle`.
+
+Removing **either** leaves all three new tests passing. Removing **both** fails all of
+them. That is a real finding about the tests rather than about the code: each guard is
+individually unnecessary for these cases and jointly load-bearing, so the honest claim is
+"the pair holds", not "each holds".
+
+What the guarantee does and does not cover:
+
+- **Covered:** a worker reporting a step outcome after the execution has completed, failed
+  or been cancelled produces **no decision**, so no new work starts and the execution is
+  not reopened. A step still `PENDING` in a cancelled execution is never dispatched.
+- **Covered elsewhere:** a late event cannot move the *execution* backwards — the
+  terminal-status guard from T0, with
+  `test_a_late_running_does_not_revive_a_finished_execution` in `test_stale_events.py`.
+- **Not covered, and deliberate:** the *step's* own status still moves. A step that was
+  dispatched before the execution failed will be recorded as succeeded when its worker
+  reports, so a failed execution can contain a succeeded step. That is accurate
+  bookkeeping — the work really did happen — and refusing it would lose the record. It is
+  stated here because "a failed execution with a succeeded step" looks like a bug in a
+  listing and is not one.
+
+---
+
+## 10. Open
 
 - **No caller.** T5 is the service that applies decisions in one transaction — event, state
   change, and for `DispatchStep` alone an outbox row. Until then `advance` is a function

@@ -668,6 +668,52 @@ def test_a_settled_or_paused_execution_decides_nothing(status: ExecutionStatus) 
     assert advance(definition, _state(status=status)) == ()
 
 
+@pytest.mark.parametrize(
+    "settled",
+    [ExecutionStatus.COMPLETED, ExecutionStatus.FAILED, ExecutionStatus.CANCELLED],
+)
+def test_a_dispatch_reporting_into_a_settled_execution_starts_nothing(
+    settled: ExecutionStatus,
+) -> None:
+    """A worker finishing after the execution ended must not restart it.
+
+    The realistic sequence: a step is dispatched, the execution fails or is
+    cancelled for another reason, and only then does the worker report. The
+    step's own outcome is recorded - it is a fact, and refusing it would
+    lose the record of work that really happened - but it must not produce a
+    decision, because a decision is how new work starts.
+
+    This is the half of the guarantee that lives here. The other half is
+    that a late event cannot move the *execution* backwards, which the
+    terminal-status guard from T0 enforces in the reducers and
+    `test_a_late_running_does_not_revive_a_finished_execution` covers.
+    """
+    definition = _definition(_agent_step("one"), _agent_step("two"))
+    for reporting in (StepStatus.SUCCEEDED, StepStatus.FAILED):
+        state = _state(
+            status=settled,
+            steps={
+                "one": StepState(status=reporting),
+                # Still out with a worker when the execution settled.
+                "two": StepState(status=StepStatus.DISPATCHED),
+            },
+        )
+        decisions = advance(definition, state)
+        assert decisions == (), f"{settled.value}/{reporting.value} produced {decisions}"
+
+
+def test_a_pending_step_in_a_settled_execution_is_never_dispatched() -> None:
+    """The case that would be worst: a step that had not started yet.
+
+    If `advance` looked at steps before it looked at the execution, a
+    cancelled execution with an untouched step would dispatch it - starting
+    work for an execution somebody had just stopped.
+    """
+    definition = _definition(_agent_step("never"))
+    state = _state(status=ExecutionStatus.CANCELLED)
+    assert advance(definition, state) == ()
+
+
 def test_a_step_in_flight_means_wait() -> None:
     for status in (
         StepStatus.READY,
