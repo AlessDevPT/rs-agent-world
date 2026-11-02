@@ -14,6 +14,8 @@ from typing import Literal
 from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from agentworld.infra import secrets
+
 Environment = Literal["local", "test", "staging", "production"]
 EventBusKind = Literal["inprocess", "redis"]
 
@@ -24,6 +26,13 @@ class Settings(BaseSettings):
         env_file_encoding="utf-8",
         extra="ignore",
         frozen=True,
+        # Without this, a pydantic validation error renders the input that
+        # failed - and the input to this model includes `CREDENTIAL_KEKS`
+        # and `API_KEY_PEPPER`. A boot failure is exactly the message most
+        # likely to be copied into a terminal, a ticket or a log aggregator,
+        # so the one error nobody can suppress must not carry key material.
+        # The field names are still named, which is all an operator needs.
+        hide_input_in_errors=True,
     )
 
     environment: Environment = "local"
@@ -48,6 +57,15 @@ class Settings(BaseSettings):
 
     api_key_pepper: str = ""
 
+    #: The key-encryption keys for `credentials`, as a JSON object of
+    #: `{"<key id>": "<base64 of 32 bytes>"}`, and the id of the one that
+    #: wraps new data keys. Both empty means the development keyring, which
+    #: `_require_secrets_when_deployed` permits only outside staging and
+    #: production. Parsed at boot by the same validator, so a malformed map
+    #: stops the process rather than the first credential write.
+    credential_keks: str = ""
+    credential_active_kek_id: str = ""
+
     default_heartbeat_ttl_seconds: int = Field(default=60, ge=5, le=3600)
     ws_replay_window_events: int = Field(default=10_000, ge=100)
     ingest_max_batch_events: int = Field(default=500, ge=1, le=5_000)
@@ -69,8 +87,26 @@ class Settings(BaseSettings):
     def cors_origin_list(self) -> list[str]:
         return [o.strip() for o in self.cors_origins.split(",") if o.strip()]
 
+    @property
+    def credential_keyring(self) -> secrets.Keyring:
+        """The KEKs this process can unwrap with.
+
+        Built on each access rather than cached: it is a few microseconds of
+        base64, `Settings` is frozen so the inputs cannot change under it,
+        and caching a keyring on a settings object would put key material in
+        a longer-lived place than it needs to be. The validator below has
+        already proved this cannot raise.
+        """
+        return secrets.load(self.credential_keks, self.credential_active_kek_id)
+
     @model_validator(mode="after")
     def _require_secrets_when_deployed(self) -> Settings:
+        # Parsed in every environment, deployed or not: a `CREDENTIAL_KEKS`
+        # that is present and malformed is a misconfiguration wherever it
+        # appears, and discovering it at the first credential write means a
+        # process that started healthy and cannot store a secret.
+        keyring = secrets.load(self.credential_keks, self.credential_active_kek_id)
+
         if not self.is_deployed:
             return self
         missing = [
@@ -79,11 +115,22 @@ class Settings(BaseSettings):
                 ("API_KEY_PEPPER", self.api_key_pepper),
                 ("SUPABASE_URL", self.supabase_url),
                 ("SUPABASE_JWKS_URL", self.supabase_jwks_url),
+                ("CREDENTIAL_KEKS", self.credential_keks),
+                ("CREDENTIAL_ACTIVE_KEK_ID", self.credential_active_kek_id),
             )
             if not value
         ]
         if missing:
             raise ValueError(f"{self.environment} requires these to be set: {', '.join(missing)}")
+        if keyring.holds_the_development_key:
+            # Unreachable through `missing` above, which only sees an empty
+            # string. This catches a deployment that pasted the development
+            # key in on purpose, which is worse than leaving the variables
+            # unset because it looks configured.
+            raise ValueError(
+                "CREDENTIAL_KEKS contains the development key; "
+                f"{self.environment} needs real key material"
+            )
         if self.event_bus != "redis":
             # More than one API worker is the norm once deployed, and the
             # in-process bus only reaches sockets held by its own worker.

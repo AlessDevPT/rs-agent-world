@@ -16,6 +16,11 @@ dependencies = [
     # [crypto] pulls in `cryptography`, without which PyJWT silently refuses
     # RS256 and every Supabase token would fail to verify.
     "pyjwt[crypto]>=2.9.0",
+    # Already present transitively through pyjwt[crypto]; named explicitly
+    # because `infra/secrets/` imports AESGCM from it directly, and a
+    # dependency you rely on through someone else's extra is one that can be
+    # dropped by a release note you did not read.
+    "cryptography>=43.0.0",
     "argon2-cffi>=23.1.0",
     "httpx>=0.27.0",
 ]
@@ -153,6 +158,29 @@ forbidden_modules = [
     "agentworld.services",
     "sqlalchemy",
 ]
+
+[[tool.importlinter.contracts]]
+# The same shape as the rule above, for the same reason. `infra/secrets/` is
+# the only module that may encrypt or decrypt credential material, so the
+# AEAD primitives are not importable anywhere else - a second call site is
+# a second AAD construction, and an AAD that differs by one byte from the
+# one that wrote the row is an unreadable credential discovered in
+# production.
+name = "Only infra/secrets handles credential ciphertext"
+type = "forbidden"
+source_modules = [
+    "agentworld.api",
+    "agentworld.services",
+    "agentworld.repositories",
+    "agentworld.domain",
+    "agentworld.adapters",
+]
+forbidden_modules = ["cryptography"]
+# Direct imports only: `repositories.credentials` imports `EncryptedBlob`
+# from `infra.secrets`, which imports `cryptography`, and the transitive
+# reading of this contract would make that - the intended arrangement - a
+# violation.
+allow_indirect_imports = true
 
 [[tool.importlinter.contracts]]
 # Persistence belongs in repositories. A service that reaches for `select()`
