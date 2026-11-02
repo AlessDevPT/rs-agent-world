@@ -14,6 +14,7 @@ somebody could forget while adding a field.
 
 from __future__ import annotations
 
+import datetime as dt
 from collections.abc import Mapping, Sequence
 from typing import Any, cast
 from uuid import UUID
@@ -594,6 +595,128 @@ class WorkflowRepository(ScopedRepository):
             )
         ).scalar_one_or_none()
         return _to_draft(row) if row is not None else None
+
+    async def publish(
+        self,
+        workflow_id: UUID,
+        *,
+        version_id: UUID,
+        steps: Sequence[Mapping[str, Any]],
+        edges: Sequence[Mapping[str, Any]],
+    ) -> dt.datetime:
+        """Freeze a draft into `workflow_steps` and `workflow_edges`.
+
+        **The order is forced by migration 0018 and is not a style choice.**
+        The trigger refuses an INSERT into either table when the version it
+        belongs to already has `published_at` set, so the graph goes in
+        first and `published_at` goes on last. Doing it the obvious way
+        round - mark it published, then write its contents - makes the
+        trigger refuse the publish's own inserts. T0 found that by breaking
+        a fixture that did exactly that.
+
+        `steps` carries `step_key`, `name`, `kind`, `agent_id`,
+        `input_mapping` and `config`; `edges` carries `from_step` and
+        `to_step` as **step keys**, which this maps to the ids it just
+        inserted. The caller works in keys because that is what the author
+        wrote; ids exist only once the rows do.
+        """
+        ids: dict[str, UUID] = {}
+        for step in steps:
+            step_id = (
+                await self._session.execute(
+                    sa.insert(m.WorkflowStep)
+                    .values(
+                        workflow_version_id=version_id,
+                        workspace_id=self.scope.workspace_id,
+                        project_id=self.scope.require_project(),
+                        step_key=step["step_key"],
+                        name=step.get("name") or step["step_key"],
+                        kind=step["kind"],
+                        agent_id=step.get("agent_id"),
+                        tool_id=step.get("tool_id"),
+                        config=dict(step.get("config") or {}),
+                        input_mapping=dict(step.get("input_mapping") or {}),
+                    )
+                    .returning(m.WorkflowStep.id)
+                )
+            ).scalar_one()
+            ids[str(step["step_key"])] = step_id
+
+        for edge in edges:
+            to_key = str(edge["to_step"])
+            from_key = edge.get("from_step")
+            await self._session.execute(
+                sa.insert(m.WorkflowEdge).values(
+                    workflow_version_id=version_id,
+                    workspace_id=self.scope.workspace_id,
+                    project_id=self.scope.require_project(),
+                    from_step_id=ids[str(from_key)] if from_key else None,
+                    to_step_id=ids[to_key],
+                    condition={"expression": edge["condition"]} if edge.get("condition") else None,
+                )
+            )
+
+        published = (
+            await self._session.execute(
+                sa.update(m.WorkflowVersion)
+                .where(
+                    m.WorkflowVersion.id == version_id,
+                    m.WorkflowVersion.project_id == self.scope.require_project(),
+                    m.WorkflowVersion.published_at.is_(None),
+                )
+                .values(published_at=sa.func.now())
+                .returning(m.WorkflowVersion.published_at)
+            )
+        ).scalar_one()
+        # `scalar_one` already proved a row came back, and the column was just
+        # set to `now()`, so this cannot be None. Narrowed rather than cast,
+        # so that a future change making the column nullable fails here.
+        assert published is not None
+        return published
+
+    async def published_version(self, workflow_id: UUID) -> WorkflowDraft | None:
+        """The newest published version, which is the one a run executes.
+
+        Returns the same shape as `draft_of` because a frozen version keeps
+        its `graph` column: the normalised tables are what the island, the
+        DAG canvas and `execution_steps`' foreign keys read, and the jsonb is
+        what the orchestrator reads. Both are immutable after publish, so
+        they cannot disagree.
+        """
+        row = (
+            await self._session.execute(
+                sa.select(m.WorkflowVersion)
+                .where(
+                    m.WorkflowVersion.workflow_id == workflow_id,
+                    m.WorkflowVersion.project_id == self.scope.require_project(),
+                    m.WorkflowVersion.published_at.is_not(None),
+                )
+                .order_by(m.WorkflowVersion.version.desc())
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        return _to_draft(row) if row is not None else None
+
+    async def next_draft(self, workflow_id: UUID, *, after: int) -> WorkflowDraft:
+        """A fresh draft above a version that has just been published.
+
+        Publishing freezes what was being edited, so without this the editor
+        would have nothing to open. The new draft starts as a copy of what
+        was published, which is what someone who clicks "edit" after
+        publishing expects.
+        """
+        previous = (
+            await self._session.execute(
+                sa.select(m.WorkflowVersion.graph).where(
+                    m.WorkflowVersion.workflow_id == workflow_id,
+                    m.WorkflowVersion.project_id == self.scope.require_project(),
+                    m.WorkflowVersion.version == after,
+                )
+            )
+        ).scalar_one()
+        return await self._new_version(
+            workflow_id, version=after + 1, graph=previous, created_by_user_id=None
+        )
 
     async def archive(self, workflow_id: UUID) -> bool:
         return bool(

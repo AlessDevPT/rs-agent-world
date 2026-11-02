@@ -588,25 +588,9 @@ class WorkflowService:
             scope = TenantScope(workspace_id, project_id)
 
             _, draft = await self._draft(work, scope, workflow_id)
-            agents = await work.agents(scope).list_all()
-            connections = work.connections(scope)
-            grants = await connections.tool_grants()
-            effects = await connections.tool_effects()
-            approvers = await work.members(TenantScope(workspace_id)).count_at_least(
-                MemberRole.MEMBER
-            )
+            facts, effects, approvers = await facts_and_effects(work, scope, workspace_id)
 
-        facts = {
-            agent.agent_key: AgentFacts(
-                agent_key=agent.agent_key,
-                interaction_mode=agent.interaction_mode,
-                display_name=agent.display_name,
-                granted_tools=grants.get(agent.id, frozenset()),
-            )
-            for agent in agents
-            if not agent.is_archived
-        }
-        definition = _definition_from(draft, facts, effects, approvers)
+        definition = definition_for_execution(draft, facts, effects, approvers)
         return domain_validate(definition)
 
     @staticmethod
@@ -645,7 +629,42 @@ def _elevation_for(kind: ConnectionKind, config: Mapping[str, Any] | None) -> fr
     return frozenset()
 
 
-def _definition_from(
+async def facts_and_effects(
+    work: UnitOfWork,
+    scope: TenantScope,
+    workspace_id: UUID,
+) -> tuple[Mapping[str, AgentFacts], Mapping[str, SideEffect], int]:
+    """What a pure checker needs to know and cannot look up.
+
+    Extracted so `validate` and `publish` and the execution path all ask the
+    same four questions in the same order. Two callers assembling this
+    separately is how a workflow validates at publish and then decides
+    differently at run time, which is exactly the class of bug the pure
+    functions exist to make impossible.
+
+    Archived agents are excluded, so a step naming one produces
+    `UNKNOWN_AGENT` rather than silently working - archiving an agent is a
+    decision that its workflows should notice.
+    """
+    agents = await work.agents(scope).list_all()
+    connections = work.connections(scope)
+    grants = await connections.tool_grants()
+    effects = await connections.tool_effects()
+    approvers = await work.members(TenantScope(workspace_id)).count_at_least(MemberRole.MEMBER)
+    facts = {
+        agent.agent_key: AgentFacts(
+            agent_key=agent.agent_key,
+            interaction_mode=agent.interaction_mode,
+            display_name=agent.display_name,
+            granted_tools=grants.get(agent.id, frozenset()),
+        )
+        for agent in agents
+        if not agent.is_archived
+    }
+    return facts, effects, approvers
+
+
+def definition_for_execution(
     draft: WorkflowDraft,
     agents: Mapping[str, AgentFacts],
     effects: Mapping[str, SideEffect],

@@ -37,6 +37,7 @@ from agentworld.repositories.definitions import (
 )
 from agentworld.repositories.derived import DerivedStateRepository
 from agentworld.repositories.events import EventRepository, TelemetryRepository
+from agentworld.repositories.executions import DispatchRepository, ExecutionRepository
 from agentworld.repositories.projects import ProjectLookupRepository, ProjectRepository
 from agentworld.repositories.users import (
     MemberListRepository,
@@ -133,6 +134,13 @@ class UnitOfWork:
     def derived(self, scope: TenantScope) -> DerivedStateRepository:
         """The tables a folded event may change - and no others."""
         return DerivedStateRepository(self._session, scope)
+
+    def executions(self, scope: TenantScope) -> ExecutionRepository:
+        return ExecutionRepository(self._session, scope)
+
+    def dispatches(self, scope: TenantScope) -> DispatchRepository:
+        """The outbox's only writer - see `repositories.executions`."""
+        return DispatchRepository(self._session, scope)
 
 
 class UnitOfWorkFactory:
