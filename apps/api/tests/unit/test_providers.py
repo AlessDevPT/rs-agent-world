@@ -289,6 +289,28 @@ async def test_every_stop_reason_is_mapped_not_passed_through(
 # -------------------------------------------------------------- classification ---
 
 
+def test_every_failure_member_has_a_retryability_answer() -> None:
+    """A member added without a decision about retrying is a member whose
+    behaviour nobody chose.
+
+    T6 added `TIMEOUT` and this is what would have caught it being left out
+    of the retryable set - the non-vacuity pass found that removing it from
+    that tuple broke no test.
+    """
+    expected = {
+        providers.ProviderFailure.RATE_LIMITED: True,
+        providers.ProviderFailure.OVERLOADED: True,
+        providers.ProviderFailure.UNAVAILABLE: True,
+        providers.ProviderFailure.TIMEOUT: True,
+        providers.ProviderFailure.UNAUTHORIZED: False,
+        providers.ProviderFailure.INVALID_REQUEST: False,
+        providers.ProviderFailure.MALFORMED_RESPONSE: False,
+    }
+    assert set(expected) == set(providers.ProviderFailure), "a member has no answer here"
+    for failure, retryable in expected.items():
+        assert failure.is_retryable is retryable, failure.value
+
+
 @pytest.mark.parametrize(
     ("status", "failure", "retryable"),
     [

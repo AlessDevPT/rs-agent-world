@@ -79,8 +79,16 @@ class ProviderFailure(StrEnum):
     INVALID_REQUEST = "invalid_request"
     #: The provider is up and shedding load.
     OVERLOADED = "overloaded"
-    #: 5xx, or the request never arrived.
+    #: 5xx, or the request never left this process. The far side either
+    #: answered with a failure or never heard the request - either way, what
+    #: happened is **known**.
     UNAVAILABLE = "unavailable"
+    #: The request was sent and nothing came back in time. Distinct from
+    #: `UNAVAILABLE` because the distinction decides what a caller may
+    #: assume: a timeout says nothing about whether the far side processed
+    #: it. T6 added this member - the worker was escalating every 500 as an
+    #: uncertain outcome because the two shared a name.
+    TIMEOUT = "timeout"
     #: A 200 this code could not read. Not retryable: the provider is
     #: answering, and answering with something unexpected again is the
     #: likely outcome.
@@ -98,6 +106,7 @@ class ProviderFailure(StrEnum):
             ProviderFailure.RATE_LIMITED,
             ProviderFailure.OVERLOADED,
             ProviderFailure.UNAVAILABLE,
+            ProviderFailure.TIMEOUT,
         )
 
 

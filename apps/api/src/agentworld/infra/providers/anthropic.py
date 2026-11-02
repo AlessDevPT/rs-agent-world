@@ -268,6 +268,12 @@ def _failure_for_outbound(failure: OutboundFailure) -> ProviderFailure:
             return ProviderFailure.INVALID_REQUEST
         case OutboundFailure.TLS_FAILURE:
             return ProviderFailure.INVALID_REQUEST
+        case OutboundFailure.TIMEOUT:
+            # Carried through rather than folded into `UNAVAILABLE`: the
+            # request was sent, so whether it was served is unknown, and the
+            # caller needs that distinction to decide between retrying and
+            # escalating.
+            return ProviderFailure.TIMEOUT
         case _:
             return ProviderFailure.UNAVAILABLE
 
