@@ -26,6 +26,7 @@ from agentworld.domain.reducers import fold
 from agentworld.infra.db import Database
 from agentworld.repositories.base import TenantScope
 from agentworld.repositories.unit_of_work import UnitOfWorkFactory
+from agentworld.services import ingest as ingest_service
 from helpers import Actor
 
 pytestmark = pytest.mark.integration
@@ -576,13 +577,72 @@ async def test_heartbeat_moves_the_agents_clock(
 
 
 async def test_two_heartbeats_in_one_second_are_one_fact(
-    client: TestClient, ingest: Fixture, agents: dict[str, uuid.UUID]
+    client: TestClient,
+    ingest: Fixture,
+    agents: dict[str, uuid.UUID],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """A retry within the second is a retry, not a second heartbeat.
+
+    The clock is pinned, and that is not a convenience. The dedup key is
+    `<agent>:hb:<integer second>`, so two real HTTP calls are one fact only
+    when they land in the same second - which two calls about ninety
+    milliseconds apart do roughly nine times in ten. This test flaked on the
+    tenth, having passed by luck in every run before it.
+
+    A test that passes nine times out of ten is worse than no test: it gets
+    believed when it fails for a real reason, and it trains whoever sees it
+    to re-run the suite. Pinning the clock asserts exactly the documented
+    property - same second, same fact - and asserts it every time.
+    """
+
+    class _PinnedClock(dt.datetime):
+        """`datetime` with a fixed `now`, and everything else intact.
+
+        A subclass rather than a stub: `services.ingest` also uses
+        `datetime` for the future-skew check, and a bare object with one
+        method would break that for reasons unrelated to the test.
+        """
+
+        @classmethod
+        def now(cls, tz: dt.tzinfo | None = None) -> dt.datetime:  # type: ignore[override]
+            return dt.datetime(2026, 11, 2, 12, 0, 0, 500_000, tzinfo=tz or dt.UTC)
+
+    monkeypatch.setattr(ingest_service, "datetime", _PinnedClock)
+
     body = {"agent_key": "researcher"}
     first = client.post("/v1/ingest/heartbeat", json=body, headers=ingest.headers).json()
     second = client.post("/v1/ingest/heartbeat", json=body, headers=ingest.headers).json()
     assert first["accepted"] == 1
     assert second["duplicates"] == 1, "a retry within the second is not a second heartbeat"
+
+
+async def test_heartbeats_in_different_seconds_are_two_facts(
+    client: TestClient,
+    ingest: Fixture,
+    agents: dict[str, uuid.UUID],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The other half, which the flaky version silently relied on.
+
+    Without this, pinning the clock above could hide a dedup key that
+    ignored the second entirely - every heartbeat would be a duplicate and
+    the test would still pass.
+    """
+    seconds = iter([0, 0, 1])
+
+    class _TickingClock(dt.datetime):
+        @classmethod
+        def now(cls, tz: dt.tzinfo | None = None) -> dt.datetime:  # type: ignore[override]
+            return dt.datetime(2026, 11, 2, 12, 0, next(seconds, 1), tzinfo=tz or dt.UTC)
+
+    monkeypatch.setattr(ingest_service, "datetime", _TickingClock)
+
+    body = {"agent_key": "researcher"}
+    client.post("/v1/ingest/heartbeat", json=body, headers=ingest.headers)
+    later = client.post("/v1/ingest/heartbeat", json=body, headers=ingest.headers).json()
+    assert later["accepted"] == 1, "a heartbeat a second later is a new fact"
+    assert later["duplicates"] == 0
 
 
 async def test_logs_are_stored_and_change_no_state(
