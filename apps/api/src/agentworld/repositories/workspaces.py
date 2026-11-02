@@ -9,6 +9,7 @@ neither - `create` and `slug_taken` - touch no existing tenant's data.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from uuid import UUID, uuid4
 
 import sqlalchemy as sa
@@ -53,6 +54,27 @@ class WorkspaceRepository(GlobalRepository):
             )
         ).scalar_one()
         return to_workspace(row)
+
+    async def live_ids(self, *, limit: int = 1000) -> Sequence[UUID]:
+        """Every workspace a background worker should look in.
+
+        Unscoped, and legitimately so: `workspaces` is one of the four tables
+        with no row-level security policy, because it is one of the tables
+        that answer "which tenant is this?". A worker has no tenant until it
+        finds work, and this is how it learns where to look - rather than
+        reaching across `dispatches`, which RLS protects and which returns
+        nothing to an unscoped session by design.
+
+        Archived workspaces are excluded. Work queued in one is work nobody
+        asked to continue.
+        """
+        rows = await self._session.execute(
+            sa.select(m.Workspace.id)
+            .where(m.Workspace.archived_at.is_(None))
+            .order_by(m.Workspace.created_at)
+            .limit(limit)
+        )
+        return list(rows.scalars().all())
 
     async def get(self, workspace_id: UUID) -> Workspace | None:
         """Fetch by id. Archived workspaces are not returned.

@@ -36,6 +36,10 @@ from agentworld.repositories.definitions import (
     WorkflowRepository,
 )
 from agentworld.repositories.derived import DerivedStateRepository
+from agentworld.repositories.dispatches import (
+    DispatchClaimRepository,
+    DispatchReadRepository,
+)
 from agentworld.repositories.events import EventRepository, TelemetryRepository
 from agentworld.repositories.executions import DispatchRepository, ExecutionRepository
 from agentworld.repositories.projects import ProjectLookupRepository, ProjectRepository
@@ -139,8 +143,16 @@ class UnitOfWork:
         return ExecutionRepository(self._session, scope)
 
     def dispatches(self, scope: TenantScope) -> DispatchRepository:
-        """The outbox's only writer - see `repositories.executions`."""
+        """The outbox's only *creator* - see `repositories.executions`."""
         return DispatchRepository(self._session, scope)
+
+    def dispatch_claims(self, scope: TenantScope) -> DispatchClaimRepository:
+        """Claiming and settling work in one workspace - see its own
+        docstring for why this is scoped rather than global."""
+        return DispatchClaimRepository(self._session, scope)
+
+    def dispatch_reads(self, scope: TenantScope) -> DispatchReadRepository:
+        return DispatchReadRepository(self._session, scope)
 
 
 class UnitOfWorkFactory:

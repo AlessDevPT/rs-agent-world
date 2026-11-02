@@ -199,6 +199,27 @@ class AgentRepository(ScopedRepository):
         row = (await self._session.execute(query)).scalar_one_or_none()
         return _to_agent(row) if row is not None else None
 
+    async def by_key(self, agent_key: str) -> Agent | None:
+        """The agent a dispatch instruction names.
+
+        By key rather than by id, because that is what `advance()` put in the
+        instruction - and a key is what survives an agent being recreated,
+        which is the case a frozen workflow version has to tolerate.
+        Archived agents are excluded: the step runner must not perform work
+        for one, and the alternative is a turn that runs for an agent
+        somebody retired.
+        """
+        row = (
+            await self._session.execute(
+                sa.select(m.Agent).where(
+                    m.Agent.agent_key == agent_key,
+                    m.Agent.project_id == self.scope.require_project(),
+                    m.Agent.archived_at.is_(None),
+                )
+            )
+        ).scalar_one_or_none()
+        return _to_agent(row) if row is not None else None
+
     async def list_all(self, *, include_archived: bool = False) -> Sequence[Agent]:
         """Archived agents are excluded by default and available on request.
 
