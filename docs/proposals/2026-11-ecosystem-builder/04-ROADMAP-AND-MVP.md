@@ -179,11 +179,17 @@ The first phase where something runs, and the first where something is visible.
   are nested under the workspace rather than id-addressed, and `display_hint` is derived
   from `api_key` material only. A sixth import contract keeps `cryptography` out of every
   layer but this one.
-- `infra/net/guarded.py` — the single guarded HTTP client: resolve, validate every
+- ~~`infra/net/guarded.py` — the single guarded HTTP client: resolve, validate every
   resolved address, pin the connection to it, no redirects. The full blocked set for both
   IP families, metadata names, scheme and port allow-lists, and normalised errors
-  (`06-OUTBOUND-SECURITY.md`). It lands here because this is the first phase that makes any
-  outbound call at all, and retrofitting it after four callers exist means auditing four.
+  (`06-OUTBOUND-SECURITY.md`).~~ **Done (T2).** `infra/net/{policy,addresses,errors,guarded}.py`,
+  a seventh import contract keeping `httpx` inside it with the one named Supabase
+  exemption, and 92 tests including a real TLS server for the Host/SNI criterion. Three
+  corrections to `06-OUTBOUND-SECURITY.md` and two findings are in `11-T2-GUARDED-CLIENT.md`:
+  `infra/auth/` had no `__init__.py`, so no architecture contract had ever seen it and a
+  non-editable install would have shipped without it; and the policy's allow-list could be
+  used to smuggle a NAT64-wrapped private address. Redirect following and the per-workspace
+  concurrency limit are deferred to the tasks that will have a caller for them.
 - `infra/providers/`: `base.py` Protocol, `anthropic.py`, registry, over the guarded
   client. **The OpenAI-compatible implementation is the last task of this phase**, written
   specifically to prove the Protocol is not shaped around one vendor while the first one is
