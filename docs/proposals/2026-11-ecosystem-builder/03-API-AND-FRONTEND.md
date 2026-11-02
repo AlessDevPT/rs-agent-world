@@ -208,10 +208,30 @@ one decision and two endpoints invite a UI that wires the wrong one.
 | `GET` `POST` | `/v1/projects/{id}/triggers` | viewer+ / member+ | |
 | `POST` | `/v1/triggers/{id}/rotate-token` | admin+ | |
 | `GET` `POST` | `/v1/workspaces/{ws}/credentials` | admin+ | **never returns secret material** |
-| `DELETE` | `/v1/credentials/{id}` | admin+ | refused while referenced |
+| `POST` | `/v1/workspaces/{ws}/credentials/{id}/rotate` | admin+ | new material, same row id |
+| `POST` | `/v1/workspaces/{ws}/credentials/{id}/revoke` | admin+ | reversible by rotating |
+| `DELETE` | `/v1/workspaces/{ws}/credentials/{id}` | admin+ | destroys the material; keeps a tombstone |
 
-`GET /v1/credentials` returns `display_hint`, `scopes`, `expires_at`, `last_used_at` — what
+`GET` returns `display_hint`, `scopes`, `expires_at`, `last_used_at` and `key_id` — what
 an operator needs to recognise and audit a credential, and nothing that could be replayed.
+
+**Built in T1, nested rather than id-addressed.** This table originally wrote
+`DELETE /v1/credentials/{id}`. An id-addressed route has to resolve a credential id to a
+workspace *before* it can authorize the caller, and that resolution is by definition a
+cross-tenant query — a fourth entry on the list of three that `repositories/base.py`
+keeps deliberately short and reviewable. The workspace is already in the UI's hands
+everywhere it would call these, so nesting costs nothing and removes the only reason for
+that query to exist. `/v1/api-keys/{id}` keeps the id-addressed shape because an API key
+is *presented* to this server, so looking one up cross-tenant is unavoidable; a
+credential never is.
+
+Two operations have no route at all. `rewrap_workspace` moves every data key in a
+workspace onto the active KEK: an operator action with no UI and no latency budget, and
+an endpoint that re-wraps every key in a workspace is a thing an attacker would enjoy
+calling. `use` decrypts one credential for one outbound call and takes no principal,
+because there is none — the authority came from the execution, not from whoever reads
+the row. There is no `credential.read_secret` action at any role for either to
+authorize against.
 
 ### The builder
 

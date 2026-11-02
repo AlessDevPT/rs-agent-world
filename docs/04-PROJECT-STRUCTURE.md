@@ -115,6 +115,10 @@ apps/api/
 │   │   ├── auth/
 │   │   │   ├── supabase.py   JWKS fetch + cache + RS256 verify
 │   │   │   └── provider.py   AuthProvider interface (swappable)
+│   │   ├── secrets/
+│   │   │   ├── keyring.py    the KEK map, parsed and refused at boot
+│   │   │   └── envelope.py   AES-256-GCM, per-row data key, AAD-bound
+│   │   ├── hashing.py        Argon2id for API-key secrets (not credentials)
 │   │   ├── ratelimit.py
 │   │   ├── logging.py        structlog, request-id binding
 │   │   └── telemetry.py      OpenTelemetry setup
@@ -309,6 +313,8 @@ SUPABASE_URL=https://xxxx.supabase.co
 SUPABASE_JWT_AUDIENCE=authenticated
 SUPABASE_JWKS_URL=https://xxxx.supabase.co/auth/v1/.well-known/jwks.json
 API_KEY_PEPPER=change-me                # Argon2id pepper, rotatable
+CREDENTIAL_KEKS={"k2026a":"<base64>"}   # credential KEKs; several valid at once
+CREDENTIAL_ACTIVE_KEK_ID=k2026a         # the one that wraps new data keys
 EVENT_BUS=redis                         # redis | inprocess
 WS_REPLAY_WINDOW_EVENTS=10000
 DEFAULT_HEARTBEAT_TTL_SECONDS=60

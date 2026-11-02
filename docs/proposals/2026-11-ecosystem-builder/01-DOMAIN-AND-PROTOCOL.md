@@ -529,7 +529,7 @@ CREATE TABLE credentials (
   aad_version   smallint NOT NULL DEFAULT 1,
 
   -- Readable facts, so the UI shows something useful without decrypting.
-  display_hint  text,                 -- "xoxb-…4f2a", "ada@example.com"
+  display_hint  text,                 -- "…4f2a"; derived, never supplied
   scopes        text[],
   expires_at    timestamptz,
   refresh_after timestamptz,
@@ -590,6 +590,17 @@ CREDENTIAL_ACTIVE_KEK_ID  = 'k2026b'
 `ACTIVE_KEK_ID` absent from the map — the same fail-fast validator `API_KEY_PEPPER`
 already uses, which Phase 1 has a test for.
 
+T1 made that stricter in three ways. A *present and malformed* `CREDENTIAL_KEKS` fails
+at boot in every environment, including `local`: it is wrong wherever it appears, and
+finding out at the first credential write means a process that started healthy and
+cannot store a secret. A deployed environment that pastes in the development key is
+refused too, compared by key material rather than by id, because dressing it up as
+`k2026a` leaves it exactly as compromised. And `Settings` sets pydantic's
+`hide_input_in_errors`, because the default renders the input that failed validation —
+which for this model is every environment variable the API reads, `CREDENTIAL_KEKS`
+among them. A boot failure is the message most likely to be copied into a ticket or
+shipped to a log aggregator.
+
 | Operation | What it does | Needs plaintext? | Online? |
 |-----------|--------------|------------------|---------|
 | **KEK rotation** | add a new KEK, point `ACTIVE` at it, re-wrap DEKs in the background, retire the old KEK when no row names it | no | yes |
@@ -607,7 +618,37 @@ class SecretStore(Protocol):
                       credential_id: UUID) -> EncryptedBlob: ...
     async def decrypt(self, blob: EncryptedBlob, *, workspace_id: UUID,
                       credential_id: UUID) -> bytes: ...
+    async def rewrap(self, blob: EncryptedBlob, *, workspace_id: UUID,
+                     credential_id: UUID) -> EncryptedBlob: ...
 ```
+
+### Built in T1 — three corrections to the above
+
+**`rewrap` is on the interface, not beside it.** KEK rotation is one of the
+three things a store does, and leaving it out would have meant a rotation
+pass reaching for `encrypt`/`decrypt` and therefore holding plaintext it has
+no business holding. It returns the blob with `ciphertext` and `nonce`
+carried over by `dataclasses.replace`, so "a rotation cannot damage a secret"
+is visible in the type rather than asserted in a comment.
+
+**The wrap carries the same AAD as the ciphertext.** The text above binds the
+*ciphertext* to `workspace_id ‖ credential_id`. Only binding one layer leaves
+the obvious attack open: copy `ciphertext` **and** `wrapped_key` together
+into another workspace's row, and the data key unwraps, and the ciphertext
+decrypts. Both layers carry the binding, so the wrap refuses first.
+`test_moving_both_halves_together_does_not_help` is that case.
+
+**`display_hint` is derived, and only for `api_key` material.** The example
+above showed `"ada@example.com"`, which could only have come from the caller
+— and a caller-supplied hint is a field through which the whole secret fits
+into a listing endpoint. It is computed from the material instead, and only
+for a single opaque high-entropy token, where showing the last four
+characters is what the provider's own dashboard shows and is how an operator
+matches a row here to a key there. `basic` material is or contains a
+human-chosen password, `oauth2` material's trailing characters belong to
+whichever field was serialised last, and `custom` is unknown: those get no
+hint rather than a worse one. Material shorter than 20 characters gets none
+either.
 
 ### Tenant isolation
 

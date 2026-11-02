@@ -169,8 +169,16 @@ The first phase where something runs, and the first where something is visible.
 > process waits for load that justifies it.
 
 **Build — Track A**
-- `infra/secrets/`: `SecretStore`, envelope encryption, AAD binding, KEK map and rotation;
-  `Settings` fails fast without `CREDENTIAL_KEKS` outside local and test.
+- ~~`infra/secrets/`: `SecretStore`, envelope encryption, AAD binding, KEK map and
+  rotation; `Settings` fails fast without `CREDENTIAL_KEKS` outside local and test.~~
+  **Done (T1).** `infra/secrets/{keyring,envelope}.py`, `repositories/credentials.py`,
+  `services/credentials.py`, `api/v1/credentials.py`. No migration: migration 0007 built
+  the table in Phase 2 and nothing about it needed changing. Three decisions are recorded
+  in `10-T1-SECRETS.md` and folded back into `01-DOMAIN-AND-PROTOCOL.md` §6 and
+  `03-API-AND-FRONTEND.md`: the wrap carries the same AAD as the ciphertext, the routes
+  are nested under the workspace rather than id-addressed, and `display_hint` is derived
+  from `api_key` material only. A sixth import contract keeps `cryptography` out of every
+  layer but this one.
 - `infra/net/guarded.py` — the single guarded HTTP client: resolve, validate every
   resolved address, pin the connection to it, no redirects. The full blocked set for both
   IP families, metadata names, scheme and port allow-lists, and normalised errors

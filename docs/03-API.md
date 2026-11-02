@@ -98,7 +98,7 @@ Role capabilities:
 | Read everything in the workspace | yes | yes | yes | yes |
 | Create/update projects, agents, tasks | — | yes | yes | yes |
 | Cancel tasks, silence agents | — | yes | yes | yes |
-| Manage API keys, integrations, webhooks | — | — | yes | yes |
+| Manage API keys, credentials, integrations, webhooks | — | — | yes | yes |
 | Manage members | — | — | yes | yes |
 | Delete workspace, transfer ownership | — | — | — | yes |
 
