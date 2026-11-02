@@ -212,7 +212,15 @@ The first phase where something runs, and the first where something is visible.
   `PauseExecution` not at all, since pausing is something done *to* an execution rather
   than something a decision function decides. The non-vacuity pass found three untested
   guards, including a join that would have run on half its input. See `13-T4-ADVANCE.md`.
-- `services/executions.py` — apply decisions in one transaction: event + state + outbox.
+- ~~`services/executions.py` — apply decisions in one transaction: event + state + outbox.~~
+  **Done (T5).** Plus publish, the run route, and `repositories/executions.py`, which holds
+  the only statement in the system that writes a `dispatches` row - the containment
+  allow-list went from empty to one named file in the same commit. A `tool_call` step
+  **cannot be published** in this release: `workflow_steps.tool_call_needs_tool` requires a
+  `tool_id` and there is no `tools` table until Phase 6, so `advance()`'s tool_call branch
+  is tested and unreachable from a published workflow. The non-vacuity pass removed a dead
+  second writer of `workflow_executions.status` and found that the double-advance test was
+  not racing. See `14-T5-EXECUTIONS.md`.
 - `workers/step_runner.py`, `workers/dispatch_reaper.py`.
 - `POST /v1/workflows/{id}/run`, `GET /v1/executions/{id}`.
 - `infra/event_bus.py` + the WebSocket gateway: snapshot, deltas, cursors, `resume`,
