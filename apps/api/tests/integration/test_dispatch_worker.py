@@ -155,13 +155,26 @@ class Scenario:
     to be decrypted before the call.
     """
 
-    def __init__(self, client: TestClient, actor: Actor, provider: FakeProvider) -> None:
+    def __init__(
+        self,
+        client: TestClient,
+        actor: Actor,
+        provider: FakeProvider,
+        *,
+        workspace_name: str = "Worker",
+    ) -> None:
+        #: Named so a test can build a second scenario. Workspace names are
+        #: unique per owner, so two scenarios with the default name make the
+        #: second one a 409 - which is how T6c found this, needing two
+        #: workspaces to show that one sweep visits both.
         self.client = client
         self.actor = actor
         self.provider = provider
-        self.workspace = client.post(
-            "/v1/workspaces", json={"name": "Worker"}, headers=actor.headers
-        ).json()
+        created = client.post(
+            "/v1/workspaces", json={"name": workspace_name}, headers=actor.headers
+        )
+        assert created.status_code == 201, created.text
+        self.workspace = created.json()
         self.project = client.post(
             f"/v1/workspaces/{self.workspace['id']}/projects",
             json={"name": "Island"},

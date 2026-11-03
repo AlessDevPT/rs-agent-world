@@ -310,6 +310,29 @@ class DispatchStatus(StrEnum):
     NEEDS_REVIEW = "needs_review"
     CANCELLED = "cancelled"
 
+    @property
+    def is_unsettled(self) -> bool:
+        """Whether this dispatch still owes somebody an outcome.
+
+        Added for T6c, whose reconciler asks "has this execution anything in
+        flight?" and must get the same answer as the index that makes the
+        question cheap. One predicate rather than two lists that can drift.
+
+        `needs_review` is in the set even though no worker will ever claim it
+        again. An execution waiting on a human decision is not an execution
+        anything may advance past - that is the whole point of the state.
+        """
+        return self in _UNSETTLED_DISPATCH_STATUSES
+
+
+_UNSETTLED_DISPATCH_STATUSES: frozenset[DispatchStatus] = frozenset(
+    {
+        DispatchStatus.PENDING,
+        DispatchStatus.LEASED,
+        DispatchStatus.NEEDS_REVIEW,
+    }
+)
+
 
 class WorldNodeKind(StrEnum):
     """What kind of object a placed node stands for.

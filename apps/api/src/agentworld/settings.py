@@ -87,6 +87,22 @@ class Settings(BaseSettings):
     #: notices; exiting hands the problem to the supervisor, where it is
     #: visible.
     reaper_max_consecutive_errors: int = Field(default=5, ge=1, le=100)
+    #: How often the advancement reconciler sweeps, in the same process. Less
+    #: often than the lease sweep because the gap it closes is a crash between
+    #: two adjacent transactions - rare, and an execution stalled by one is
+    #: stalled quietly rather than holding anything. See T6c.
+    reconcile_interval_seconds: int = Field(default=60, ge=1, le=3600)
+    #: Executions advanced per workspace per reconcile pass. This bounds the
+    #: work *within* a workspace, not across a pass: the sweep visits every
+    #: workspace, so its total duration grows with workspace count.
+    reconcile_batch_limit: int = Field(default=50, ge=1, le=10_000)
+    #: How long an execution's folded clock must have been still before the
+    #: reconciler will touch it. The normal path settles a dispatch and
+    #: advances milliseconds later, so without a grace period the reconciler
+    #: would compete for the execution's row lock on every ordinary step. Too
+    #: short wastes locks; too long leaves a stalled execution stalled for
+    #: longer. Zero is allowed, for tests that want no window at all.
+    reconcile_grace_seconds: int = Field(default=60, ge=0, le=3600)
 
     cors_origins: str = "http://localhost:3000"
 

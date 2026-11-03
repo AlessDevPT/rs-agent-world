@@ -245,7 +245,12 @@ The first phase where something runs, and the first where something is visible.
   transaction and `advance_once` runs in a second, because it decides from committed
   state. A process that dies between them leaves an execution that is complete,
   consistent and **stalled**, with nothing scheduling the advance again. Introduced in
-  T6, inherited by T6b, not solved by either. Tracked as T6c -
+  T6, inherited by T6b. **Narrowed by T6c**, which adds a reconciliation sweep in the
+  reaper process: a `running` execution with no dispatch in `pending`, `leased` or
+  `needs_review` is offered to `advance_once`, which writes nothing if nothing is owed.
+  Derived state and a partial index, no marker column, no cursor. The gap is narrowed
+  rather than closed - a crash still strands an execution, and T6c guarantees somebody
+  comes back for it within the interval plus the grace period. See
   `18-T6C-ADVANCEMENT-RECOVERY.md`.
 - ~~`POST /v1/workflows/{id}/run`, `GET /v1/executions/{id}`.~~ **Run route done (T5);
   execution detail still to come.** Plus the T6b review queue:

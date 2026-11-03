@@ -126,6 +126,13 @@ CREATE INDEX dispatches_expired_lease_idx ON dispatches (leased_until)
   WHERE status = 'leased';
 CREATE INDEX dispatches_attention_idx ON dispatches (project_id, status)
   WHERE status IN ('dead', 'needs_review');
+-- Added in T6c, for the advancement reconciler's one question per candidate
+-- execution: "is any dispatch of yours still unsettled?". `needs_review` is
+-- among the three on purpose, so an execution waiting on a person is never a
+-- candidate for automatic advancement.
+CREATE INDEX dispatches_unsettled_by_execution_idx ON dispatches (execution_id, status)
+  WHERE execution_id IS NOT NULL
+    AND status IN ('pending', 'leased', 'needs_review');
 ```
 
 `dispatches` is **not** append-only and **not** under the event log's retention: rows are

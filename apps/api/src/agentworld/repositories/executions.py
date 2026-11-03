@@ -30,6 +30,7 @@ import sqlalchemy as sa
 
 from agentworld.domain.enums import (
     DispatchKind,
+    DispatchStatus,
     ExecutionStatus,
     InitiatorKind,
     SideEffect,
@@ -259,6 +260,65 @@ class ExecutionRepository(ScopedRepository):
             )
         )
         return {row[0]: str(row[1]) for row in rows.all()}
+
+    async def needing_advance(
+        self, *, stale_before: dt.datetime, limit: int
+    ) -> Sequence[tuple[UUID, UUID]]:
+        """Executions that look owed an advance, as `(execution_id, project_id)`.
+
+        Derived rather than marked. A `running` execution with no dispatch in
+        `pending`, `leased` or `needs_review` has nothing in flight, so it was
+        either never told what to do next or it has already finished. Both are
+        safe to hand to `advance_once`, which decides from committed state and
+        writes nothing when there is nothing to decide - so a false positive
+        here costs one row lock and no rows.
+
+        `needs_review` counts as unsettled deliberately. An execution waiting
+        for a person must never become a candidate; that is the state T6 and
+        T6b exist to protect, and nothing automatic may advance past it.
+
+        `stale_before` keeps the reconciler out of the normal path's way. A
+        worker settles a dispatch and advances milliseconds later, so without
+        a grace period this would compete for the execution's row lock on
+        every ordinary step. `last_event_at` is the execution's own folded
+        clock: a stalled execution's stops moving while a healthy one's does
+        not. It is NULL only before the first event is folded, which is a
+        state no advance is owed for - but it is included rather than excluded
+        so that a row with a missing clock is visible to the sweep rather than
+        invisible to it.
+
+        Oldest trace first, so the longest-stalled execution is recovered
+        first and a candidate beyond `limit` is picked up by a later pass
+        rather than forgotten.
+
+        Workspace-scoped, not project-scoped: the sweep covers a whole
+        workspace, and `dispatches` is under forced row-level security, so the
+        session has to be opened with that workspace visible. The project id
+        comes back per row because `advance_once` needs it.
+        """
+        unsettled = (
+            sa.select(sa.literal(1))
+            .select_from(m.Dispatch)
+            .where(
+                m.Dispatch.execution_id == m.WorkflowExecution.id,
+                m.Dispatch.status.in_([s for s in DispatchStatus if s.is_unsettled]),
+            )
+        )
+        rows = await self._session.execute(
+            sa.select(m.WorkflowExecution.id, m.WorkflowExecution.project_id)
+            .where(
+                m.WorkflowExecution.workspace_id == self.scope.workspace_id,
+                m.WorkflowExecution.status == ExecutionStatus.RUNNING,
+                sa.or_(
+                    m.WorkflowExecution.last_event_at.is_(None),
+                    m.WorkflowExecution.last_event_at < stale_before,
+                ),
+                ~unsettled.exists(),
+            )
+            .order_by(m.WorkflowExecution.last_event_at.asc().nullsfirst())
+            .limit(limit)
+        )
+        return [(row[0], row[1]) for row in rows.all()]
 
     async def list_in_project(self, *, limit: int = 50) -> Sequence[Any]:
         rows = await self._session.execute(

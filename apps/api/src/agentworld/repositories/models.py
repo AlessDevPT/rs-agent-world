@@ -1073,6 +1073,22 @@ class Dispatch(Base):
             "status",
             postgresql_where=sa.text("status IN ('dead', 'needs_review')"),
         ),
+        # T6c: what the advancement reconciler asks, per candidate execution -
+        # "is any dispatch of yours still unsettled?". The three statuses are
+        # the non-terminal ones, and `needs_review` is deliberately among them
+        # so an execution waiting on a person is never a candidate.
+        #
+        # `execution_id IS NOT NULL` keeps the column's own nullability out of
+        # the index: a dispatch with no execution can never satisfy the
+        # correlation, so indexing it would only cost space.
+        sa.Index(
+            "dispatches_unsettled_by_execution_idx",
+            "execution_id",
+            "status",
+            postgresql_where=sa.text(
+                "execution_id IS NOT NULL AND status IN ('pending', 'leased', 'needs_review')"
+            ),
+        ),
     )
 
 
