@@ -69,6 +69,16 @@ class FakeProvider:
     #: assertion passes against the fallback backoff instead.
     extra_headers: dict[str, str] = field(default_factory=dict)
     requests: list[dict[str, str]] = field(default_factory=list)
+    #: Set by the handler the moment a request arrives, so a test can wait
+    #: for the call to be genuinely in flight instead of sleeping and hoping.
+    arrived: asyncio.Event = field(default_factory=asyncio.Event)
+    #: When set to an event, the handler waits for it before answering. The
+    #: pair replaces a fixed sleep: `arrived` says the call has started and
+    #: `hold` keeps it started until the test is finished looking. A sleep
+    #: long enough to be safe on a loaded machine is a sleep that makes the
+    #: suite slower for everyone, and one short enough to be quick is one
+    #: that fails on a loaded machine - which is exactly what happened.
+    hold: asyncio.Event | None = None
 
     @property
     def base_url(self) -> str:
@@ -112,7 +122,10 @@ async def provider() -> AsyncIterator[FakeProvider]:
         if length:
             await reader.readexactly(length)
         state.requests.append(headers)
+        state.arrived.set()
 
+        if state.hold is not None:
+            await state.hold.wait()
         if state.delay:
             await asyncio.sleep(state.delay)
         extra = "".join(f"{k}: {v}\r\n" for k, v in state.extra_headers.items())
@@ -529,22 +542,43 @@ async def test_the_worker_marks_the_call_in_flight_before_making_it(
     removing the write broke nothing, while leaving the reaper unable to tell
     a crash before the call from a crash during it.
 
-    Observed from outside, while a deliberately slow provider holds the
-    request open - which is exactly the state a worker is in when it dies
-    mid-flight.
+    Observed from outside while the provider holds the request open - which
+    is exactly the state a worker is in when it dies mid-flight.
+
+    The observation is a handshake rather than a sleep. The first version
+    slept 200 ms and read the row, which assumed the claim, the credential
+    decryption and the connection all finished inside that window; on a
+    loaded machine they did not, and the test failed in a full run that took
+    27 minutes instead of 17. `arrived` says the call has genuinely started
+    and `hold` keeps it started until this test has finished looking, so
+    there is no window to lose.
     """
     execution_id = scenario.run()
-    provider.delay = 0.5
+    provider.hold = asyncio.Event()
     worker = _worker(factory, provider)
 
     task = asyncio.create_task(worker.run_once())
-    await asyncio.sleep(0.2)
+    try:
+        try:
+            await asyncio.wait_for(provider.arrived.wait(), timeout=30)
+        except TimeoutError:  # pragma: no cover - the worker never called out
+            pytest.fail("the provider was never called")
 
-    in_flight = await _dispatch_row(owner_database, execution_id)
-    assert in_flight.status == DispatchStatus.LEASED
-    assert in_flight.side_effect_started_at is not None, (
-        "the reaper could not tell this from a crash before the call"
-    )
+        in_flight = await _dispatch_row(owner_database, execution_id)
+        assert in_flight.status == DispatchStatus.LEASED
+        assert in_flight.side_effect_started_at is not None, (
+            "the reaper could not tell this from a crash before the call"
+        )
+    finally:
+        # Release the held handler on every path, including a failing
+        # assertion above: otherwise it waits on `hold` for ever and the
+        # test hangs in teardown instead of reporting. A test that hangs
+        # when the protection is removed is worse than no test at all - the
+        # non-vacuity sweep has no way to see it fail.
+        provider.hold.set()
+        finished, _ = await asyncio.wait([task], timeout=30)
+        if not finished:  # pragma: no cover - the worker never returned
+            task.cancel()
 
     assert await task is not None
     settled = await _dispatch_row(owner_database, execution_id)

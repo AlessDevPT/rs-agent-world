@@ -444,6 +444,26 @@ the ceiling belongs in `workers/reaper.py` — an untracked file, so `git status
 have shown it. Found by grepping the four touched files for weakening markers afterwards,
 which is now the step that follows any killed sweep.
 
+### It happened a second time, in the fix for a different problem
+
+`test_the_worker_marks_the_call_in_flight_before_making_it` originally slept 200 ms and
+then read the dispatch row, which assumed the claim, the credential decryption and the
+connection all finished inside that window. On a full run that took 27 minutes instead of
+17 they did not, and the test failed for reasons that had nothing to do with what it
+tests. It was rewritten around a handshake: the fake provider sets `arrived` when the
+request reaches it and then waits on `hold`, so the row is read while the call is
+genuinely in flight and there is no window to lose.
+
+That fix reintroduced the hang. The release of `hold` sat *after* the assertions, so a
+failing assertion left the provider's handler waiting on it for ever and the test hung in
+teardown — the exact defect described above, reached from the opposite direction. The
+release is now in a `finally`, with a bounded wait on the worker task.
+
+Confirmed the way it should have been the first time: with the marker write removed, the
+test now **fails** in about a minute, with its own message — "the reaper could not tell
+this from a crash before the call". Killing that run also left the weakening in
+`services/dispatch.py`, as before; the grep found it.
+
 ## Operational deployment requirements
 
 - **The reaper must run.** Without it a crashed worker's dispatch stays `leased` for ever.
