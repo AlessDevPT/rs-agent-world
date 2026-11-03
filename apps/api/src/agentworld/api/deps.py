@@ -41,6 +41,7 @@ from agentworld.services.executions import ExecutionService
 from agentworld.services.identity import IdentityService, resolve_principal
 from agentworld.services.ingest import IngestService
 from agentworld.services.projects import ProjectService
+from agentworld.services.review import ReviewService
 from agentworld.services.workspaces import WorkspaceService
 from agentworld.settings import Settings
 
@@ -259,6 +260,17 @@ def get_execution_service(factory: FactoryDep) -> ExecutionService:
     return ExecutionService(factory)
 
 
+def get_review_service(factory: FactoryDep) -> ReviewService:
+    """Resolving uncertain outcomes.
+
+    Holds an `ExecutionService` because a resolution advances the execution
+    through the same path everything else does - there is no second way to
+    move an execution, and adding one here would be the obvious shortcut and
+    the wrong one.
+    """
+    return ReviewService(factory, executions=ExecutionService(factory))
+
+
 def get_credential_service(factory: FactoryDep, settings: SettingsDep) -> CredentialService:
     """The keyring comes from settings, which refused to boot without it.
 
@@ -280,3 +292,4 @@ ConnectionServiceDep = Annotated[ConnectionService, Depends(get_connection_servi
 WorkflowServiceDep = Annotated[WorkflowService, Depends(get_workflow_service)]
 CredentialServiceDep = Annotated[CredentialService, Depends(get_credential_service)]
 ExecutionServiceDep = Annotated[ExecutionService, Depends(get_execution_service)]
+ReviewServiceDep = Annotated[ReviewService, Depends(get_review_service)]

@@ -329,12 +329,15 @@ def test_an_approval_floor_is_never_below_the_action_itself(
 
 
 def test_the_matrix_is_the_size_the_proposal_says_it_is() -> None:
-    """77 actions, 62 of them new in Phase 2.
+    """78 actions: 77 from the proposal, plus one T6b added.
 
     A count is a weak test of anything except itself - but this one is quoted
-    in `05-PERMISSIONS.md` and in the decision record, and a silent drift
-    between the document a reviewer reads and the table the code enforces is
-    exactly what an access-control model cannot afford.
+    in `05-PERMISSIONS.md` (the title of §6, and §§1 and 2) and in
+    `00-GAP-ANALYSIS.md`, and a silent drift between the document a
+    reviewer reads and the table the code enforces is exactly what an
+    access-control model cannot afford. Both documents now carry the 78th as
+    an implementation note rather than a rewritten total, which is why this
+    test asserts the two numbers separately.
     """
     phase_one = {
         action
@@ -342,8 +345,13 @@ def test_the_matrix_is_the_size_the_proposal_says_it_is() -> None:
         if action.value.split(".", 1)[0] in {"workspace", "member", "project", "api_key"}
     }
     assert len(phase_one) == 15
-    assert len(Action) == 77
-    assert len(Action) - len(phase_one) == 62
+    # 77 in the proposal. `dispatch.resolve_review` is the 78th, added in
+    # T6b for the one state that needs a human: a dispatch whose outcome
+    # nobody knows. It is counted separately rather than folded into the
+    # Phase 2 total, so the number the documents quote stays checkable.
+    added_after_the_proposal = {Action.DISPATCH_RESOLVE_REVIEW}
+    assert len(Action) == 78
+    assert len(Action) - len(phase_one) - len(added_after_the_proposal) == 62
 
 
 def test_every_sensitive_action_exists_and_is_not_merely_a_read() -> None:
@@ -362,6 +370,27 @@ def test_the_dangerous_actions_are_all_marked_sensitive() -> None:
             if action is Action.INTEGRATION_READ:
                 continue  # that a Slack connection exists is not a secret
             assert action in SENSITIVE_ACTIONS, action
+
+
+def test_resolving_an_uncertain_outcome_is_sensitive() -> None:
+    """`SENSITIVE_ACTIONS` drives the audit digest and the consent prompts.
+
+    The spot-check above covers `credential.*` and `integration.*` only, so
+    the non-vacuity pass found that removing `dispatch.resolve_review` from
+    the set broke nothing. It is the most consequential action a human can
+    take on an execution - asserting what happened to an effect nobody
+    observed, and possibly repeating it - so it belongs in a digest, and
+    something has to say so.
+
+    Writing this turned up that `execution.cancel` is *not* in the set while
+    `execution.retry_step` is. That is left as it was: cancelling stops work
+    rather than causing an external effect, so the line is defensible, but it
+    is a Phase 2 call and not one T6b should quietly change.
+    """
+    assert Action.DISPATCH_RESOLVE_REVIEW in SENSITIVE_ACTIONS
+    # Its nearest neighbour, and the reason the pair reads as a category:
+    # both can cause an outbound call to happen a second time.
+    assert Action.EXECUTION_RETRY_STEP in SENSITIVE_ACTIONS
 
 
 def test_no_action_can_read_a_secret() -> None:

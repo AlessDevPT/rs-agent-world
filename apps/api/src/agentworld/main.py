@@ -30,6 +30,7 @@ from agentworld.api.v1 import (
     ingest,
     me,
     projects,
+    review,
     self_,
     workflows,
     workspaces,
@@ -150,6 +151,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(credentials.router)
     app.include_router(executions.workflow_router)
     app.include_router(executions.router)
+    app.include_router(review.router)
 
     return app
 

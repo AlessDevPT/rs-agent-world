@@ -42,6 +42,12 @@ re-decision; the pivot does not touch any of it.
 Totals as committed: **444 API tests, 26 web tests, 5 import-linter contracts, mypy strict
 clean.**
 
+> **This table has not been extended past Phase 1.** Phases 2 and 3 (T0-T6b) are committed
+> and their status lives in `04-ROADMAP-AND-MVP.md`, per-task, with a document each
+> (`09`-`17`). The totals above are therefore historical: the suite is over 2,300 API tests
+> and 8 contracts as of T6b. Bringing §1 up to date is a documentation task of its own and
+> is deliberately not done inside a feature change.
+
 ### Corrections found while implementing, not while designing
 
 Both were found by a test written against a claim this proposal makes, which is the

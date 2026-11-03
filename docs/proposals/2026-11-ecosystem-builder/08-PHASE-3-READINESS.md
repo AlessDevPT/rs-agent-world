@@ -78,6 +78,7 @@ A stale row cannot hide either: a row naming a route that no longer exists would
 ### 2.4 The 77-action permission matrix — verified for what exists; 46 actions are forward-declared
 
 - `Action` has **77 members**; `MINIMUM_ROLE` has **77 keys**; no action lacks a role.
+  *(T6b made this 78 and 78: `dispatch.resolve_review`. See `17-T6B-REVIEW-API.md`.)*
 - **31 actions are referenced outside `policy.py`.** The other **46 are declared ahead of
   their endpoints** — approvals, triggers, credentials, integrations, knowledge, tools,
   world, builder, `WORKFLOW_PUBLISH`, `WORKFLOW_RUN`.

@@ -379,6 +379,79 @@ class DispatchReadRepository(ScopedRepository):
         )
         return list(rows.scalars().all())
 
+    async def needing_review(self, *, limit: int = 100) -> Sequence[Any]:
+        """Dispatches waiting for a person, oldest first.
+
+        Oldest first because this is a queue of stuck executions, not a feed:
+        the one that has been waiting longest is the one most likely to
+        matter. Each row is an execution that cannot finish until somebody
+        says what happened.
+        """
+        rows = await self._session.execute(
+            sa.select(m.Dispatch)
+            .where(
+                m.Dispatch.project_id == self.scope.require_project(),
+                m.Dispatch.status == DispatchStatus.NEEDS_REVIEW,
+            )
+            .order_by(m.Dispatch.created_at)
+            .limit(limit)
+        )
+        return list(rows.scalars().all())
+
+    async def resolve_review(
+        self,
+        dispatch_id: UUID,
+        *,
+        status: DispatchStatus,
+        note: str,
+        run_after: dt.datetime | None = None,
+    ) -> Any:
+        """Move a dispatch out of `needs_review`, once.
+
+        Guarded on `status = 'needs_review'`, which is what makes a duplicate
+        or conflicting resolution impossible rather than merely unlikely: two
+        people pressing different buttons at the same moment produce one
+        resolution and one 409. The caller turns a `None` into that.
+
+        `side_effect_started_at` is cleared. The flag means "a call was in
+        flight for this attempt", and a human has now said what became of
+        it - so leaving it set would make the *next* crash of a retried
+        dispatch look mid-flight when it had not started. What the flag
+        recorded is not lost: it is in the `dispatch.recovered` audit row
+        that escalated this dispatch in the first place, which nothing can
+        edit.
+
+        `note` goes into `last_error` because that is the column an operator
+        reading the row will look at, and a resolution is the last thing that
+        happened to it. The authoritative record, with the person's identity,
+        is the audit row the caller writes in this same transaction.
+        """
+        values: dict[str, Any] = {
+            "status": status,
+            "leased_by": None,
+            "leased_until": None,
+            "side_effect_started_at": None,
+            "last_error": note,
+            "last_error_code": "resolved_by_review",
+        }
+        if run_after is not None:
+            values["run_after"] = run_after
+        if status in (DispatchStatus.SUCCEEDED, DispatchStatus.DEAD, DispatchStatus.CANCELLED):
+            values["finished_at"] = sa.func.now()
+
+        return (
+            await self._session.execute(
+                sa.update(m.Dispatch)
+                .where(
+                    m.Dispatch.id == dispatch_id,
+                    m.Dispatch.project_id == self.scope.require_project(),
+                    m.Dispatch.status == DispatchStatus.NEEDS_REVIEW,
+                )
+                .values(**values)
+                .returning(m.Dispatch)
+            )
+        ).scalar_one_or_none()
+
 
 def _required(when: dt.datetime | None) -> dt.datetime:
     if when is None:  # pragma: no cover - the claim statement always sets it

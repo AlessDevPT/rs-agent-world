@@ -93,6 +93,10 @@ class Action(StrEnum):
     EXECUTION_CANCEL = "execution.cancel"
     EXECUTION_PAUSE_RESUME = "execution.pause_resume"
     EXECUTION_RETRY_STEP = "execution.retry_step"
+    #: Resolving a dispatch whose outcome nobody knows. Not a retry: the
+    #: person is asserting what happened to an effect this system could not
+    #: observe, which is why it is admin rather than member.
+    DISPATCH_RESOLVE_REVIEW = "dispatch.resolve_review"
     EXECUTION_PROVIDE_INPUT = "execution.provide_input"
 
     APPROVAL_READ = "approval.read"
@@ -198,6 +202,7 @@ MINIMUM_ROLE: dict[Action, MemberRole] = {
     Action.EXECUTION_CANCEL: MemberRole.MEMBER,
     Action.EXECUTION_PAUSE_RESUME: MemberRole.MEMBER,
     Action.EXECUTION_RETRY_STEP: MemberRole.MEMBER,
+    Action.DISPATCH_RESOLVE_REVIEW: MemberRole.ADMIN,
     Action.EXECUTION_PROVIDE_INPUT: MemberRole.MEMBER,
     Action.APPROVAL_READ: MemberRole.VIEWER,
     # The floor, not the answer. An approval carries its own
@@ -310,6 +315,7 @@ SENSITIVE_ACTIONS: frozenset[Action] = frozenset(
         Action.WORKFLOW_PUBLISH,
         Action.WORKFLOW_RUN,
         Action.EXECUTION_RETRY_STEP,
+        Action.DISPATCH_RESOLVE_REVIEW,
         Action.APPROVAL_DECIDE,
         Action.APPROVAL_POLICY_UPDATE,
         Action.CONNECTION_CREATE,

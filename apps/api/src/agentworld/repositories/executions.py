@@ -230,6 +230,36 @@ class ExecutionRepository(ScopedRepository):
             )
         ).scalar_one_or_none()
 
+    async def step_key_of(self, execution_step_id: UUID) -> str:
+        """The step key a dispatch's step row carries.
+
+        A dispatch names a step row; the human reading a review queue needs
+        the key the author wrote. Returns an empty string for a step that is
+        gone, because a missing key must not stop someone resolving the
+        uncertainty the dispatch represents.
+        """
+        found = (
+            await self._session.execute(
+                sa.select(m.ExecutionStep.step_key).where(
+                    m.ExecutionStep.id == execution_step_id,
+                    m.ExecutionStep.project_id == self.scope.require_project(),
+                )
+            )
+        ).scalar_one_or_none()
+        return str(found) if found is not None else ""
+
+    async def step_keys(self, execution_step_ids: Sequence[UUID]) -> Mapping[UUID, str]:
+        """The same, for a list - one query rather than one per row."""
+        if not execution_step_ids:
+            return {}
+        rows = await self._session.execute(
+            sa.select(m.ExecutionStep.id, m.ExecutionStep.step_key).where(
+                m.ExecutionStep.id.in_(list(execution_step_ids)),
+                m.ExecutionStep.project_id == self.scope.require_project(),
+            )
+        )
+        return {row[0]: str(row[1]) for row in rows.all()}
+
     async def list_in_project(self, *, limit: int = 50) -> Sequence[Any]:
         rows = await self._session.execute(
             sa.select(m.WorkflowExecution)

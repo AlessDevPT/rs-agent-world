@@ -221,8 +221,38 @@ The first phase where something runs, and the first where something is visible.
   is tested and unreachable from a published workflow. The non-vacuity pass removed a dead
   second writer of `workflow_executions.status` and found that the double-advance test was
   not racing. See `14-T5-EXECUTIONS.md`.
-- `workers/step_runner.py`, `workers/dispatch_reaper.py`.
-- `POST /v1/workflows/{id}/run`, `GET /v1/executions/{id}`.
+- ~~`workers/step_runner.py`, `workers/dispatch_reaper.py`.~~
+  **Done (T6, T6a, T6b), under different names.** The step runner and the reaper are
+  `services/dispatch.py` (`StepRunner`, `DispatchWorker`, `LeaseReaper`) because both are
+  orchestration over repositories, not processes; the only process is
+  `workers/reaper.py`, a dedicated worker with `--once` and continuous modes, deliberately
+  not run inside the API lifespan. Claiming is `FOR UPDATE SKIP LOCKED` plus a lease, and
+  `repositories/dispatches.py` may *update* a dispatch row but still may not *insert* one -
+  the containment test splits the allow-list by verb. `side_effect_started_at` is written
+  **before** the outbound call, so a lease that expires with it set means nobody knows
+  whether the effect landed: that dispatch goes to `needs_review` and **nothing retries it
+  automatically**. T6b added the only way out of that state:
+  `GET /v1/projects/{id}/dispatches` to see the queue at `viewer`, and
+  `POST .../dispatches/{id}/resolve` at `admin` under a new `dispatch.resolve_review`
+  action, with a mandatory note and an explicit acknowledgement before a retry that may
+  repeat the effect.
+  Recovery history is counted from `audit_log`, so no migration was needed. The
+  non-vacuity pass found a protection that nothing tested (the in-flight marker), two
+  tests of my own that were not racing, an audit row that recorded the resolution's own
+  note as the previous error, and two tests that **hung instead of failing** when their
+  protection was removed. See `15-T6-WORKER.md`, `16-T6A-PLAN.md`, `17-T6B-REVIEW-API.md`.
+  **One known reliability gap, open:** settling or resolving a dispatch commits in one
+  transaction and `advance_once` runs in a second, because it decides from committed
+  state. A process that dies between them leaves an execution that is complete,
+  consistent and **stalled**, with nothing scheduling the advance again. Introduced in
+  T6, inherited by T6b, not solved by either. Tracked as T6c -
+  `18-T6C-ADVANCEMENT-RECOVERY.md`.
+- ~~`POST /v1/workflows/{id}/run`, `GET /v1/executions/{id}`.~~ **Run route done (T5);
+  execution detail still to come.** Plus the T6b review queue:
+  `GET /v1/projects/{project_id}/dispatches` and
+  `POST /v1/projects/{project_id}/dispatches/{dispatch_id}/resolve`, which were not in
+  this plan - the `needs_review` state T6 created has to have an authorized way out, or
+  an execution that reaches it is stuck for ever.
 - `infra/event_bus.py` + the WebSocket gateway: snapshot, deltas, cursors, `resume`,
   `resync_required`.
 - The two new import-linter contracts, each verified by planting a violation.
@@ -242,8 +272,21 @@ The first phase where something runs, and the first where something is visible.
 - [ ] `advance()` unit tests pass with no database and no network; called twice on identical
       state it returns identical decisions.
 - [ ] A double `advance` produces **one** dispatch; the loser hits the unique constraint.
-- [ ] A worker killed mid-dispatch: the lease expires and the step completes exactly once.
+- [x] A worker killed mid-dispatch: the lease expires and the step completes exactly once.
+      **Met only for a crash *before* the outbound call** -
+      `test_an_expired_lease_is_recovered_and_the_work_runs`. A crash *during* the call is
+      deliberately **not** completed: `side_effect_started_at` is set beforehand, so the
+      reaper can tell the two apart, and the mid-flight case becomes `needs_review`
+      instead (`test_a_lease_that_expires_mid_flight_becomes_needs_review`). Completing it
+      exactly once would require knowing whether the effect landed, which is exactly what
+      nobody knows. This is a correction to the criterion, not a gap in the code: as
+      written it asks for a guess.
 - [ ] A 429 then success: one step, two attempts, one output.
+      **Not exercised end to end.** The parts are tested separately - a retryable failure
+      returns to `pending` with a future `run_after`, the idempotency token is stable
+      across attempts, and a backed-off row is not claimable until it is due - but no test
+      runs a failing attempt *followed by* a succeeding one and asserts a single output.
+      No test uses a 429 specifically either; 500 stands in for the retryable class.
 - [ ] A credential row copied into another workspace at the SQL level cannot be decrypted.
 - [ ] KEK rotation re-wraps every DEK with no plaintext access and no `ciphertext` change.
 - [ ] **The island displays real agents** from the backend, with their real statuses, and

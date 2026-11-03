@@ -15,7 +15,7 @@ opens its session with that id visible.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from typing import Any
 from uuid import UUID
 
@@ -66,6 +66,30 @@ class AuditLogRepository(ScopedRepository):
             .returning(m.AuditLogEntry.id)
         )
         return int(result.scalar_one())
+
+    async def count_by_resource(
+        self, *, action: str, resource_ids: Sequence[UUID]
+    ) -> Mapping[UUID, int]:
+        """How many rows of one action each resource has.
+
+        Added for T6b, which needs "how many times has this dispatch been
+        recovered before?" and reads it from here rather than from a column
+        on the row. That is the whole of what the recovery history was
+        required to provide, and it needed no migration: `audit_log` is
+        append-only by privilege, so the count cannot be quietly wrong.
+        """
+        if not resource_ids:
+            return {}
+        rows = await self._session.execute(
+            sa.select(m.AuditLogEntry.resource_id, sa.func.count())
+            .where(
+                m.AuditLogEntry.workspace_id == self.scope.workspace_id,
+                m.AuditLogEntry.action == action,
+                m.AuditLogEntry.resource_id.in_(list(resource_ids)),
+            )
+            .group_by(m.AuditLogEntry.resource_id)
+        )
+        return {row[0]: int(row[1]) for row in rows.all() if row[0] is not None}
 
     async def recent(self, *, limit: int = 50) -> list[tuple[int, str, str]]:
         """The latest entries as (id, action, resource_type).

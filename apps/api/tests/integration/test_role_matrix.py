@@ -18,6 +18,7 @@ from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy import text
 
 from agentworld.domain.enums import MemberRole
 from agentworld.infra.db import Database
@@ -183,6 +184,18 @@ ENDPOINTS = [
     Endpoint("POST", "/v1/projects/{project}/workflows/{workflow}/run", MemberRole.MEMBER, {}),
     Endpoint("GET", "/v1/projects/{project}/executions", MemberRole.VIEWER),
     Endpoint("GET", "/v1/projects/{project}/executions/{execution}", MemberRole.VIEWER),
+    # ---- Phase 3 / T6b ----------------------------------------------------
+    # The split in privilege is the design: seeing that an execution is
+    # stuck is operational awareness, while asserting what happened to an
+    # effect nobody observed is not. The resolve row is `admin` and is the
+    # only reason `dispatch.resolve_review` exists as its own action.
+    Endpoint("GET", "/v1/projects/{project}/dispatches", MemberRole.VIEWER),
+    Endpoint(
+        "POST",
+        "/v1/projects/{project}/dispatches/{dispatch}/resolve",
+        MemberRole.ADMIN,
+        {"outcome": "failed", "note": "Resolved while checking the role matrix."},
+    ),
 ]
 
 
@@ -199,6 +212,9 @@ class Scenario:
     #: An execution of that workflow, so the read rows have something to
     #: read. Created by the fixture, not by the row under test.
     execution_id: str
+    #: Its dispatch, parked in `needs_review` so the resolve row answers a
+    #: permission question rather than "this is not awaiting review".
+    dispatch_id: str
     credential_id: str
     #: A member who is never one of the callers, so that removing them is
     #: never self-service - which a viewer may do regardless of role.
@@ -216,6 +232,7 @@ class Scenario:
             "connection": self.connection_id,
             "workflow": self.workflow_id,
             "execution": self.execution_id,
+            "dispatch": self.dispatch_id,
             "credential": self.credential_id,
             "target": self.target_user_id,
         }
@@ -341,6 +358,21 @@ async def scenario(
         headers=actor.headers,
     )
     assert execution.status_code == 202, execution.text
+
+    # The run produced one dispatch. Parked in `needs_review` directly,
+    # because the role matrix is about permissions and arranging a crashed
+    # worker here would be testing the reaper instead.
+    async with owner_database.engine.begin() as conn:
+        dispatch_id = (
+            await conn.execute(
+                text(
+                    "UPDATE dispatches SET status = 'needs_review', "
+                    "last_error = 'parked for the role matrix' "
+                    "WHERE execution_id = :id RETURNING id"
+                ),
+                {"id": execution.json()["id"]},
+            )
+        ).scalar_one()
     credential = client.post(
         f"/v1/workspaces/{workspace['id']}/credentials",
         json={
@@ -362,6 +394,7 @@ async def scenario(
         connection_id=connection["id"],
         workflow_id=workflow_id,
         execution_id=execution.json()["id"],
+        dispatch_id=str(dispatch_id),
         credential_id=credential["id"],
         target_user_id=str(target_user_id),
         actors=actors,
@@ -469,6 +502,7 @@ def app_routes(client: TestClient) -> set[str]:
             .replace("{profile_id}", "{profile}")
             .replace("{credential_id}", "{credential}")
             .replace("{execution_id}", "{execution}")
+            .replace("{dispatch_id}", "{dispatch}")
             .replace("{user_id}", "{target}")
         )
         for method in operations:
