@@ -931,14 +931,15 @@ async def test_a_backed_off_retry_is_not_claimable_until_it_is_due(
     is left alone. Without the filter a failing dispatch would be retried in
     a tight loop at whatever speed the worker polls.
 
-    The jitter is pinned to its ceiling, and that is not tidiness. The
-    fallback backoff is `random.uniform(0, ceiling)` with `ceiling = 2.0` at
-    attempt 0, so the draw can be a few microseconds - and then `run_after`
-    is already in the past before this test reads the row, and it fails for
-    reasons that have nothing to do with the filter. Observed in a full-file
-    run: `run_after` 37 microseconds behind `now()`. Pinning the draw tests
-    the filter; the fact that an unpinned draw can be zero is a property of
-    the backoff, recorded as an open question rather than hidden here.
+    The draw is pinned to 60 seconds, and that is not tidiness. The real
+    first-retry window is 1-2 seconds, which leaves under two seconds for a
+    settle commit and a SELECT before `run_after` is in the past and the test
+    fails for reasons that have nothing to do with the filter. This used to
+    be worse: the fallback was `uniform(0, ceiling)`, so the draw could be a
+    few microseconds - observed in a full-file run at 37 microseconds behind
+    `now()`. Equal jitter put a floor under it, but a floor of one second is
+    still not margin, so the draw stays pinned. The window arithmetic is in
+    `tests/unit/test_backoff.py`; this test is about the filter.
     """
     monkeypatch.setattr(
         dispatch_service, "random", SimpleNamespace(uniform=lambda _low, _high: 60.0)

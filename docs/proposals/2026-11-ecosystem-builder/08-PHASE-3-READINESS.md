@@ -458,7 +458,7 @@ not shaped around Anthropic. Nothing above `infra/providers/` mentions a vendor;
 | Concurrent claiming | `FOR UPDATE SKIP LOCKED` + a lease |
 | Worker crash | `leased_until` expiry; the reaper returns the row to `pending` |
 | Uncertain outcome | `side_effect_started_at` set *before* a consequential call; a crash after it means `needs_review`, never an automatic retry |
-| Retry | classify first; backoff `min(15m, 2s · 2^attempt)` with full jitter; `max_attempts` 3, but **1** for consequential work |
+| Retry | classify first; backoff `ceiling = min(15m, 2s · 2^(claims-1))` with **equal** jitter, `uniform(ceiling/2, ceiling)`; `max_attempts` 3, but **1** for consequential work |
 | Dead letter | `status = dead` keeps instruction, error and lineage; always resolves its step by emitting `step_failed`; appears in the project's attention list |
 | Timeout | per-step wall clock enforced by the reaper, not by a hung dispatch |
 | Idempotency | `idempotency_token` per dispatch, forwarded to providers that accept one |

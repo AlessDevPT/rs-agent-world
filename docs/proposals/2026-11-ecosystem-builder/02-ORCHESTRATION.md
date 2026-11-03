@@ -451,9 +451,14 @@ Classification first, because retrying the wrong error is worse than not retryin
 | Tool not granted | **terminal** | `dead`. The grant changed; the decision must be remade |
 | Model refused or returned unusable output | retryable once, then terminal | one retry absorbs a transient refusal; two means the prompt is wrong |
 
-Backoff: `min(cap, base * 2^attempt)` with full jitter, `base = 2s`, `cap = 15m` for
-in-execution work. Jitter is not decoration — without it, a provider outage produces a
-synchronised retry storm from every parked dispatch the moment it recovers.
+Backoff: `ceiling = min(cap, base * 2^(claims - 1))` with **equal** jitter -
+`uniform(ceiling / 2, ceiling)` - `base = 2s`, `cap = 15m` for in-execution work. Jitter is not decoration:
+without it, a provider outage produces a synchronised retry storm from every parked
+dispatch the moment it recovers. *Equal* rather than full (`uniform(0, ceiling)`) because
+full jitter put a measured 4.95% of first retries inside 100 ms - a delay named "backoff"
+that did not delay anything - while half the ceiling still leaves a 50% spread. The
+exponent counts **claims**, not `attempt`: migration 0019 makes `attempt` immutable, so an
+exponent reading it never moved. See `15-T6-WORKER.md` §9.
 
 `max_attempts` defaults to 3 and is set per step. A `consequential` dispatch defaults to
 **1**: retrying something that may already have happened is a decision for a human, not a

@@ -317,7 +317,49 @@ rests on what its docstring claims.
 | `_will_retry` ignores the classification | `test_a_failed_result_fails_the_execution_through_the_same_path` |
 | The adapter stops passing the classification | the same test |
 | The budget reads `attempt` again | `test_the_attempt_budget_is_spent_and_then_the_work_is_over` |
-| The ceiling reads `attempt` again | `test_the_backoff_ceiling_grows_with_each_attempt` |
+| The ceiling reads `attempt` again | `test_the_window_doubles_with_each_claim`, in `tests/unit/test_backoff.py` |
+
+The last row named an integration test when this was written. That test was deleted in
+`82fbb0c`: it asserted a *remaining* duration against a lower bound, which measures the
+runner's database latency, and the claim moved to a unit test on `_backoff` where no
+database sits between computing the value and reading it.
+
+### The fallback jitter: approved as equal jitter
+
+The review left one policy question open rather than deciding it in passing: whether the
+fallback should be allowed to produce a delay arbitrarily close to zero. It was
+`uniform(0, ceiling)` - full jitter - and the measurements were:
+
+| claim_count | ceiling | mean | P(delay < 0.1s) |
+| --- | --- | --- | --- |
+| 1 | 2.0s | 0.99s | **4.95%** |
+| 2 | 4.0s | 2.02s | 2.56% |
+| 3 | 8.0s | 3.98s | 1.34% |
+
+So about one first retry in twenty was effectively immediate: a delay named "backoff"
+that did not delay anything, and the source of a flaky test that asserted a backed-off row
+was not yet claimable.
+
+**Approved and implemented: equal jitter, `uniform(ceiling / 2, ceiling)`.** Half the
+ceiling keeps a 50% spread - enough that workers failing together do not converge, which
+is the whole reason jitter is there - while guaranteeing the wait happened. It scales with
+the ceiling instead of adding a constant to keep in step with it, and it cannot interact
+with the 900-second cap, because half of a capped ceiling is still under the cap. A valid
+`Retry-After` still wins outright, `Retry-After: 0` is still an explicit zero, and invalid
+or negative values still fall back to the jitter.
+
+**What this does not buy, stated plainly.** With `max_attempts` at 3 and a 2-second base,
+the whole retry horizon is about 3 seconds expected and 6 at worst under either policy, so
+no provider outage of a realistic length is survived by jitter policy. A 30-second 503
+fails every execution either way. The horizon - attempts, base, and a circuit breaker - is
+T8's, and the floor is not a substitute for it. That is the thing to fix in T8, not this.
+
+**Three immediate-retry paths were found; one remains by design and one by omission.**
+The jitter path is closed. `Retry-After: 0` stays, deliberately: a provider saying "now"
+is making a statement about its own readiness, and the floor is for our guesses. And
+`reclaim` sets status, lease and error but never `run_after`, so a reaper-recovered
+dispatch keeps a stale past timestamp and is immediately claimable with no backoff at all
+- untouched here, since lease behaviour was out of scope, and worth a decision in T8.
 
 ### One knock-on, recorded rather than fixed
 

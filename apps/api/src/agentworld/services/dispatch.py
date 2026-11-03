@@ -620,6 +620,22 @@ def _backoff(claimed: ClaimedDispatch, outcome: Outcome) -> dt.datetime:
     adding noise to a number we asked for is second-guessing it. Jitter stays
     on the fallback, where several workers are guessing the same number and
     need not to converge on it.
+
+    **The fallback jitter is *equal* jitter**, `uniform(ceiling / 2, ceiling)`,
+    not full jitter from zero. Full jitter decorrelates retries better, which
+    is its point, but it meant a measured 4.95% of first retries landed inside
+    100 ms: a delay named "backoff" that did not delay anything. Half the
+    ceiling keeps a 50% spread - enough that workers failing together do not
+    converge - while guaranteeing the wait happened at all. It scales with the
+    ceiling rather than introducing a constant to keep in step with it, and it
+    cannot interact with the 900-second cap, because half of a capped ceiling
+    is still under the cap.
+
+    This buys less than it looks. With `max_attempts` at 3 and a 2-second
+    base, the whole retry horizon is about 3 seconds expected and 6 at worst
+    either way, so no provider outage of a realistic length is survived by
+    jitter policy. The horizon - attempts, base, and a circuit breaker - is
+    T8's, and a floor is not a substitute for it.
     """
     if (asked := outcome.retry_after_seconds) is not None and asked >= 0:
         return dt.datetime.now(dt.UTC) + dt.timedelta(seconds=min(asked, RETRY_AFTER_MAX_SECONDS))
@@ -629,7 +645,7 @@ def _backoff(claimed: ClaimedDispatch, outcome: Outcome) -> dt.datetime:
     # original two-second ceiling, so `claim_count - 1` rather than
     # `claim_count`.
     ceiling = min(float(RETRY_AFTER_MAX_SECONDS), 2.0 * (2 ** max(0, claimed.claim_count - 1)))
-    return dt.datetime.now(dt.UTC) + dt.timedelta(seconds=random.uniform(0, ceiling))
+    return dt.datetime.now(dt.UTC) + dt.timedelta(seconds=random.uniform(ceiling / 2, ceiling))
 
 
 async def _report_step(work: UnitOfWork, claimed: ClaimedDispatch, outcome: Outcome) -> None:
