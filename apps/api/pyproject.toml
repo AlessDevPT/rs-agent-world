@@ -25,6 +25,13 @@ dependencies = [
     "httpx>=0.27.0",
 ]
 
+# The two background processes. Neither may run inside the API: both compete
+# with request handling for the connection pool and both would run once per
+# replica. See their module docstrings.
+[project.scripts]
+agentworld-worker = "agentworld.workers.worker:main"
+agentworld-reaper = "agentworld.workers.reaper:main"
+
 [project.optional-dependencies]
 dev = [
     "pytest>=8.3.0",

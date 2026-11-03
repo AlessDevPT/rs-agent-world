@@ -23,6 +23,8 @@
     "api:venv": "python -m venv apps/api/.venv",
     "api:install": "python scripts/api.py install",
     "api:dev": "python scripts/api.py dev",
+    "api:worker": "python scripts/api.py worker",
+    "api:reaper": "python scripts/api.py reaper",
     "api:migrate": "python scripts/api.py migrate",
     "api:revision": "python scripts/api.py revision",
     "api:test": "python scripts/api.py test",

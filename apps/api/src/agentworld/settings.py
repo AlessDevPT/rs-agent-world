@@ -103,6 +103,23 @@ class Settings(BaseSettings):
     #: short wastes locks; too long leaves a stalled execution stalled for
     #: longer. Zero is allowed, for tests that want no window at all.
     reconcile_grace_seconds: int = Field(default=60, ge=0, le=3600)
+    #: How long the worker waits after finding the queue empty. The floor on
+    #: how long a new dispatch waits before anything notices it - and the
+    #: cost of shortening it is one claim query *per live workspace* per
+    #: poll, because the outbox is under forced row-level security and
+    #: claiming has to be scoped. A claim that *finds* work does not sleep at
+    #: all, so a backlog drains at the speed of the work.
+    worker_idle_sleep_seconds: float = Field(default=2.0, gt=0, le=300)
+    #: The lease a worker takes. Must outlast the slowest provider call it
+    #: will make, or the reaper reclaims work that is still running - and a
+    #: call already in flight becomes `needs_review` rather than a retry. The
+    #: egress policy's own total timeout is 30 seconds, so 120 leaves room
+    #: for the claim, the credential decryption and the report.
+    worker_lease_seconds: int = Field(default=120, ge=10, le=3600)
+    #: Consecutive failed turns before the loop exits non-zero. Same reason
+    #: as the reaper's: a worker spinning against a database that is refusing
+    #: it is a worker nobody notices.
+    worker_max_consecutive_errors: int = Field(default=5, ge=1, le=100)
 
     cors_origins: str = "http://localhost:3000"
 

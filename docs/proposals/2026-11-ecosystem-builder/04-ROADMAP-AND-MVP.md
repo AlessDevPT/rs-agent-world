@@ -222,11 +222,21 @@ The first phase where something runs, and the first where something is visible.
   second writer of `workflow_executions.status` and found that the double-advance test was
   not racing. See `14-T5-EXECUTIONS.md`.
 - ~~`workers/step_runner.py`, `workers/dispatch_reaper.py`.~~
-  **Done (T6, T6a, T6b), under different names.** The step runner and the reaper are
+  **Done (T6, T6a, T6b, T6d), under different names.** The step runner and the reaper are
   `services/dispatch.py` (`StepRunner`, `DispatchWorker`, `LeaseReaper`) because both are
-  orchestration over repositories, not processes; the only process is
-  `workers/reaper.py`, a dedicated worker with `--once` and continuous modes, deliberately
-  not run inside the API lifespan. Claiming is `FOR UPDATE SKIP LOCKED` plus a lease, and
+  orchestration over repositories, not processes. The processes are `workers/worker.py`
+  and `workers/reaper.py`, each with `--once` and continuous modes, deliberately not run
+  inside the API lifespan.
+
+  *An earlier revision of this bullet said "the only process is `workers/reaper.py`",
+  which was true and misleading: there was no process that **performed** a dispatch at
+  all. `DispatchWorker.run_once` had no production caller, so every part of T0-T6c was
+  exercised only by the test suite, and a real deployment could write a dispatch row that
+  nothing would ever claim. T6d added the loop, the console entry points
+  (`agentworld-worker`, `agentworld-reaper`) and the runner tasks (`npm run api:worker`,
+  `npm run api:reaper`). The lesson is the one this document keeps relearning: "the code
+  exists" and "something runs it" are different claims, and the acceptance criteria are
+  where the difference shows up.* Claiming is `FOR UPDATE SKIP LOCKED` plus a lease, and
   `repositories/dispatches.py` may *update* a dispatch row but still may not *insert* one -
   the containment test splits the allow-list by verb. `side_effect_started_at` is written
   **before** the outbound call, so a lease that expires with it set means nobody knows

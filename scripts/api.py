@@ -52,6 +52,16 @@ def task_dev() -> int:
     return run([str(venv_bin("python")), "-m", "uvicorn", "agentworld.main:app", "--reload", "--port", "8000"])
 
 
+def task_worker() -> int:
+    """The dispatch worker. Nothing performs queued work without it."""
+    return run([str(venv_bin("python")), "-m", "agentworld.workers.worker", *sys.argv[2:]])
+
+
+def task_reaper() -> int:
+    """Lease recovery and advancement reconciliation, in one process."""
+    return run([str(venv_bin("python")), "-m", "agentworld.workers.reaper", *sys.argv[2:]])
+
+
 def task_test() -> int:
     return run([str(venv_bin("python")), "-m", "pytest", *sys.argv[2:]])
 
@@ -106,6 +116,8 @@ def task_format() -> int:
 TASKS = {
     "install": task_install,
     "dev": task_dev,
+    "worker": task_worker,
+    "reaper": task_reaper,
     "migrate": task_migrate,
     "revision": task_revision,
     "test": task_test,

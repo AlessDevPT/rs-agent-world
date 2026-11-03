@@ -60,7 +60,6 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
-import signal
 import time
 from dataclasses import dataclass
 
@@ -71,6 +70,7 @@ from agentworld.services.dispatch import LeaseReaper
 from agentworld.services.executions import ExecutionService
 from agentworld.services.reconcile import AdvanceReconciler, ReconcileResult
 from agentworld.settings import Settings, get_settings
+from agentworld.workers._signals import install_stop_handlers
 
 log = get_logger(__name__)
 
@@ -136,7 +136,7 @@ async def run_forever(settings: Settings | None = None) -> int:
     reaper = LeaseReaper(factory)
     reconciler = _reconciler(factory, resolved)
     stopping = asyncio.Event()
-    _install_signal_handlers(stopping)
+    install_stop_handlers(stopping)
 
     log.info(
         "reaper_starting",
@@ -189,22 +189,6 @@ def _reconciler(factory: UnitOfWorkFactory, settings: Settings) -> AdvanceReconc
         executions=ExecutionService(factory),
         grace_seconds=settings.reconcile_grace_seconds,
     )
-
-
-def _install_signal_handlers(stopping: asyncio.Event) -> None:
-    """Ask the loop to finish its sweep and return.
-
-    Best-effort: `add_signal_handler` is not implemented on Windows, where a
-    developer running this in a terminal gets KeyboardInterrupt instead -
-    which is the same outcome by a different route.
-    """
-    loop = asyncio.get_running_loop()
-    for name in ("SIGINT", "SIGTERM"):
-        signum = getattr(signal, name, None)
-        if signum is None:
-            continue
-        with contextlib.suppress(NotImplementedError):
-            loop.add_signal_handler(signum, stopping.set)
 
 
 async def _main(argv: list[str] | None = None) -> int:
