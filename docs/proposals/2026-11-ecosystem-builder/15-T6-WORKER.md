@@ -215,6 +215,8 @@ exercises the worker's own path.
   left is retried with jittered exponential backoff; everything else is terminal. A
   provider's `Retry-After` is parsed by the adapter and **not yet honoured** by the worker —
   T8's call, and the provider knows better than the backoff does.
+  *(T6a honoured `Retry-After`, clamped to 900 s. And the Phase 3 acceptance review found
+  that the paragraph above described something the code did not do — see §9.)*
 - **No `workflow.step_retried` event.** A retry puts the row back to `pending` and tells the
   step nothing, because nothing has been *decided* about the step. The event belongs with
   T8's retry decision.
@@ -240,3 +242,86 @@ exercises the worker's own path.
 3. **Does a `needs_review` dispatch need an endpoint before Phase 3a?** It is the one state
    that requires a human and currently has no way to reach one.
 4. **Notification instead of polling** — at what scale, and which mechanism.
+
+
+---
+
+## 9. What the Phase 3 acceptance review found, and the fix
+
+Closing the last unticked Phase 3 criterion - *a 429 then success: one step, two attempts,
+one output* - turned up three things about the retry path. None was a safety hole; all three
+were the retry policy not being the policy the code and tests described.
+
+### The attempt budget was never consumed
+
+`_will_retry` computed `claimed.attempt + 1 < claimed.max_attempts`. Migration 0019 makes
+`attempt` immutable - it is the *identity* of a unit of work, which is what makes
+`UNIQUE (execution_step_id, kind, attempt)` guard creation - so that expression was frozen
+at `0 + 1 < 3` for the life of a row. Only `claim_count` moves.
+
+Measured, with the provider answering 500 every time:
+
+```
+attempt 1: ('pending', 0, 1)      attempt == 0 throughout
+attempt 2: ('pending', 0, 2)      claim_count is the thing that moves
+attempt 3: ('pending', 0, 3)      max_attempts is 3
+attempt 4: ('pending', 0, 4)
+attempt 5: ('pending', 0, 5)      five provider calls, still claimable
+```
+
+And because `_backoff`'s ceiling was `2.0 * 2**claimed.attempt`, it was frozen at two
+seconds as well. So a permanently failing call was re-sent roughly once a second,
+indefinitely, with real spend, and the execution stayed `running` for ever because the step
+was never told anything. T6c cannot help: there *is* an unsettled dispatch, and the
+reconciler is right to leave it alone.
+
+**Fixed** by bounding on `claim_count`, which is what increments, and growing the ceiling
+with it. The budget is now exactly `max_attempts` provider calls.
+
+**The consequence worth knowing:** `claim_count` cannot tell "the provider refused" from
+"our worker died before calling", so a claim that crashed pre-call also consumes budget. A
+crash-looping worker can therefore exhaust a dispatch. That is bounded failure instead of
+unbounded looping, and it is visible in the column - but separating the two needs a
+dedicated failure counter, a migration, and a decision. Not smuggled in with a fix.
+
+### A terminal failure was retried
+
+`ProviderFailure.is_retryable` has classified `UNAUTHORIZED`, `INVALID_REQUEST` and
+`MALFORMED_RESPONSE` as terminal since T3, with a docstring saying retrying a 400 "turns one
+caller's mistake into three times the spend". **Nothing consulted it.** `StepRunner` mapped
+every failure except `TIMEOUT` to `FAILED`, and `_will_retry` retried any `FAILED`. Measured:
+a 400 left the dispatch `pending` with `last_error_code = invalid_request`.
+
+Worse than dead code, because it is *tested* code: `test_providers.py` asserts the full
+classification, so the predicate reads like an enforced guarantee. The same is true of
+`infra/net/errors.py`'s own `is_retryable`, which is also consulted nowhere.
+
+**Fixed** by carrying the adapter's classification on `Outcome.retryable` and gating
+`_will_retry` on it. Defaults to `True`, so an outcome built outside the adapter - the
+runner-crash path - keeps being retried, now bounded by the budget.
+
+### A test that documented the opposite of what ran
+
+`test_a_failed_result_fails_the_execution_through_the_same_path` said the 400's terminal
+classification is why the worker does not retry - and then set `max_attempts = 1`, with a
+comment that this made the classification decisive "rather than the attempt budget". It was
+the budget doing all the work; remove the line and the 400 was retried.
+
+The crutch is gone. The test now runs with the full budget, asserts one provider call, and
+rests on what its docstring claims.
+
+### Non-vacuity
+
+| Weakening | What fails |
+| --- | --- |
+| `_will_retry` ignores the classification | `test_a_failed_result_fails_the_execution_through_the_same_path` |
+| The adapter stops passing the classification | the same test |
+| The budget reads `attempt` again | `test_the_attempt_budget_is_spent_and_then_the_work_is_over` |
+| The ceiling reads `attempt` again | `test_the_backoff_ceiling_grows_with_each_attempt` |
+
+### One knock-on, recorded rather than fixed
+
+`17-T6B-REVIEW-API.md` §8 lists, as a limitation, that a dispatch already at its attempt
+ceiling can be resolved as `retry` and then fail immediately. That was unreachable before -
+the ceiling was never reached - and it is reachable now. The behaviour is as documented and
+as approved ("retry grants no extra attempts"); what changed is that it can actually happen.

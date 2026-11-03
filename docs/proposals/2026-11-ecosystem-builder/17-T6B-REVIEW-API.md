@@ -208,9 +208,12 @@ caller rather than only for the one that arrives through the schema.
   thing that happened. The reason the dispatch was escalated is not lost: it
   is in the `dispatch.recovered` audit row that escalated it, and in this
   resolution's audit row as `previous_error`. Nothing can edit either.
-- **`retry` grants no extra attempts.** `attempt` is immutable and the retry
-  budget is unchanged, so a dispatch already at its attempt ceiling can be
-  resolved as `retry` and then fail again immediately. Whether a human
+- **`retry` grants no extra attempts.** The retry budget is unchanged, so a
+  dispatch already at its ceiling can be resolved as `retry` and then fail
+  again immediately. *(When this was written the ceiling was unreachable -
+  the Phase 3 acceptance review found the budget was never consumed at all.
+  With that fixed, bounded on `claim_count`, this limitation is real rather
+  than theoretical. Behaviour as approved; see `15-T6-WORKER.md` §9.)* Whether a human
   resolution should raise the ceiling is a T8 question, not answered here.
 - **The advance is a second transaction.** The resolution, the step event and the audit
   row commit together; `advance_once` then runs after that block, because it takes the

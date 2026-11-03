@@ -286,12 +286,21 @@ The first phase where something runs, and the first where something is visible.
       exactly once would require knowing whether the effect landed, which is exactly what
       nobody knows. This is a correction to the criterion, not a gap in the code: as
       written it asks for a guess.
-- [ ] A 429 then success: one step, two attempts, one output.
-      **Not exercised end to end.** The parts are tested separately - a retryable failure
-      returns to `pending` with a future `run_after`, the idempotency token is stable
-      across attempts, and a backed-off row is not claimable until it is due - but no test
-      runs a failing attempt *followed by* a succeeding one and asserts a single output.
-      No test uses a 429 specifically either; 500 stands in for the retryable class.
+- [x] A 429 then success: one step, two attempts, one output.
+      `test_a_rate_limit_then_success_is_one_step_two_attempts_one_output`. A real 429
+      with `Retry-After: 30`, the delay asserted as the provider's rather than ours, then
+      the row made due and served. What it checks afterwards is the accounting: one
+      dispatch row, one step row, one non-null output, `claim_count == 2`, `attempt`
+      unmoved, the execution `completed`, and both requests carrying the same idempotency
+      token - so "one output" is true at the receiver too, not only in our rows.
+      **Two defects found while closing it, both now fixed** (`15-T6-WORKER.md` §9).
+      `_will_retry` bounded retries on `attempt`, which migration 0019 makes immutable, so
+      the budget was never consumed: measured at five provider calls against a
+      `max_attempts` of 3, with the backoff ceiling frozen at two seconds - a failing call
+      re-sent about once a second for ever, and an execution that never terminated. And
+      `ProviderFailure.is_retryable` was consulted by nothing, so a 400 was retried too,
+      despite being classified terminal since T3 and asserted as such in
+      `test_providers.py`. Both bounded on `claim_count` and the classification now.
 - [ ] A credential row copied into another workspace at the SQL level cannot be decrypted.
 - [ ] KEK rotation re-wraps every DEK with no plaintext access and no `ciphertext` change.
 - [ ] **The island displays real agents** from the backend, with their real statuses, and

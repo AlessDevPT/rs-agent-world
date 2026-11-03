@@ -101,6 +101,15 @@ class Outcome:
     #: From the provider's `Retry-After`, when it sent a usable one. The
     #: backoff honours it, clamped - see `_backoff`.
     retry_after_seconds: float | None = None
+    #: Whether trying again could plausibly give a different answer, as the
+    #: provider adapter classified it. False for a 400, a 401 or a malformed
+    #: response: nothing about waiting changes those, and retrying a caller's
+    #: mistake three times only spends three times as much.
+    #:
+    #: Defaults to True so that an outcome built outside the adapter - the
+    #: runner-crash path, say - keeps the old behaviour of being retried,
+    #: bounded by the attempt budget.
+    retryable: bool = True
 
     @property
     def is_success(self) -> bool:
@@ -212,6 +221,7 @@ class StepRunner:
                 error_code=exc.failure.value,
                 uncertain=uncertain,
                 retry_after_seconds=exc.retry_after_seconds,
+                retryable=exc.failure.is_retryable,
             )
 
         return Outcome(
@@ -548,13 +558,41 @@ def _recovery_for(expired: ExpiredLease) -> tuple[DispatchStatus, str]:
 def _will_retry(claimed: ClaimedDispatch, outcome: Outcome) -> bool:
     """Whether this failure goes back to `pending` for another attempt.
 
-    Deliberately narrow, and T8 owns the real policy. `FAILED` with attempts
-    left is retried; everything else is terminal. A `needs_review` row is
-    never retried by anything, which is the whole point of it.
+    Three gates, and two of them were added after the Phase 3 acceptance
+    review measured what this function actually did.
+
+    **`needs_review` is never retried**, which is the whole point of it.
+
+    **A failure the provider classified terminal is not retried.** A 400, a
+    401 and a malformed response cannot be fixed by waiting, and retrying
+    them turns one caller's mistake into three times the spend.
+    `ProviderFailure.is_retryable` has said so since T3 and was consulted by
+    nothing: the review found a 400 going back to `pending`, and an existing
+    test whose docstring claimed the opposite while quietly setting
+    `max_attempts = 1` to make its assertion hold.
+
+    **The budget is counted in claims, not in `attempt`.** This read
+    `claimed.attempt + 1 < claimed.max_attempts`, and migration 0019 makes
+    `attempt` immutable - it is the identity of a unit of work, not a
+    counter. So the expression was frozen at `0 + 1 < 3` and the budget was
+    never consumed: five consecutive failures produced five provider calls
+    and a row still `pending`, with the backoff ceiling also frozen at two
+    seconds. Measured, not inferred.
+
+    `claim_count` is what moves, so it is what bounds this. The consequence
+    worth knowing: a claim that crashed before the call also consumes
+    budget, because the counter cannot tell "the provider refused" from "our
+    worker died". That is bounded failure instead of unbounded looping, and
+    it is visible in `claim_count` - but it does mean a crash-looping worker
+    can exhaust a dispatch. A separate failure counter would separate the
+    two, and that needs a migration and a decision rather than being
+    smuggled in here.
     """
     if outcome.status is not DispatchStatus.FAILED:
         return False
-    return claimed.attempt + 1 < claimed.max_attempts
+    if not outcome.retryable:
+        return False
+    return claimed.claim_count < claimed.max_attempts
 
 
 def _backoff(claimed: ClaimedDispatch, outcome: Outcome) -> dt.datetime:
@@ -585,7 +623,12 @@ def _backoff(claimed: ClaimedDispatch, outcome: Outcome) -> dt.datetime:
     """
     if (asked := outcome.retry_after_seconds) is not None and asked >= 0:
         return dt.datetime.now(dt.UTC) + dt.timedelta(seconds=min(asked, RETRY_AFTER_MAX_SECONDS))
-    ceiling = min(float(RETRY_AFTER_MAX_SECONDS), 2.0 * (2**claimed.attempt))
+    # `claim_count`, not `attempt`: `attempt` is immutable, so this ceiling
+    # was frozen at two seconds for every retry of a row - a failing call
+    # was re-sent roughly once a second for ever. The first retry keeps the
+    # original two-second ceiling, so `claim_count - 1` rather than
+    # `claim_count`.
+    ceiling = min(float(RETRY_AFTER_MAX_SECONDS), 2.0 * (2 ** max(0, claimed.claim_count - 1)))
     return dt.datetime.now(dt.UTC) + dt.timedelta(seconds=random.uniform(0, ceiling))
 
 

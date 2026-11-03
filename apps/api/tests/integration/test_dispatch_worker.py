@@ -23,6 +23,7 @@ import json
 import uuid
 from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -34,6 +35,7 @@ from agentworld.infra import net
 from agentworld.infra.db import Database
 from agentworld.repositories.base import TenantScope
 from agentworld.repositories.unit_of_work import UnitOfWorkFactory
+from agentworld.services import dispatch as dispatch_service
 from agentworld.services.credentials import CredentialService
 from agentworld.services.dispatch import (
     DispatchWorker,
@@ -740,25 +742,26 @@ async def test_a_failed_result_fails_the_execution_through_the_same_path(
     factory: UnitOfWorkFactory,
     owner_database: Database,
 ) -> None:
-    """Advancement after a failure, with no attempts left.
+    """Advancement after a failure the provider classified terminal.
 
-    The provider answers 400, which the adapter classifies terminal, so the
+    The provider answers 400, the adapter classifies it terminal, and the
     worker does not retry: the step fails, `advance()` sees a failed step and
     fails the execution. One path for both outcomes.
+
+    This test used to force `max_attempts = 1`, with a comment saying that
+    made the classification decisive "rather than the attempt budget" - and
+    the acceptance review found it was the budget doing all the work. The
+    classification was consulted nowhere, and without that line the 400 went
+    back to `pending`. The line is gone, so the assertion now rests on what
+    the docstring claims: the full budget is available and the 400 is still
+    terminal after one call.
     """
     execution_id = scenario.run()
     provider.status = 400
     worker = _worker(factory, provider)
 
-    # One attempt only, so the terminal classification is what decides it
-    # rather than the attempt budget.
-    async with owner_database.session() as session:
-        await session.execute(
-            text("UPDATE dispatches SET max_attempts = 1 WHERE execution_id = :id"),
-            {"id": str(execution_id)},
-        )
-
     assert await worker.run_once() is not None
+    assert len(provider.requests) == 1, "a terminal failure was retried"
 
     row = await _dispatch_row(owner_database, execution_id)
     assert row.status == DispatchStatus.FAILED
@@ -919,6 +922,7 @@ async def test_a_backed_off_retry_is_not_claimable_until_it_is_due(
     provider: FakeProvider,
     factory: UnitOfWorkFactory,
     owner_database: Database,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """`run_after` is a real filter, not decoration.
 
@@ -926,7 +930,19 @@ async def test_a_backed_off_retry_is_not_claimable_until_it_is_due(
     now before claiming again, so nothing ever asserted that a backed-off row
     is left alone. Without the filter a failing dispatch would be retried in
     a tight loop at whatever speed the worker polls.
+
+    The jitter is pinned to its ceiling, and that is not tidiness. The
+    fallback backoff is `random.uniform(0, ceiling)` with `ceiling = 2.0` at
+    attempt 0, so the draw can be a few microseconds - and then `run_after`
+    is already in the past before this test reads the row, and it fails for
+    reasons that have nothing to do with the filter. Observed in a full-file
+    run: `run_after` 37 microseconds behind `now()`. Pinning the draw tests
+    the filter; the fact that an unpinned draw can be zero is a property of
+    the backoff, recorded as an open question rather than hidden here.
     """
+    monkeypatch.setattr(
+        dispatch_service, "random", SimpleNamespace(uniform=lambda _low, high: high)
+    )
     execution_id = scenario.run()
     provider.status = 500
     worker = _worker(factory, provider)
@@ -948,6 +964,189 @@ async def test_a_backed_off_retry_is_not_claimable_until_it_is_due(
     provider.status = 200
     assert await worker.run_once() is not None
     assert len(provider.requests) == 2
+
+
+async def _make_due(owner_database: Database, execution_id: uuid.UUID) -> None:
+    """Bring a backed-off row forward. Time travel, not a sleep.
+
+    The claim filters `run_after <= now`, so this is exactly what the delay
+    elapsing would do - without spending the delay.
+    """
+    async with owner_database.session() as session:
+        await session.execute(
+            text("UPDATE dispatches SET run_after = now() WHERE execution_id = :id"),
+            {"id": str(execution_id)},
+        )
+
+
+async def test_the_attempt_budget_is_spent_and_then_the_work_is_over(
+    scenario: Scenario,
+    provider: FakeProvider,
+    factory: UnitOfWorkFactory,
+    owner_database: Database,
+) -> None:
+    """A dispatch that always fails stops, and stops at `max_attempts`.
+
+    The acceptance review measured the opposite. `_will_retry` read
+    `claimed.attempt`, which migration 0019 makes immutable, so the budget
+    was never consumed: five consecutive failures gave five provider calls
+    and a row still `pending`, forever, at roughly one call a second. The
+    bound is now `claim_count`, which is the thing that actually moves.
+
+    Driven until it stops rather than for a fixed number of rounds, so the
+    test states "it terminates" rather than assuming where.
+    """
+    execution_id = scenario.run()
+    provider.status = 500
+    worker = _worker(factory, provider)
+
+    budget = (await _dispatch_row(owner_database, execution_id)).claim_count
+    assert budget == 0, "the row should not be claimed yet"
+
+    for _ in range(10):
+        if await worker.run_once() is None:
+            break
+        row = await _dispatch_row(owner_database, execution_id)
+        if row.status != DispatchStatus.PENDING:
+            break
+        await _make_due(owner_database, execution_id)
+    else:  # pragma: no cover - ten rounds without terminating is the old bug
+        pytest.fail("the dispatch never ran out of attempts")
+
+    settled = await _dispatch_row(owner_database, execution_id)
+    assert settled.status == DispatchStatus.FAILED, "a spent dispatch is still claimable"
+    assert settled.claim_count == 3, "the budget is `max_attempts`, which defaults to 3"
+    assert len(provider.requests) == 3, "the provider was called more often than the budget"
+
+    execution, step = await _states(owner_database, execution_id)
+    assert step == StepStatus.FAILED
+    assert execution == ExecutionStatus.FAILED, "a spent dispatch left the execution running"
+
+
+async def test_the_backoff_ceiling_grows_with_each_attempt(
+    scenario: Scenario,
+    provider: FakeProvider,
+    factory: UnitOfWorkFactory,
+    owner_database: Database,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Each retry waits longer than the last.
+
+    It did not. The ceiling was `2.0 * 2**claimed.attempt`, and `attempt`
+    never moves, so every retry of a row drew from the same two-second
+    window - which is the difference between backing off and hammering a
+    provider that is down.
+
+    The draw is pinned to the ceiling so the assertion is about the ceiling
+    rather than about luck.
+    """
+    monkeypatch.setattr(
+        dispatch_service, "random", SimpleNamespace(uniform=lambda _low, high: high)
+    )
+    execution_id = scenario.run()
+    provider.status = 500
+    worker = _worker(factory, provider)
+
+    assert await worker.run_once() is not None
+    first = await _dispatch_row(owner_database, execution_id)
+    first_delay = (first.run_after - dt.datetime.now(dt.UTC)).total_seconds()
+
+    await _make_due(owner_database, execution_id)
+    assert await worker.run_once() is not None
+    second = await _dispatch_row(owner_database, execution_id)
+    second_delay = (second.run_after - dt.datetime.now(dt.UTC)).total_seconds()
+
+    assert 1.0 < first_delay <= 2.0, f"first ceiling moved: {first_delay}s"
+    assert 3.0 < second_delay <= 4.0, (
+        f"the ceiling did not grow: {first_delay}s then {second_delay}s"
+    )
+
+
+async def test_a_rate_limit_then_success_is_one_step_two_attempts_one_output(
+    scenario: Scenario,
+    provider: FakeProvider,
+    factory: UnitOfWorkFactory,
+    owner_database: Database,
+) -> None:
+    """The Phase 3 acceptance criterion, end to end.
+
+    The pieces were each tested separately - a retryable failure returns to
+    `pending` with a future `run_after`, the idempotency token is stable
+    across attempts, a backed-off row is not claimable until due - but
+    nothing ran a failing attempt *followed by* a succeeding one and then
+    looked at what was left behind. That is where double-counting would
+    show: a second dispatch row, a second step row, two outputs, or an
+    `attempt` that moved.
+
+    429 rather than 500, because a rate limit is the realistic case and it
+    carries `Retry-After`, so the delay is the provider's rather than ours.
+    """
+    execution_id = scenario.run()
+    provider.status = 429
+    provider.extra_headers = {"Retry-After": "30"}
+    worker = _worker(factory, provider)
+
+    assert await worker.run_once() is not None
+    first = await _dispatch_row(owner_database, execution_id)
+    assert first.status == DispatchStatus.PENDING, "a 429 was not treated as retryable"
+    assert first.claim_count == 1
+    delay = (first.run_after - dt.datetime.now(dt.UTC)).total_seconds()
+    assert 25 <= delay <= 30, f"Retry-After was not honoured: {delay}s"
+
+    # Time travel rather than a sleep. The claim filters `run_after <= now`,
+    # so this is exactly what thirty seconds passing would do to the row.
+    async with owner_database.session() as session:
+        await session.execute(
+            text("UPDATE dispatches SET run_after = now() WHERE execution_id = :id"),
+            {"id": str(execution_id)},
+        )
+    provider.status = 200
+    provider.extra_headers = {}
+    assert await worker.run_once() is not None
+
+    # One step, two attempts, one output.
+    async with owner_database.session() as session:
+        dispatches = (
+            await session.execute(
+                text("SELECT count(*) FROM dispatches WHERE execution_id = :id"),
+                {"id": str(execution_id)},
+            )
+        ).scalar_one()
+        steps = (
+            await session.execute(
+                text("SELECT count(*) FROM execution_steps WHERE execution_id = :id"),
+                {"id": str(execution_id)},
+            )
+        ).scalar_one()
+        outputs = (
+            await session.execute(
+                text(
+                    "SELECT count(*) FROM execution_steps "
+                    "WHERE execution_id = :id AND output IS NOT NULL"
+                ),
+                {"id": str(execution_id)},
+            )
+        ).scalar_one()
+
+    assert dispatches == 1, "the retry created a second dispatch row"
+    assert steps == 1, "the retry created a second step row"
+    assert outputs == 1, "the work produced more than one output"
+
+    settled = await _dispatch_row(owner_database, execution_id)
+    assert settled.status == DispatchStatus.SUCCEEDED
+    assert settled.claim_count == 2, "two attempts were not counted as two"
+    assert settled.attempt == first.attempt, "`attempt` moved; it is the attempt's identity"
+
+    status, step = await _states(owner_database, execution_id)
+    assert step == StepStatus.SUCCEEDED
+    assert status == ExecutionStatus.COMPLETED
+
+    # Both calls really happened, and the receiver could have deduplicated
+    # them: same token, which is what makes "one output" true at the far end
+    # too rather than only in our own rows.
+    assert len(provider.requests) == 2
+    tokens = {request.get("idempotency-key") for request in provider.requests}
+    assert len(tokens) == 1 and None not in tokens, f"token not stable across attempts: {tokens}"
 
 
 async def test_a_second_outcome_event_for_one_attempt_is_refused(
