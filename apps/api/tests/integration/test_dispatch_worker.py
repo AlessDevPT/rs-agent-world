@@ -941,7 +941,7 @@ async def test_a_backed_off_retry_is_not_claimable_until_it_is_due(
     the backoff, recorded as an open question rather than hidden here.
     """
     monkeypatch.setattr(
-        dispatch_service, "random", SimpleNamespace(uniform=lambda _low, high: high)
+        dispatch_service, "random", SimpleNamespace(uniform=lambda _low, _high: 60.0)
     )
     execution_id = scenario.run()
     provider.status = 500
@@ -950,7 +950,8 @@ async def test_a_backed_off_retry_is_not_claimable_until_it_is_due(
 
     row = await _dispatch_row(owner_database, execution_id)
     assert row.status == DispatchStatus.PENDING
-    assert row.run_after > dt.datetime.now(dt.UTC)
+    delay = (row.run_after - dt.datetime.now(dt.UTC)).total_seconds()
+    assert delay > 30, f"the row is not parked far enough ahead to test the filter: {delay}s"
 
     # Due in the future, so there is nothing to claim right now.
     assert await worker.run_once() is None
@@ -1023,45 +1024,6 @@ async def test_the_attempt_budget_is_spent_and_then_the_work_is_over(
     assert execution == ExecutionStatus.FAILED, "a spent dispatch left the execution running"
 
 
-async def test_the_backoff_ceiling_grows_with_each_attempt(
-    scenario: Scenario,
-    provider: FakeProvider,
-    factory: UnitOfWorkFactory,
-    owner_database: Database,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Each retry waits longer than the last.
-
-    It did not. The ceiling was `2.0 * 2**claimed.attempt`, and `attempt`
-    never moves, so every retry of a row drew from the same two-second
-    window - which is the difference between backing off and hammering a
-    provider that is down.
-
-    The draw is pinned to the ceiling so the assertion is about the ceiling
-    rather than about luck.
-    """
-    monkeypatch.setattr(
-        dispatch_service, "random", SimpleNamespace(uniform=lambda _low, high: high)
-    )
-    execution_id = scenario.run()
-    provider.status = 500
-    worker = _worker(factory, provider)
-
-    assert await worker.run_once() is not None
-    first = await _dispatch_row(owner_database, execution_id)
-    first_delay = (first.run_after - dt.datetime.now(dt.UTC)).total_seconds()
-
-    await _make_due(owner_database, execution_id)
-    assert await worker.run_once() is not None
-    second = await _dispatch_row(owner_database, execution_id)
-    second_delay = (second.run_after - dt.datetime.now(dt.UTC)).total_seconds()
-
-    assert 1.0 < first_delay <= 2.0, f"first ceiling moved: {first_delay}s"
-    assert 3.0 < second_delay <= 4.0, (
-        f"the ceiling did not grow: {first_delay}s then {second_delay}s"
-    )
-
-
 async def test_a_rate_limit_then_success_is_one_step_two_attempts_one_output(
     scenario: Scenario,
     provider: FakeProvider,
@@ -1091,7 +1053,11 @@ async def test_a_rate_limit_then_success_is_one_step_two_attempts_one_output(
     assert first.status == DispatchStatus.PENDING, "a 429 was not treated as retryable"
     assert first.claim_count == 1
     delay = (first.run_after - dt.datetime.now(dt.UTC)).total_seconds()
-    assert 25 <= delay <= 30, f"Retry-After was not honoured: {delay}s"
+    # Generous on the low side on purpose: this is a *remaining* duration, so
+    # it shrinks while the test runs, and a tight lower bound measures the
+    # runner's database latency rather than the header. The exact arithmetic
+    # is in `tests/unit/test_backoff.py`.
+    assert 20 < delay <= 30, f"Retry-After was not honoured: {delay}s"
 
     # Time travel rather than a sleep. The claim filters `run_after <= now`,
     # so this is exactly what thirty seconds passing would do to the row.
