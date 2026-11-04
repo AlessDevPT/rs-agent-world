@@ -300,17 +300,27 @@ def _worker(
 
 
 def _store() -> Any:
-    """The same keyring the app under test uses.
+    """The same keyring the app under test uses - derived, not assumed.
 
-    Built from the development keyring rather than from `Settings` because
-    the worker is constructed here rather than by the app; the credential was
-    written by the app, so the two have to agree, and
-    `test_credentials_api.py` is what asserts the app uses this one when no
-    `CREDENTIAL_KEKS` is configured.
+    The credential is written by the app and read by the worker built here,
+    so the two keyrings have to be the same one. This used to return
+    `secrets.development()` on the grounds that the app falls back to it, and
+    that was true only while no `CREDENTIAL_KEKS` was configured. Configuring
+    one - which a developer running against a real `.env` does - made the app
+    encrypt under its own key id and this worker fail to decrypt with
+    `unknown_key_id`, claiming the dispatch and never reaching the provider.
+    The suite passed or failed depending on the machine.
+
+    Reading `Settings` the way the `settings` fixture does removes the
+    assumption: whatever the app encrypts with, this decrypts with, including
+    the development fallback when nothing is set.
     """
     from agentworld.infra import secrets
+    from agentworld.settings import Settings
 
-    return secrets.EnvelopeSecretStore(secrets.development())
+    keyring = Settings(environment="test").credential_keyring
+    assert isinstance(keyring, secrets.Keyring)
+    return secrets.EnvelopeSecretStore(keyring)
 
 
 def _claims(work: Any, scenario: Scenario) -> Any:
@@ -1037,6 +1047,79 @@ async def _step_error(owner_database: Database, execution_id: uuid.UUID) -> Any:
                 {"id": str(execution_id)},
             )
         ).scalar_one()
+
+
+async def _finished_at(owner_database: Database, dispatch_id: uuid.UUID) -> Any:
+    """Read one dispatch's finish timestamp by id.
+
+    By id rather than by execution, because the terminal-timestamp test
+    settles several dispatches in one workspace and has to look at the exact
+    row it settled.
+    """
+    async with owner_database.session() as session:
+        return (
+            await session.execute(
+                text("SELECT finished_at FROM dispatches WHERE id = :id"),
+                {"id": str(dispatch_id)},
+            )
+        ).scalar_one()
+
+
+async def _park(owner_database: Database, dispatch_id: uuid.UUID) -> None:
+    """Push a still-claimable row far into the future.
+
+    Settling to `pending` leaves a row claimable, so without this the next
+    claim in a loop would pick up the previous iteration's dispatch instead
+    of the fresh one and the test would quietly assert about the wrong row.
+    """
+    async with owner_database.session() as session:
+        await session.execute(
+            text("UPDATE dispatches SET run_after = now() + interval '1 day' WHERE id = :id"),
+            {"id": str(dispatch_id)},
+        )
+
+
+async def test_finished_at_is_stamped_for_terminal_statuses_only(
+    scenario: Scenario,
+    factory: UnitOfWorkFactory,
+    owner_database: Database,
+) -> None:
+    """The invariant, over every status a settle can produce.
+
+    The Phase 3 acceptance run found `settle` stamping `succeeded`, `dead`
+    and `cancelled` but not `failed`, so a terminally failed dispatch
+    carried no finish time and read as unfinished. These assertions are
+    derived from `DispatchStatus.is_terminal` rather than from a hand-written
+    list, so a status added later is covered the day it is added - and if
+    somebody adds one without classifying it, the enum test fails first.
+    """
+    settleable = [s for s in DispatchStatus if s is not DispatchStatus.LEASED]
+    assert len(settleable) >= 6, "the enum shrank; this test is no longer covering it"
+
+    for status in settleable:
+        execution_id = scenario.run()
+        async with factory.begin(visible_workspaces={scenario.workspace_id}) as work:
+            claimed = await _claims(work, scenario).claim(worker="stamper", lease_seconds=120)
+        assert claimed is not None, f"nothing to claim for {status.value}"
+
+        # Leased is not finished, whatever happens next.
+        assert await _finished_at(owner_database, claimed.id) is None, (
+            f"a freshly claimed dispatch already had finished_at ({status.value})"
+        )
+
+        async with factory.begin(visible_workspaces={scenario.workspace_id}) as work:
+            settled = await _claims(work, scenario).settle(
+                claimed.id, status=status, error="x", error_code="probe"
+            )
+        assert settled is True, f"settle refused {status.value}"
+
+        stamped = await _finished_at(owner_database, claimed.id) is not None
+        assert stamped is status.is_terminal, (
+            f"{status.value}: finished_at stamped={stamped}, is_terminal={status.is_terminal}"
+        )
+        if not status.is_terminal:
+            await _park(owner_database, claimed.id)
+        _ = execution_id
 
 
 async def _step_output(owner_database: Database, execution_id: uuid.UUID) -> Any:

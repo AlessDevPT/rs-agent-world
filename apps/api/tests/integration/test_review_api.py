@@ -22,7 +22,14 @@ from typing import Any
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import text
-from test_dispatch_worker import FakeProvider, Scenario, _claims, _dispatch_row, _states
+from test_dispatch_worker import (
+    FakeProvider,
+    Scenario,
+    _claims,
+    _dispatch_row,
+    _park,
+    _states,
+)
 
 from agentworld.domain.enums import DispatchStatus, ExecutionStatus, MemberRole, StepStatus
 from agentworld.domain.errors import ConflictError, ValidationFailedError
@@ -528,6 +535,61 @@ async def test_the_audit_row_names_the_person_and_keeps_the_note(
     assert metadata["step_key"] == "research"
     # What the reaper had recorded, carried forward rather than lost.
     assert "unknown" in metadata["previous_error"]
+
+
+async def _dispatch_finished_at(owner_database: Database, dispatch_id: uuid.UUID) -> Any:
+    async with owner_database.session() as session:
+        return (
+            await session.execute(
+                text("SELECT finished_at FROM dispatches WHERE id = :id"),
+                {"id": str(dispatch_id)},
+            )
+        ).scalar_one()
+
+
+@pytest.mark.parametrize(
+    ("outcome", "acknowledged", "finishes"),
+    [
+        (Resolution.SUCCEEDED, False, True),
+        (Resolution.FAILED, False, True),
+        (Resolution.RETRY, True, False),
+    ],
+)
+async def test_a_resolution_stamps_finished_at_only_when_it_ends_the_work(
+    scenario: Scenario,
+    factory: UnitOfWorkFactory,
+    owner_database: Database,
+    outcome: Resolution,
+    acknowledged: bool,
+    finishes: bool,
+) -> None:
+    """The other writer of `finished_at`, held to the same rule as `settle`.
+
+    `succeeded` and `failed` end the dispatch - `failed` becomes `dead` - so
+    both get a finish time. `retry` puts the row back to `pending`, which is
+    the work about to happen again, so it must not be stamped. Both writers
+    now read `DispatchStatus.is_terminal`, and this is what stops them
+    drifting apart.
+    """
+    _, dispatch_id = await _stick_it(factory, scenario)
+    assert await _dispatch_finished_at(owner_database, dispatch_id) is None
+
+    response = _resolve(scenario, dispatch_id, outcome=outcome.value, acknowledged=acknowledged)
+    assert response.status_code == 204, response.text
+
+    stamped = await _dispatch_finished_at(owner_database, dispatch_id) is not None
+    assert stamped is finishes, (
+        f"resolving as {outcome.value}: finished_at stamped={stamped}, expected {finishes}"
+    )
+
+    if not finishes:
+        # A `retry` resolution leaves the row `pending` with `run_after` now,
+        # and `DispatchWorker` claims across *every* workspace - so leaving it
+        # claimable lets a later test's worker pick up this row instead of its
+        # own. That is exactly how this test first broke
+        # `test_a_retried_dispatch_can_be_claimed_and_run`, whose provider was
+        # then never called.
+        await _park(owner_database, dispatch_id)
 
 
 async def test_resolving_preserves_every_earlier_recovery_record(

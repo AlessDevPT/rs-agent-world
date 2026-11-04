@@ -242,7 +242,20 @@ class DispatchClaimRepository(ScopedRepository):
         reaper decided, because the reaper may have decided `needs_review`.
 
         Clears the lease, and clears `side_effect_started_at` on success: the
-        call returned, so the uncertainty it recorded is resolved.
+        call returned, so the uncertainty it recorded is resolved. A failure
+        keeps the marker, because the call did go out and that is worth
+        knowing; what resolved the uncertainty there is the provider's own
+        answer, recorded in `last_error_code`.
+
+        **`finished_at` is stamped for every terminal status**, which was not
+        true until the Phase 3 acceptance run looked. It stamped `succeeded`,
+        `dead` and `cancelled` and skipped `failed` - so a terminally failed
+        dispatch carried no finish time and looked unfinished to anything
+        reading that column. `failed` is terminal here by construction: a
+        retryable failure is settled as `pending`, because the claim query
+        filters on `pending` and a `failed` row is never claimed again. One
+        predicate rather than a list, so a status added later cannot be left
+        out of it.
         """
         values: dict[str, Any] = {
             "status": status,
@@ -253,8 +266,7 @@ class DispatchClaimRepository(ScopedRepository):
         }
         if status is DispatchStatus.SUCCEEDED:
             values["side_effect_started_at"] = None
-            values["finished_at"] = sa.func.now()
-        if status in (DispatchStatus.DEAD, DispatchStatus.CANCELLED):
+        if status.is_terminal:
             values["finished_at"] = sa.func.now()
         if run_after is not None:
             values["run_after"] = run_after
@@ -436,7 +448,10 @@ class DispatchReadRepository(ScopedRepository):
         }
         if run_after is not None:
             values["run_after"] = run_after
-        if status in (DispatchStatus.SUCCEEDED, DispatchStatus.DEAD, DispatchStatus.CANCELLED):
+        # The same rule as `settle`: terminal means finished. A `retry`
+        # resolution sets `pending`, which is not terminal and must not be
+        # stamped - the work is about to happen again.
+        if status.is_terminal:
             values["finished_at"] = sa.func.now()
 
         return (

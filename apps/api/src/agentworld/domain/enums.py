@@ -324,6 +324,19 @@ class DispatchStatus(StrEnum):
         """
         return self in _UNSETTLED_DISPATCH_STATUSES
 
+    @property
+    def is_terminal(self) -> bool:
+        """Whether this dispatch is over, whatever the outcome was.
+
+        The exact complement of `is_unsettled`, written as one so the two can
+        never disagree, and named separately because call sites read better
+        for it: `settle` stamps `finished_at` when a dispatch is *terminal*,
+        which is a statement about being finished rather than about having
+        nothing in flight. `StepStatus` carries the same property for the
+        same reason.
+        """
+        return not self.is_unsettled
+
 
 _UNSETTLED_DISPATCH_STATUSES: frozenset[DispatchStatus] = frozenset(
     {
