@@ -304,7 +304,14 @@ One `Makefile`, so nobody has to remember two toolchains:
 
 ## 8. Configuration
 
-`.env.example`, every variable documented in `settings.py`:
+Two files, one per app, because Next.js loads `.env` from its own project directory
+rather than from the repository root. A `NEXT_PUBLIC_*` value placed in the root `.env`
+is read by nothing - the API has no use for it and Next never looks there - so the web
+app boots on its defaults and renders the setup page as though it were unconfigured.
+
+### `.env` (apps/api)
+
+From `.env.example`, every variable documented in `settings.py`:
 
 ```
 DATABASE_URL=postgresql+asyncpg://agentworld:dev@localhost:5432/agentworld
@@ -320,13 +327,24 @@ WS_REPLAY_WINDOW_EVENTS=10000
 DEFAULT_HEARTBEAT_TTL_SECONDS=60
 CORS_ORIGINS=http://localhost:3000
 OTEL_EXPORTER_OTLP_ENDPOINT=
+```
 
-# apps/web
+No secret has a working default. `settings.py` fails fast at boot on a missing required
+variable rather than at the first request that needs it.
+
+### `apps/web/.env.local` (apps/web)
+
+From `apps/web/.env.example`:
+
+```
 NEXT_PUBLIC_API_URL=http://localhost:8000
 NEXT_PUBLIC_WS_URL=ws://localhost:8000
 NEXT_PUBLIC_SUPABASE_URL=
 NEXT_PUBLIC_SUPABASE_ANON_KEY=
 ```
 
-No secret has a working default. `settings.py` fails fast at boot on a missing required
-variable rather than at the first request that needs it.
+`NEXT_PUBLIC_*` is inlined into the browser bundle at build time, so only public values
+belong in this file - the Supabase *anon* key is designed for it. Server-only secrets
+(`API_KEY_PEPPER`, `CREDENTIAL_KEKS`, `MIGRATION_DATABASE_URL`, a service-role key) stay
+in the root `.env`, and giving one a `NEXT_PUBLIC_` name is what would publish it.
+`apps/web/tests/public-env.test.ts` holds this split in place.

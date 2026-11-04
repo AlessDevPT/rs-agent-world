@@ -59,9 +59,11 @@ function Unconfigured() {
             Create a project at <code>supabase.com</code>, or point at a self-hosted one.
           </li>
           <li>
-            Put its URL and <em>anon</em> key in <code>.env</code> at the repository root,
-            as <code>NEXT_PUBLIC_SUPABASE_URL</code> and{" "}
-            <code>NEXT_PUBLIC_SUPABASE_ANON_KEY</code>.
+            Put its URL and <em>anon</em> key in <code>apps/web/.env.local</code> as{" "}
+            <code>NEXT_PUBLIC_SUPABASE_URL</code> and{" "}
+            <code>NEXT_PUBLIC_SUPABASE_ANON_KEY</code>. Next.js reads that file, not the
+            <code>.env</code> at the repository root; start from{" "}
+            <code>apps/web/.env.example</code>.
           </li>
           <li>
             Give the API the same project: <code>SUPABASE_URL</code> and{" "}

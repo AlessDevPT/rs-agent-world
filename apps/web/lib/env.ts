@@ -16,7 +16,8 @@ export interface PublicEnv {
 function required(name: string, value: string | undefined): string {
   if (!value) {
     throw new Error(
-      `${name} is not set. Copy .env.example to .env at the repository root.`,
+      `${name} is not set. Copy apps/web/.env.example to apps/web/.env.local - ` +
+        "Next.js reads .env files from this app's directory, not the repository root.",
     );
   }
   return value;
@@ -35,7 +36,10 @@ export function readPublicEnv(): PublicEnv {
 /**
  * Phase 0 default, so the shell renders before Supabase Auth exists (Phase 1).
  * Falls back rather than throwing, because a developer who has not copied
- * .env yet should still see the app boot.
+ * apps/web/.env.example to apps/web/.env.local yet should still see the app
+ * boot. That fallback is also why putting these values in the root .env fails
+ * quietly: Next reads nothing from there, so the app boots on the defaults
+ * and the setup page reports no Supabase project.
  */
 export const publicEnv: PublicEnv = {
   apiUrl: process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000",

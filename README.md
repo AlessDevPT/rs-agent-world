@@ -40,7 +40,8 @@ No agents, no events and no island yet — those are Phases 2 and 6.
 ## Quick start
 
 ```bash
-cp .env.example .env
+cp .env.example .env                              # apps/api
+cp apps/web/.env.example apps/web/.env.local      # apps/web, read by Next.js
 npm run api:install     # creates apps/api/.venv and installs the API
 npm install             # installs the web workspace
 npm run infra:up        # Postgres + Redis
@@ -53,10 +54,15 @@ Then in two terminals:
 npm run api:dev         # http://localhost:8000  (/docs for the OpenAPI UI)
 ```
 
-To sign in you need a Supabase project: put its URL and anon key in `.env` as
-`NEXT_PUBLIC_SUPABASE_URL` / `NEXT_PUBLIC_SUPABASE_ANON_KEY`, and give the API the same
-project as `SUPABASE_URL` / `SUPABASE_JWKS_URL`. Without one, the app says so and tells
-you what to set rather than failing.
+To sign in you need a Supabase project. Put its URL and anon key in
+`apps/web/.env.local` as `NEXT_PUBLIC_SUPABASE_URL` / `NEXT_PUBLIC_SUPABASE_ANON_KEY`,
+and give the API the same project in the root `.env` as `SUPABASE_URL` /
+`SUPABASE_JWKS_URL`. Without one, the app says so and tells you what to set rather than
+failing.
+
+The two files are not interchangeable: Next.js loads `.env` from its own project
+directory, so `NEXT_PUBLIC_*` in the root `.env` is read by nothing and the app boots on
+its defaults - which looks exactly like having configured nothing at all.
 
 ```bash
 npm run dev             # http://localhost:3000
