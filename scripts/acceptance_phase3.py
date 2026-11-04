@@ -21,7 +21,7 @@ for these contracts.
 | `ANTHROPIC_API_KEY` | A live key. Stored through the credentials endpoint, encrypted at rest, and never printed by this script. |
 | `AGENTWORLD_API_URL` | Optional, default `http://localhost:8000`. |
 | `ANTHROPIC_MODEL_ID` | Optional, default `claude-haiku-5-5` - the cheapest model that can answer the prompt. |
-| `DATABASE_URL` | Optional. Only for the extra evidence the API does not expose: the dispatch row, the event rows and the audit rows. |
+| `DATABASE_URL` | Optional, and the ordinary application URL - no owner privileges needed. Only for the extra evidence the API does not expose: the dispatch row, the event rows and the audit rows. Without it those checks are reported as not collected, never as passed. |
 
 ## What it never does
 
@@ -268,14 +268,39 @@ def _truncate(output: Any, limit: int = 240) -> Any:
 # ------------------------------------- evidence the API does not expose yet ---
 
 
-async def _query(url: str, execution_id: str) -> dict[str, Any]:
+async def _query(url: str, execution_id: str, workspace_id: str) -> dict[str, Any]:
+    """Read the rows the API does not expose, as the application role.
+
+    **The row-level security has to be satisfied, not avoided.** Every table
+    here - `dispatches`, `events`, `audit_log`, `execution_steps` - has
+    `FORCE ROW LEVEL SECURITY` and one `ALL` policy keyed on
+    `agentworld.workspace_ids`, so the application role sees nothing until
+    that setting names a workspace. Measured against this database: with the
+    setting unset the role reads **0 rows from all four tables and raises
+    nothing**; with it set to the run's workspace it reads exactly what the
+    owner reads. Silence, not an error - which is why the earlier version of
+    this script reported empty evidence as though there were none to find.
+
+    So the fix is to set it - the same mechanism `TenantScope` uses on every
+    application query - rather than to connect as the owner. No owner
+    credentials, no `BYPASSRLS`, no extra grant, and no policy is weakened:
+    the evidence is scoped to the one workspace this run created, which is
+    all it ever wanted to see.
+
+    `set_config(..., false)` for the session rather than `SET LOCAL`, because
+    these reads are not inside a transaction.
+    """
     import asyncpg
 
     dsn = url.replace("postgresql+asyncpg://", "postgresql://")
     conn = await asyncpg.connect(dsn)
     try:
+        await conn.execute(
+            "SELECT set_config('agentworld.workspace_ids', $1, false)", workspace_id
+        )
         dispatches = await conn.fetch(
             "SELECT id, kind, status, attempt, claim_count, leased_by, last_error_code, "
+            "finished_at IS NOT NULL AS finished, "
             "side_effect_started_at IS NOT NULL AS was_in_flight "
             "FROM dispatches WHERE execution_id = $1::uuid",
             execution_id,
@@ -285,11 +310,16 @@ async def _query(url: str, execution_id: str) -> dict[str, Any]:
             "WHERE execution_id = $1::uuid ORDER BY attempt",
             execution_id,
         )
+        # `type`, not `name`. The column has always been `type`, so the old
+        # query raised UndefinedColumnError - which the broad except turned
+        # into a "skipped" line while the run still called itself passed.
         events = await conn.fetch(
-            "SELECT name, count(*) AS n FROM events WHERE execution_id = $1::uuid "
-            "GROUP BY name ORDER BY name",
+            "SELECT type, count(*) AS n FROM events WHERE execution_id = $1::uuid "
+            "GROUP BY type ORDER BY type",
             execution_id,
         )
+        # Workspace-scoped by the policy now, where this used to count every
+        # matching row in the table.
         audit = await conn.fetch(
             "SELECT action, count(*) AS n FROM audit_log "
             "WHERE action LIKE 'workflow.%' OR action LIKE 'dispatch.%' "
@@ -301,55 +331,163 @@ async def _query(url: str, execution_id: str) -> dict[str, Any]:
     return {
         "dispatches": [dict(row) for row in dispatches],
         "steps": [dict(row) for row in steps],
-        "events": {row["name"]: row["n"] for row in events},
+        "events": {row["type"]: row["n"] for row in events},
         "audit": {row["action"]: row["n"] for row in audit},
     }
 
 
-def database_evidence(execution_id: str) -> dict[str, Any]:
-    """The dispatch, event and audit rows, read as the owner.
+class Evidence:
+    """Database rows, and whether they were actually read.
+
+    The point of the class is that `collected` cannot be left out. The
+    previous version returned a plain dict that was either the rows or
+    `{"skipped": reason}`, and the caller tested `evidence.get("dispatches")`
+    - falsy both when the dispatch did not exist and when nothing was read at
+    all. The failure scenario treated the second as the first and returned
+    success. An absent measurement is not a passing measurement.
+    """
+
+    __slots__ = ("collected", "reason", "rows")
+
+    def __init__(
+        self,
+        *,
+        collected: bool,
+        rows: dict[str, Any] | None = None,
+        reason: str | None = None,
+    ) -> None:
+        self.collected = collected
+        self.rows = rows or {}
+        self.reason = reason
+
+    @property
+    def dispatches(self) -> list[dict[str, Any]]:
+        rows = self.rows.get("dispatches")
+        return rows if isinstance(rows, list) else []
+
+    def as_json(self) -> dict[str, Any]:
+        """What goes in the evidence dump: the verdict first, then the rows."""
+        if not self.collected:
+            return {"collected": False, "reason": self.reason}
+        return {"collected": True, **self.rows}
+
+
+def database_evidence(execution_id: str, workspace_id: str) -> Evidence:
+    """The dispatch, event and audit rows, or an explicit statement of why not.
 
     Separate from everything above because it is not part of the public
     contract: Phase 3 exposes no dispatch read route except the needs-review
     queue, and step detail is T12's. An acceptance run still wants to see
     which dispatch ran, with what classification, and that the events were
-    written - so this reads them directly and says so.
+    written - so this reads them directly and says, either way, whether it
+    managed to.
 
     `asyncpg`, because that is the driver this project installs; there is no
     synchronous Postgres driver in the venv.
     """
     url = os.environ.get("DATABASE_URL", "")
     if not url:
-        return {"skipped": "DATABASE_URL is unset"}
+        return Evidence(collected=False, reason="DATABASE_URL is unset")
     try:
-        return asyncio.run(_query(url, execution_id))
-    except Exception as exc:  # noqa: BLE001 - optional evidence, never fatal
-        # Deliberately broad. This is diagnostics beside the acceptance run,
-        # and a missing driver, a refused connection or a renamed column must
-        # be reported in the output rather than failing a run that otherwise
-        # succeeded against the real API and the real provider.
-        return {"skipped": f"{type(exc).__name__}: {exc}"}
+        rows = asyncio.run(_query(url, execution_id, workspace_id))
+    except Exception as exc:  # noqa: BLE001 - reported, never silently dropped
+        # Still broad - a missing driver or a refused connection should not
+        # look like a crash in the acceptance run itself - but the reason now
+        # travels with `collected=False`, so no caller can read it as a pass.
+        # `url` is deliberately not interpolated: a DSN carries a password.
+        return Evidence(collected=False, reason=f"{type(exc).__name__}: {exc}")
+    return Evidence(collected=True, rows=rows)
 
 
 # ------------------------------------------------------------------ driving ---
 
 
-def success_scenario(api: Acceptance, api_key: str, model_id: str) -> bool:
+class ScenarioResult:
+    """Two verdicts, kept apart on purpose.
+
+    `execution_ok` is what the API said the execution did. `claims_ok` is
+    whether the things only the database can show were checked and held:
+    `None` when the scenario makes no such claim, `False` when it makes one
+    that could not be checked. Collapsing the two is the bug this replaces -
+    a run whose evidence never arrived used to print PASSED.
+    """
+
+    __slots__ = ("claims_ok", "evidence", "execution_ok", "name")
+
+    def __init__(
+        self,
+        name: str,
+        *,
+        execution_ok: bool,
+        evidence: Evidence,
+        claims_ok: bool | None = None,
+    ) -> None:
+        self.name = name
+        self.execution_ok = execution_ok
+        self.evidence = evidence
+        self.claims_ok = claims_ok
+
+    @property
+    def passed(self) -> bool:
+        return self.execution_ok and self.claims_ok is not False
+
+
+def _report_evidence(evidence: Evidence) -> None:
+    """Say what happened to the database read, every time, either way."""
+    if not evidence.collected:
+        print(f"  database evidence: NOT COLLECTED - {evidence.reason}")
+        return
+    counts = ", ".join(
+        f"{len(value) if isinstance(value, (list, dict)) else value} {key}"
+        for key, value in evidence.rows.items()
+    )
+    print(f"  database evidence: collected ({counts})")
+
+
+def success_scenario(api: Acceptance, api_key: str, model_id: str) -> ScenarioResult:
     print("\n== the success scenario: a real Anthropic call ==")
     api.build_project(api_key, model_id, "success")
     workflow_id = api.publish_workflow("success")
     status = api.run_and_wait(workflow_id, "success")
-    api.evidence["success_database"] = database_evidence(
-        api.evidence["success_execution_id"]
+    evidence = database_evidence(
+        api.evidence["success_execution_id"], api.evidence["success_workspace_id"]
     )
+    api.evidence["success_database"] = evidence.as_json()
+    _report_evidence(evidence)
+
     if status != "completed":
         print(f"  !! the execution finished '{status}', not 'completed'")
-        return False
+        return ScenarioResult("success", execution_ok=False, evidence=evidence)
     print("  the execution completed")
-    return True
+
+    # The API's verdict is this scenario's acceptance criterion, so a missing
+    # database read does not retract it - but it is not reported as a check
+    # that passed either. `claims_ok` stays None when nothing was checked.
+    if not evidence.collected:
+        return ScenarioResult("success", execution_ok=True, evidence=evidence)
+
+    claims_ok = True
+    rows = evidence.dispatches
+    if not rows:
+        print("  !! the execution completed with no dispatch row")
+        claims_ok = False
+    elif rows[0].get("status") != "succeeded":
+        print(f"  !! the dispatch is '{rows[0].get('status')}', not 'succeeded'")
+        claims_ok = False
+    elif not rows[0].get("finished"):
+        print("  !! the dispatch is terminal but finished_at is NULL")
+        claims_ok = False
+    if not evidence.rows.get("events"):
+        print("  !! no events were written for this execution")
+        claims_ok = False
+    if claims_ok:
+        print("  the dispatch succeeded, is stamped finished, and events were written")
+    return ScenarioResult(
+        "success", execution_ok=True, evidence=evidence, claims_ok=claims_ok
+    )
 
 
-def failure_scenario(api: Acceptance, model_id: str) -> bool:
+def failure_scenario(api: Acceptance, model_id: str) -> ScenarioResult:
     """An unusable credential, which must be terminal rather than retried.
 
     This is the safe failure: a 401 from the provider classifies as
@@ -357,36 +495,63 @@ def failure_scenario(api: Acceptance, model_id: str) -> bool:
     the dispatch must fail on its **first** attempt, with `claim_count` 1,
     rather than burning the attempt budget on something waiting cannot fix.
     Nothing external is touched and no secret is involved.
+
+    Both of those are properties of the dispatch row, so this scenario cannot
+    reach a verdict without the database. It used to return success when it
+    could not read one, which made the only check it exists for vacuous.
     """
     print("\n== the failure scenario: an unusable credential ==")
     api.build_project(INVALID_KEY, model_id, "failure")
     workflow_id = api.publish_workflow("failure")
     status = api.run_and_wait(workflow_id, "failure", timeout=120.0)
-    evidence = database_evidence(api.evidence["failure_execution_id"])
-    api.evidence["failure_database"] = evidence
+    evidence = database_evidence(
+        api.evidence["failure_execution_id"], api.evidence["failure_workspace_id"]
+    )
+    api.evidence["failure_database"] = evidence.as_json()
+    _report_evidence(evidence)
 
-    if status != "failed":
+    execution_ok = status == "failed"
+    if not execution_ok:
         print(f"  !! expected 'failed', got '{status}'")
-        return False
-    rows = evidence.get("dispatches") or []
-    if not isinstance(rows, list) or not rows:
-        print("  (could not read the dispatch row; DATABASE_URL unset?)")
-        return True
+
+    if not evidence.collected:
+        print(
+            "  !! NOT VERIFIED: this scenario's whole claim - terminal on the first"
+            "\n     attempt, classified 'unauthorized' - lives in the dispatch row,"
+            f"\n     and the row could not be read ({evidence.reason})."
+            "\n     Not treated as a pass."
+        )
+        return ScenarioResult(
+            "failure", execution_ok=execution_ok, evidence=evidence, claims_ok=False
+        )
+
+    rows = evidence.dispatches
+    if not rows:
+        print("  !! no dispatch row exists for this execution, so nothing ran")
+        return ScenarioResult(
+            "failure", execution_ok=execution_ok, evidence=evidence, claims_ok=False
+        )
+
     row = rows[0]
-    ok = True
+    claims_ok = True
     if row.get("last_error_code") != "unauthorized":
         print(
             f"  !! classified as {row.get('last_error_code')!r}, expected 'unauthorized'"
         )
-        ok = False
+        claims_ok = False
     if row.get("claim_count") != 1:
         print(
             f"  !! claim_count is {row.get('claim_count')}, so a terminal failure was retried"
         )
-        ok = False
-    if ok:
+        claims_ok = False
+    if not row.get("finished"):
+        print("  !! the dispatch is terminal but finished_at is NULL")
+        claims_ok = False
+    if claims_ok:
         print("  terminal on the first attempt, classified 'unauthorized', not retried")
-    return ok
+    return ScenarioResult(
+        "failure", execution_ok=execution_ok, evidence=evidence, claims_ok=claims_ok
+    )
 
 
 def main() -> int:
@@ -438,22 +603,48 @@ def main() -> int:
     print(f"model          : {model_id}")
 
     api = Acceptance(base, token)
-    passed = True
+    results: list[ScenarioResult] = []
+    crashed = False
     try:
         api.preflight()
         print(f"authenticated as user {api.evidence['authenticated_user_id']}")
         if not arguments.failure_only:
-            passed = success_scenario(api, api_key, model_id) and passed
+            results.append(success_scenario(api, api_key, model_id))
         if arguments.failure or arguments.failure_only:
-            passed = failure_scenario(api, model_id) and passed
+            results.append(failure_scenario(api, model_id))
     except Failed as exc:
         print(f"\nFAILED: {exc}", file=sys.stderr)
-        passed = False
+        crashed = True
     finally:
         api.close()
 
     print("\n== evidence ==")
     print(json.dumps(api.evidence, indent=2, default=str))
+
+    # Reported separately, because they fail for different reasons and a
+    # reader needs to know which one did. An execution that ran correctly
+    # while the evidence read failed is a configuration problem; an execution
+    # that misbehaved is a defect. The old single PASSED said neither, and
+    # printed itself even when no evidence had been read at all.
+    print("\n== result ==")
+    if crashed:
+        print("  scenarios        : NOT PASSED (the run did not finish)")
+    for result in results:
+        execution = "passed" if result.execution_ok else "NOT PASSED"
+        print(f"  {result.name + ' execution':<17}: {execution}")
+        if result.claims_ok is None:
+            checks = "not checked - no database evidence"
+        else:
+            checks = "passed" if result.claims_ok else "NOT PASSED"
+        print(f"  {result.name + ' row checks':<17}: {checks}")
+
+    unread = [r.name for r in results if not r.evidence.collected]
+    if unread:
+        print(f"  database evidence: NOT COLLECTED for {', '.join(unread)}")
+    elif results:
+        print("  database evidence: collected")
+
+    passed = not crashed and bool(results) and all(r.passed for r in results)
     print("\nPASSED" if passed else "\nNOT PASSED")
     return 0 if passed else 1
 
