@@ -3,6 +3,10 @@
 > Proposal, 2026-11-01, revised after the refinement brief. Deliverables 10 and 11 of the
 > original brief; deliverables 1–8 of the refinement.
 
+> Amended 2026-11-04: Phase 4 gains the authorization-axis constraint below (decision
+> C19), Phase 7 gains the runtime it implies, and section 7's "a provider is a file" is
+> qualified, because one row of it is not.
+
 ## 1. What changed in this revision, and what it costs
 
 The first version of this roadmap was **sequential**: foundations, then a thin execution
@@ -359,6 +363,55 @@ and complete end to end.
 - Per-plan object caps, per-session rate limits, `builder.apply` bounded by the caller's
   own permissions and refused **at plan time**.
 
+**Enters Phase 4 planning — the authorization axis for a model turn**
+
+Phase 4 is where `managed` execution stops being one hard-coded path and becomes the
+thing every later phase builds on, so this is the last cheap moment to say it:
+
+> A model turn must be able to run **either** against a provider API credential the
+> workspace holds, **or** on an AI runtime a user has personally authorized — and the
+> second must not be assumed to be reachable as a conventional API. Some subscriptions
+> have no server-callable API at all; some runtimes live on the user's own machine.
+
+This sharpens C15's "model provider and agent runtime are independent axes" into a
+statement about *authorization and reachability*, which C15 leaves open. Three
+assumptions in the code today encode the opposite. Each is a seam, not a rewrite:
+
+| Assumption | Where it lives | What a personal runtime needs instead |
+|---|---|---|
+| A credential is a replayable secret | `CredentialService.use()` returns a decrypted string "for one outbound call, right now" | A *grant*: refreshable, possibly device-bound, possibly never extractable |
+| A provider is built from a key and an HTTP client | `providers/registry.build(slug, client, api_key=...)` | Construction from a session, a local endpoint, or a claim ticket |
+| AgentWorld dials out | `GuardedClient` with `EgressPolicy`, which blocks `127.0.0.0/8` and `::1/128` by default and today has no setting to widen | The runtime dials **in** and claims its work |
+
+What already fits, and must therefore not be spent:
+
+- **`ModelProvider` is already right.** It is `slug` plus
+  `async complete(request) -> Completion` — it names no transport and no credential, so a
+  non-API runtime can satisfy it unchanged. The import-linter contract that confines
+  provider SDKs to `infra/providers/` (K15) is what keeps that true.
+- **`CredentialKind` already has `oauth2`**, and `ModelProfile.credential_id` is already
+  **nullable** — a profile that needs no stored secret is representable today.
+- **`DispatchKind` already has `agent_task_offer`**, the claim/poll shape, which Phase 7
+  builds for `dispatchable` agents. A personal runtime is that shape applied to a model
+  turn rather than to an external worker.
+
+**So the Phase 4 obligation is negative.** Nothing to build here, two things not to do:
+
+- Do not let `advance()` or `StepRunner` *require* a `credential_id` to plan a managed
+  step, in code or by check constraint.
+- Do not let anything outside `infra/providers/` assume a model turn is an outbound HTTP
+  call that completes inside one lease.
+
+Phase 7 implements the second kind. The cost of discovering this there instead is a
+change to the one code path every execution runs through, plus a migration on a table
+with rows in it; the cost of honouring it now is an argument left optional and a
+constraint not written.
+
+**Entitlement is a product question, not only a technical one.** A personal subscription
+may forbid server-side automation, so the model must record *whose* authorization a turn
+ran under and must never silently promote a personal grant into a workspace-wide
+credential. O4 tracks which runtime is supported first and under what policy.
+
 **M1 — the demonstration**
 
 > A user types *"I want a researcher that finds competitor news and a writer that turns it
@@ -395,6 +448,11 @@ and complete end to end.
       there being one component.
 - [ ] The `attention` side rail and the nav badge read the same `overview` field, so a user
       who never opens the island misses nothing.
+- [ ] A managed step whose `model_profile` carries **no** `credential_id` can still be
+      planned and dispatched, failing only where a runtime would be selected — asserted by
+      a test, so the credential-free path cannot rot before Phase 7 needs it.
+- [ ] Nothing outside `infra/providers/` names an HTTP client, a key or a base URL for a
+      model turn — asserted by the existing import-linter contracts.
 - [ ] The whole demo is reproducible from a script in `docs/demo/`.
 
 ---
@@ -447,6 +505,9 @@ and complete end to end.
 - MCP tool discovery and refresh; `tools` rows with `source='mcp'`.
 - `side_effect` classification; `consequential` defaults to requiring approval.
 - OAuth2: start, callback, token storage, refresh. **Slack** as the first integration.
+  Write the grant record so it can also describe an authorization to *act as a user on a
+  runtime*, not only an authorization to call a SaaS API — the refresh and revocation
+  paths are the same, and Phase 7 needs them (C19).
 - Secret redaction: the `Secret` wrapper, the structlog scrubber, `secret_fields` on tool
   schemas, sanitised errors, allow-listed metric labels.
 - Knowledge v1: upload, extraction, PostgreSQL full-text `knowledge_search`.
@@ -534,6 +595,12 @@ only after a human grants it.
 - `triggers` table, the `scheduler` worker, cron with timezone, the webhook token plane,
   `integration_event`, `workflow_completed`.
 - `heartbeat_sweeper`.
+- **The first user-authorized personal runtime** (C19), on the `agent_task_offer` path:
+  the user authorizes their own runtime, the runtime claims model turns for its own
+  workspace under a lease, and AgentWorld never holds a provider key for it. The runtime
+  satisfies the same `ModelProvider` contract; what changes is construction and call
+  direction, not `complete()`. Which runtime, and the entitlement policy it runs under,
+  is O4 — decided at the start of this phase, not here.
 - `packages/sdk-python` — thin, never raising into caller control flow, forwarding
   `X-AgentWorld-Idempotency-Key`.
 
@@ -541,6 +608,11 @@ only after a human grants it.
 
 **Acceptance criteria**
 - [ ] A Python worker outside AgentWorld completes a step, via push and via poll.
+- [ ] A managed step completes against a user-authorized runtime with **no** provider
+      credential stored for it, and the execution record names whose authorization it ran
+      under.
+- [ ] Revoking that authorization stops further turns without touching any other
+      workspace's model access.
 - [ ] An `observed` agent assigned a step: `422` naming the mode, and `validate` says so
       first.
 - [ ] A trigger firing twice in a minute yields one execution (`idempotency_key`).
@@ -764,7 +836,8 @@ afford to ship untested are the approval gate and tenant isolation.
 
 | | In v1 | Not in v1 |
 |---|---|---|
-| **Providers** | Anthropic, OpenAI-compatible | Gemini, Bedrock, Vertex, local models |
+| **Providers** | Anthropic, OpenAI-compatible | Gemini, Bedrock, Vertex |
+| **Model access** | provider API credentials held by the workspace; one user-authorized personal runtime (P7) | further runtimes; local models; any runtime needing inbound reachability to the user's machine |
 | **Agent modes** | managed, dispatchable (push and poll), observed | per-framework adapters (LangGraph, Assistants, CrewAI) |
 | **Workflow features** | sequence, parallel fan-out/join, condition, transform, wait, approval, retry, timeout, `on_failure` | loops, map-over-collection, sub-workflows, dynamic agent selection, compensation |
 | **Connections** | `grant_tool`, `grant_knowledge`, `delegate`, `trigger`, `publish` | typed channels, queues between agents |
@@ -780,6 +853,12 @@ One reliable instance of each category rather than many incomplete ones. Each ri
 cell is reachable without architectural change: a provider is a file, an integration is a
 credential plus discovery, a workflow feature is a `Decision` variant, a builder capability
 is an enum member.
+
+**One exception, and it is why the "Model access" row exists.** A *personal AI runtime*
+is not a file. It inverts the call direction, replaces a stored secret with a user's own
+grant, and may have no conventional API behind it at all. That is an architectural
+change, which is exactly why Phase 4 is constrained to keep the seam open (C19) rather
+than leaving it to be found in Phase 7.
 
 ## 8. Security and reliability requirements, by phase
 
@@ -843,6 +922,7 @@ Consolidated from `01-DOMAIN-AND-PROTOCOL.md` §6 and §10, `02-ORCHESTRATION.md
 
 | Deferred | Why | Earliest |
 |----------|-----|---------|
+| Personal runtimes beyond the first, and local models | The axis is open from Phase 4 and one runtime ships in Phase 7; each further one is its own authorization flow, entitlement question and failure mode. Local models additionally need the egress policy to gain a deliberate, configurable exception | v1.1 |
 | Loops and map-over-collection | Turns an orchestrator into a workflow language: iteration state, fan-out limits, partial-failure semantics | v1.1 |
 | Sub-workflows | Nested cancellation and approval inheritance | v1.1 |
 | Approval groups, quorum, escalation, delegation, approval-of-approval | v1 has configurable policies with a different-user requirement, which covers the real cases without a four-eyes engine (`01` §7) | v1.1 |

@@ -96,7 +96,18 @@ Agreed across the original brief and two refinements. These are what the roadmap
 | — | `model_profile_id` only valid for `managed`, by check constraint | 2 | 01 §2 |
 | K15 | Provider SDKs confined to `infra/providers/`, by import-linter contract | 3 | 03 §2 |
 | K16 | Adapters translate payloads and never touch persistence | 7 | 00 §3 |
+| **C19** | **A model turn runs against either a workspace provider credential or a user-authorized personal runtime; a runtime is not assumed to be a conventional API** | 4 (seam), 7 (runtime) | 04 §2 |
 | — | MCP as the primary tool mechanism | 6 | 01 §4 |
+
+**C19, in a sentence.** C15 says the model provider and the agent runtime are
+independent axes. C19 says what that must mean for *authorization and reachability*: some
+subscriptions cannot be used through an API at all, and some runtimes are not reachable
+from a server. So `ModelProvider.complete()` stays the contract — it names no transport
+and no credential — while construction and call direction become variable, and
+`ModelProfile.credential_id` stays nullable rather than gaining a NOT NULL it would later
+have to lose. Phase 4 owes this nothing but restraint; Phase 7 implements it on
+`agent_task_offer`. Deciding it late means migrating a populated table and editing the
+single code path every execution runs through.
 
 ### Security
 
@@ -189,7 +200,7 @@ transactional. That was correct, and it is now the product.
 
 ## 4. Open questions
 
-Three. The earlier list's self-approval item is decided (C16), and the island-ordering item
+Four. The earlier list's self-approval item is decided (C16), and the island-ordering item
 is largely answered by the Phase 4 prototype.
 
 | # | Decision | Recommended resolution | Needed by | Cost of changing later |
@@ -197,6 +208,7 @@ is largely answered by the Phase 4 prototype.
 | **O1** | First real integration: Slack or Gmail? | **Slack.** The least painful OAuth, and "post to a channel" is a convincing consequential action to gate. Gmail is the better demo and a much worse first OAuth — restricted scopes mean app review, which is calendar time you cannot compress | **Start of Phase 6** | Low. A second integration is 3-5 days once the first OAuth flow exists |
 | **O2** | MCP as the primary tool mechanism? | **Yes.** One client turns every MCP server into tools with no AgentWorld code per service. It does bet on an ecosystem outside our control | **Start of Phase 6** | Medium. Reversing it means an adapter per service, which is the work that does not finish |
 | **O3** | Plain workspace polished before the island? | **Yes** - Phase 8 then Phase 9, so the product is proved usable without the island. The Phase 4 prototype means this delays *finishing* the island, not seeing it | **Start of Phase 8** | Low. The two phases share no files and can be swapped |
+| **O4** | First user-authorized personal runtime, and the entitlement policy it runs under | **Undecided, deliberately.** The architecture is held open by C19 from Phase 4; the choice depends on which runtimes expose an authorization flow usable by a server-side orchestrator, and on whether their terms permit automated use on a user's behalf. Needs a written policy on attribution — whose authorization a turn ran under — before any runtime ships | **Start of Phase 7** | Low for the abstraction, which C19 keeps open; high for the *choice*, since each runtime is its own authorization flow and failure mode |
 
 **None blocks Phase 2**, which is why implementation can begin now. Each is listed against
 the phase that forces it, so none has to be decided earlier than it must be.

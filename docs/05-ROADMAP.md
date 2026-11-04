@@ -3,6 +3,17 @@
 > Revision 1 (2026-10-31). Each phase ends in something demonstrable and leaves the repo
 > green. No phase depends on a later phase's code.
 
+> [!IMPORTANT]
+> **Superseded for phase planning as of 2026-11-04.** This describes the original
+> *monitoring* product - agents reporting events, an island projecting them - and its
+> phase numbering no longer matches the work being done. What shipped instead is an
+> *orchestration* platform: workflows, executions, a dispatch outbox, model profiles and
+> provider credentials. "Phase 3" and "Phase 4" in conversation and in code comments mean
+> the phases in
+> [`proposals/2026-11-ecosystem-builder/04-ROADMAP-AND-MVP.md`](proposals/2026-11-ecosystem-builder/04-ROADMAP-AND-MVP.md),
+> not the ones below. Phases 0-1 here were built roughly as written; the rest is kept for
+> the goals and the milestone gates, which still hold.
+
 ## Ordering principle
 
 The protocol and the ingest pipeline are built and proved **before** anything visual.
