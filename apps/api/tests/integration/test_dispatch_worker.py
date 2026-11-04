@@ -81,6 +81,11 @@ class FakeProvider:
     #: suite slower for everyone, and one short enough to be quick is one
     #: that fails on a loaded machine - which is exactly what happened.
     hold: asyncio.Event | None = None
+    #: Overrides the response document. Set it to return what a real model
+    #: actually returns in the awkward cases - no content blocks at all, or
+    #: a thinking block that ate the whole output budget - which is how the
+    #: live acceptance run found an empty answer recorded as success.
+    body: dict[str, Any] | None = None
 
     @property
     def base_url(self) -> str:
@@ -102,15 +107,13 @@ async def _resolve(_host: str, _port: int) -> Sequence[net.Address]:
 @pytest.fixture
 async def provider() -> AsyncIterator[FakeProvider]:
     state = FakeProvider()
-    body = json.dumps(
-        {
-            "id": "msg_01",
-            "model": "test-model",
-            "content": [{"type": "text", "text": "Four competitors."}],
-            "stop_reason": "end_turn",
-            "usage": {"input_tokens": 11, "output_tokens": 4},
-        }
-    ).encode()
+    default = {
+        "id": "msg_01",
+        "model": "test-model",
+        "content": [{"type": "text", "text": "Four competitors."}],
+        "stop_reason": "end_turn",
+        "usage": {"input_tokens": 11, "output_tokens": 4},
+    }
 
     async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         head = await reader.readuntil(b"\r\n\r\n")
@@ -130,6 +133,7 @@ async def provider() -> AsyncIterator[FakeProvider]:
             await state.hold.wait()
         if state.delay:
             await asyncio.sleep(state.delay)
+        body = json.dumps(state.body if state.body is not None else default).encode()
         extra = "".join(f"{k}: {v}\r\n" for k, v in state.extra_headers.items())
         writer.write(
             f"HTTP/1.1 {state.status} X\r\nContent-Type: application/json\r\n{extra}"
@@ -1023,6 +1027,164 @@ async def test_the_attempt_budget_is_spent_and_then_the_work_is_over(
     execution, step = await _states(owner_database, execution_id)
     assert step == StepStatus.FAILED
     assert execution == ExecutionStatus.FAILED, "a spent dispatch left the execution running"
+
+
+async def _step_error(owner_database: Database, execution_id: uuid.UUID) -> Any:
+    async with owner_database.session() as session:
+        return (
+            await session.execute(
+                text("SELECT error FROM execution_steps WHERE execution_id = :id"),
+                {"id": str(execution_id)},
+            )
+        ).scalar_one()
+
+
+async def _step_output(owner_database: Database, execution_id: uuid.UUID) -> Any:
+    async with owner_database.session() as session:
+        return (
+            await session.execute(
+                text("SELECT output FROM execution_steps WHERE execution_id = :id"),
+                {"id": str(execution_id)},
+            )
+        ).scalar_one()
+
+
+async def test_an_empty_model_answer_fails_the_step_instead_of_succeeding(
+    scenario: Scenario,
+    provider: FakeProvider,
+    factory: UnitOfWorkFactory,
+    owner_database: Database,
+) -> None:
+    """The defect the live acceptance run found, as a test.
+
+    `content: []` is what `claude-opus-5` returned at a one-token budget.
+    Before the integrity check this was recorded as `succeeded` with
+    `output.text == ""`: the step succeeded, the execution completed, and
+    the workflow's result was silence. The point of this test is the
+    *execution* status - a workflow that produced nothing must not be
+    indistinguishable from one that worked.
+    """
+    execution_id = scenario.run()
+    provider.body = {
+        "id": "msg_01",
+        "model": "test-model",
+        "content": [],
+        "stop_reason": "end_turn",
+        "usage": {"input_tokens": 11, "output_tokens": 0},
+    }
+
+    assert await _worker(factory, provider).run_once() is not None
+
+    row = await _dispatch_row(owner_database, execution_id)
+    assert row.status == DispatchStatus.FAILED
+    assert row.last_error_code == "empty_model_response"
+    assert row.claim_count == 1, "an unusable answer was retried"
+    assert len(provider.requests) == 1
+
+    execution, step = await _states(owner_database, execution_id)
+    assert step == StepStatus.FAILED
+    assert execution == ExecutionStatus.FAILED
+
+
+async def test_a_thinking_only_answer_is_reported_as_incomplete(
+    scenario: Scenario,
+    provider: FakeProvider,
+    factory: UnitOfWorkFactory,
+    owner_database: Database,
+) -> None:
+    """The measured shape: the budget went on thinking, nothing came back.
+
+    The adapter drops the thinking block as an unknown type - deliberately -
+    so what reaches the integrity check is an empty answer whose stop reason
+    says why. The code has to be the one an operator can act on.
+    """
+    execution_id = scenario.run()
+    provider.body = {
+        "id": "msg_01",
+        "model": "test-model",
+        "content": [{"type": "thinking", "thinking": "weighing it up"}],
+        "stop_reason": "max_tokens",
+        "usage": {"input_tokens": 18, "output_tokens": 16},
+    }
+
+    assert await _worker(factory, provider).run_once() is not None
+
+    row = await _dispatch_row(owner_database, execution_id)
+    assert row.status == DispatchStatus.FAILED
+    assert row.last_error_code == "incomplete_model_response"
+    assert row.claim_count == 1
+
+    execution, step = await _states(owner_database, execution_id)
+    assert step == StepStatus.FAILED
+    assert execution == ExecutionStatus.FAILED
+
+
+async def test_the_step_error_carries_the_providers_diagnostics(
+    scenario: Scenario,
+    provider: FakeProvider,
+    factory: UnitOfWorkFactory,
+    owner_database: Database,
+) -> None:
+    """The stop reason has to survive as far as the step's own record.
+
+    A dispatch row is operational state and gets pruned; the step row and
+    its event are the history. Somebody debugging next week reads those, so
+    the reason the answer was unusable has to be in them rather than only in
+    `dispatches.last_error`.
+    """
+    execution_id = scenario.run()
+    provider.body = {
+        "id": "msg_01",
+        "model": "answering-model",
+        "content": [],
+        "stop_reason": "max_tokens",
+        "usage": {"input_tokens": 18, "output_tokens": 16},
+    }
+
+    assert await _worker(factory, provider).run_once() is not None
+
+    recorded = await _step_error(owner_database, execution_id)
+    assert recorded is not None, "the step failed with no error recorded"
+    assert recorded["code"] == "incomplete_model_response"
+    assert "max_tokens" in recorded["message"]
+    assert "answering-model" in recorded["message"]
+
+
+async def test_a_truncated_but_usable_answer_still_succeeds(
+    scenario: Scenario,
+    provider: FakeProvider,
+    factory: UnitOfWorkFactory,
+    owner_database: Database,
+) -> None:
+    """The limit of the check, asserted so it cannot be tightened by accident.
+
+    `stop_reason = max_tokens` with real text is a fragment, and whether a
+    fragment is useful is the caller's question rather than the worker's.
+    Rejecting this would need a rule about how much text is enough - the
+    invention the integrity check refuses to make - so it succeeds, with the
+    stop reason preserved in the output for a consumer that cares.
+    """
+    execution_id = scenario.run()
+    provider.body = {
+        "id": "msg_01",
+        "model": "test-model",
+        "content": [{"type": "text", "text": "A partial answer that was cut"}],
+        "stop_reason": "max_tokens",
+        "usage": {"input_tokens": 11, "output_tokens": 64},
+    }
+
+    assert await _worker(factory, provider).run_once() is not None
+
+    row = await _dispatch_row(owner_database, execution_id)
+    assert row.status == DispatchStatus.SUCCEEDED
+
+    execution, step = await _states(owner_database, execution_id)
+    assert step == StepStatus.SUCCEEDED
+    assert execution == ExecutionStatus.COMPLETED
+
+    output = await _step_output(owner_database, execution_id)
+    assert output["text"] == "A partial answer that was cut"
+    assert output["stop_reason"] == "max_tokens", "truncation was not recorded"
 
 
 async def test_a_rate_limit_then_success_is_one_step_two_attempts_one_output(

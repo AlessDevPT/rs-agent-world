@@ -246,7 +246,7 @@ exercises the worker's own path.
 
 ---
 
-## 9. What the Phase 3 acceptance review found, and the fix
+## 10. What the Phase 3 acceptance review found, and the fix
 
 Closing the last unticked Phase 3 criterion - *a 429 then success: one step, two attempts,
 one output* - turned up three things about the retry path. None was a safety hole; all three
@@ -367,3 +367,58 @@ dispatch keeps a stale past timestamp and is immediately claimable with no backo
 ceiling can be resolved as `retry` and then fail immediately. That was unreachable before -
 the ceiling was never reached - and it is reachable now. The behaviour is as documented and
 as approved ("retry grants no extra attempts"); what changed is that it can actually happen.
+
+### An empty answer was recorded as a success
+
+The last thing the live run found, and the worst of the three, because it
+produced no error at all.
+
+An agent task finished `succeeded` with `output.text == ""`. The model had
+spent its entire output budget on an extended-thinking block;
+`anthropic._completion` discards thinking blocks as an unknown block type -
+deliberately, so a provider adding a type cannot break a deployment that
+does not use it - and nothing downstream objected to an empty answer. The
+step succeeded, the execution completed, and the workflow's result was
+silence.
+
+Measured against `claude-opus-5`, deterministically, five runs identical:
+
+| `max_tokens` | content blocks | stop reason | `completion.text` |
+| --- | --- | --- | --- |
+| 1 | none at all | `max_tokens` | `""` |
+| 4 | thinking only | `max_tokens` | `""` |
+| 20 | thinking, text | `max_tokens` | `"p"` |
+
+Two further measurements worth keeping. **Thinking is prompt-dependent, not a
+parameter.** The same model with the same budget either thinks or does not
+depending on phrasing - `"Reply with exactly the word: pong"` thought for 15
+of 16 tokens, `"Reply with exactly: pong"` did not think at all - so budget
+sizing cannot be reasoned about from configuration. And
+`thinking: {"type": "disabled"}` is accepted by the API, so a lever exists;
+it is **not** used, because turning reasoning off product-wide is a decision
+about what the product is, not a fix for this defect.
+
+**The fix is `StepRunner._unusable`**, on the neutral `Completion` rather
+than in the adapter: the condition is about text and tool calls, which every
+provider has, so deciding it once means a second adapter cannot forget it.
+No usable text and no tool calls is a terminal failure -
+`incomplete_model_response` when the stop reason was `max_tokens`,
+`empty_model_response` otherwise, because the remedy differs. Non-retryable:
+the same request against the same budget produces the same silence.
+
+**What it deliberately does not do** is reject a truncated answer that
+carries content. `stop_reason = max_tokens` with real text is a fragment,
+but whether a fragment is useful is the caller's question, and the provider
+gives no signal separating a usefully-long summary from a sentence cut
+mid-word. A length floor would be this layer guessing at intent. So `"p"`
+from a truncated `"pong"` still succeeds, with the stop reason preserved in
+the output - asserted in a test so it is a decision rather than an
+oversight. If that case needs catching later, the lever is surfacing
+truncation to the workflow author, not a heuristic in the worker.
+
+One more thing this found, about the rules rather than the code: the first
+version of `_unusable`'s docstring named the model, and
+`test_no_vendor_is_named_outside_the_provider_package` failed on it. The
+contract scans comments and docstrings too, which is right - a vendor name
+in `services/` is where provider knowledge starts leaking - so the
+measurement lives here and the docstring points at it.

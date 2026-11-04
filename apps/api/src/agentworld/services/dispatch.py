@@ -51,11 +51,13 @@ from agentworld.domain.reducers import fold
 from agentworld.infra.logging import get_logger
 from agentworld.infra.net import GuardedClient
 from agentworld.infra.providers import (
+    Completion,
     CompletionRequest,
     Message,
     ProviderError,
     ProviderFailure,
     Role,
+    StopReason,
 )
 from agentworld.infra.providers import (
     build as build_provider,
@@ -73,6 +75,18 @@ log = get_logger(__name__)
 #: look like a crash; short enough that a crashed worker's work moves within
 #: a minute or two rather than at the next deploy.
 DEFAULT_LEASE_SECONDS = 120
+
+#: A model answered, and said nothing usable. Values are lower snake case
+#: because that is what the rest of this taxonomy is - `rate_limited`,
+#: `invalid_request`, `runner_error`, `lease_expired` - and an operator
+#: filtering on `last_error_code` should not have to know which family a code
+#: came from.
+EMPTY_MODEL_RESPONSE = "empty_model_response"
+#: The same, where the provider told us why: it ran out of output budget
+#: before producing anything. Separated from the above because the remedy is
+#: different - raise `max_output_tokens` - and an operator reading
+#: `last_error_code` should not have to guess which it was.
+INCOMPLETE_MODEL_RESPONSE = "incomplete_model_response"
 
 #: The longest a provider's `Retry-After` may delay a retry, and the
 #: ceiling of the fallback backoff. Approved 2026-11-02: a provider asking
@@ -223,6 +237,9 @@ class StepRunner:
                 retry_after_seconds=exc.retry_after_seconds,
                 retryable=exc.failure.is_retryable,
             )
+
+        if (unusable := _unusable(completion)) is not None:
+            return unusable
 
         return Outcome(
             status=DispatchStatus.SUCCEEDED,
@@ -553,6 +570,90 @@ def _recovery_for(expired: ExpiredLease) -> tuple[DispatchStatus, str]:
     if expired.attempt + 1 >= expired.max_attempts:
         return DispatchStatus.DEAD, "the lease expired and no attempts remain"
     return DispatchStatus.PENDING, "the lease expired before the work started"
+
+
+def _unusable(completion: Completion) -> Outcome | None:
+    """A failure when the model answered with nothing worth recording.
+
+    Returns None when the completion is usable, which is the ordinary case.
+
+    ## Why this exists
+
+    A live run against the real API found an agent task recorded as
+    `succeeded` with `output.text == ""`. The model had spent its whole
+    output budget on an extended-thinking block, which `_completion`
+    discards by design as an unknown block type, and nothing downstream
+    treated an empty answer as a problem: the step succeeded, the execution
+    completed, and the workflow's result was silence.
+
+    Measured against a reasoning model that emits thinking blocks - named in
+    `15-T6-WORKER.md` rather than here, because `test_vendor_containment`
+    holds this layer to knowing no vendor, and it caught this docstring
+    doing it:
+
+    | `max_tokens` | content blocks | stop reason | text |
+    | --- | --- | --- | --- |
+    | 1 | none | `max_tokens` | `""` |
+    | 4 | thinking only | `max_tokens` | `""` |
+    | 20 | thinking, text | `max_tokens` | `"p"` |
+
+    ## What counts as usable
+
+    Text that is not blank, or at least one tool call. Nothing else is
+    inspected: this works on the neutral `Completion`, so it holds for every
+    provider rather than for the one adapter that happens to exist, and a
+    new adapter cannot forget it.
+
+    Blank-but-present text counts as nothing. A step whose recorded output
+    is whitespace is as useless to the next step's input mapping as an empty
+    string, and treating them differently would make the guarantee depend on
+    whether a model emitted a newline.
+
+    A tool call with no text **is** usable - that is what a tool-use turn
+    looks like - so this cannot reject one. `advance()` cannot emit a
+    `tool_call` dispatch in this release, so no such completion can arrive
+    through the approved path yet; the rule is written for when it can.
+
+    ## What this deliberately does not do
+
+    It does not reject a truncated answer that *has* content. A completion
+    with `stop_reason = max_tokens` and real text is a fragment - the
+    vocabulary says so - but whether a fragment is useful is the caller's
+    question, not this function's: a summary cut short at a thousand tokens
+    may be exactly what was wanted, and a sentence cut mid-word may not be.
+    The provider gives no signal that separates the two, and inventing one
+    (a length floor, a sentence-boundary check) would be this layer guessing
+    at intent. The stop reason is preserved in the successful output
+    instead, so a consumer that cares can see it.
+
+    So the only "demonstrably incomplete" case acted on is the one the
+    provider itself makes unambiguous: it stopped at the budget *and*
+    produced nothing to show for it.
+    """
+    if completion.text.strip() or completion.tool_calls:
+        return None
+
+    truncated = completion.stop_reason is StopReason.MAX_TOKENS
+    return Outcome(
+        status=DispatchStatus.FAILED,
+        # Diagnostics, and only diagnostics: the stop reason, the counts and
+        # the model the provider echoed back. No content - there is none to
+        # leak here, and a future caller copying this shape should not learn
+        # to put model output in an error string.
+        error=(
+            "the model returned no usable content "
+            f"(stop reason: {completion.stop_reason.value}, "
+            f"model: {completion.model or 'unreported'}, "
+            f"output tokens: {completion.usage.output_tokens})"
+        ),
+        error_code=INCOMPLETE_MODEL_RESPONSE if truncated else EMPTY_MODEL_RESPONSE,
+        # Not retried. The same request against the same budget produces the
+        # same silence, so a retry spends money to learn nothing; and where
+        # the budget is the cause, the remedy is a configuration change
+        # rather than a repetition. A human can still resolve the step
+        # through the T6b review route if they disagree.
+        retryable=False,
+    )
 
 
 def _will_retry(claimed: ClaimedDispatch, outcome: Outcome) -> bool:

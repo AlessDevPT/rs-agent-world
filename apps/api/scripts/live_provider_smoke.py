@@ -58,11 +58,23 @@ async def main() -> int:
     # the same egress rules a tool call would, that is the finding.
     async with net.GuardedClient() as client:
         provider = registry.build(anthropic.SLUG, client, api_key=api_key)
+        # No `temperature`. The first live run of this script failed with
+        # `invalid_request (HTTP 400)` and the real API's body said why:
+        # "`temperature` is deprecated for this model." Confirmed by probing
+        # the same endpoint through the same client - 0.0 is a 400, while 1.0
+        # and omitting it are both 200 - so the field is no longer tunable on
+        # these models.
+        #
+        # Omitting it is also what makes this script match production:
+        # `_TurnPlan` carries `base_url`, `system`, `prompt` and
+        # `max_output_tokens` and no temperature, and
+        # `CompletionRequest.temperature` defaults to None, which
+        # `_request_body` leaves out. A smoke test that sends a field the
+        # pipeline never sends is testing a request shape nothing makes.
         request = providers.CompletionRequest(
             model=MODEL,
             messages=[providers.Message(role=providers.Role.USER, content=PROMPT)],
             max_output_tokens=16,
-            temperature=0.0,
         )
         try:
             completion = await provider.complete(request)
