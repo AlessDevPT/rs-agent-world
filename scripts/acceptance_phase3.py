@@ -9,6 +9,11 @@ agent-task workflow, start it through `POST /v1/workflows/{id}/run`, and wait
 for the worker to claim it, call Anthropic through the guarded client, and
 advance the execution to a terminal state.
 
+The success scenario runs **two** sequential agent steps: the second step's
+input is mapped from the first step's persisted output, so one real model
+answer becomes the next real model's prompt. That is Phase 4 Track A's
+deliverable, and `04-ROADMAP-AND-MVP.md` M1 asks for it by name.
+
 It invents nothing. Every endpoint and payload below is the one the
 integration suite's `Scenario` helper uses, which is the only ground truth
 for these contracts.
@@ -41,6 +46,7 @@ import os
 import sys
 import time
 import uuid
+from collections.abc import Mapping
 from typing import Any
 
 try:
@@ -101,7 +107,9 @@ class Acceptance:
             raise Failed(f"GET /v1/me returned {me.status_code}: {me.text[:300]}")
         self.evidence["authenticated_user_id"] = me.json()["user"]["id"]
 
-    def build_project(self, api_key: str, model_id: str, label: str) -> None:
+    def build_project(
+        self, api_key: str, model_id: str, label: str, *, second_agent: bool = False
+    ) -> None:
         """Workspace, project, credential, model profile, agent - in order.
 
         The order is forced: a model profile needs a credential, an agent
@@ -167,6 +175,36 @@ class Acceptance:
             expect=200,
             json={"model_profile_id": profile["id"]},
         )
+        if second_agent:
+            # The second step of the sequence. It shares the credential and
+            # the model profile, because what is under test is the handoff,
+            # not a second configuration.
+            relay = self._call(
+                "POST",
+                f"/v1/projects/{project['id']}/agents",
+                expect=201,
+                json={
+                    "display_name": "Acceptance relay",
+                    "agent_key": "relay",
+                    "interaction_mode": "managed",
+                    # Chosen so the answer is checkable: whatever the first
+                    # agent said comes back surrounded by a fixed marker, so
+                    # the second model demonstrably read its input rather
+                    # than answering from the system prompt alone.
+                    "instructions": (
+                        "You will be given a field called received. Reply with "
+                        "exactly RELAYED:<value> where <value> is that field, "
+                        "and nothing else."
+                    ),
+                },
+            )
+            self._call(
+                "PATCH",
+                f"/v1/projects/{project['id']}/agents/{relay['id']}",
+                expect=200,
+                json={"model_profile_id": profile["id"]},
+            )
+            self.evidence[f"{label}_relay_agent_id"] = relay["id"]
         self.workspace_id = workspace["id"]
         self.project_id = project["id"]
         self.evidence[f"{label}_workspace_id"] = workspace["id"]
@@ -176,25 +214,37 @@ class Acceptance:
         self.evidence[f"{label}_model_id"] = model_id
         self.evidence[f"{label}_agent_id"] = agent["id"]
 
-    def publish_workflow(self, label: str) -> str:
+    def publish_workflow(self, label: str, *, two_step: bool = False) -> str:
+        """The graph. One step, or the two-step sequence M1 asks for.
+
+        The second step's `input_mapping` reads
+        `$.steps.confirm.output.text` - the first step's *persisted* output,
+        not the execution input - which is the whole claim being tested.
+        """
+        steps: list[dict[str, Any]] = [
+            {
+                "step_key": "confirm",
+                "kind": "agent_task",
+                "agent_key": "acceptance",
+                "input_mapping": {"prompt": "$.input.prompt"},
+            }
+        ]
+        edges: list[dict[str, Any]] = []
+        if two_step:
+            steps.append(
+                {
+                    "step_key": "relay",
+                    "kind": "agent_task",
+                    "agent_key": "relay",
+                    "input_mapping": {"received": "$.steps.confirm.output.text"},
+                }
+            )
+            edges.append({"from": "confirm", "to": "relay"})
         created = self._call(
             "POST",
             f"/v1/projects/{self.project_id}/workflows",
             expect=201,
-            json={
-                "name": "Acceptance",
-                "graph": {
-                    "steps": [
-                        {
-                            "step_key": "confirm",
-                            "kind": "agent_task",
-                            "agent_key": "acceptance",
-                            "input_mapping": {"prompt": "$.input.prompt"},
-                        }
-                    ],
-                    "edges": [],
-                },
-            },
+            json={"name": "Acceptance", "graph": {"steps": steps, "edges": edges}},
         )
         workflow_id = created["workflow"]["id"]
         published = self._call(
@@ -298,16 +348,24 @@ async def _query(url: str, execution_id: str, workspace_id: str) -> dict[str, An
         await conn.execute(
             "SELECT set_config('agentworld.workspace_ids', $1, false)", workspace_id
         )
+        # Joined to the step so a dispatch can be told apart by step key,
+        # and carrying `instruction` because the mapped input a step was
+        # actually dispatched with is the strongest *persisted* evidence that
+        # the handoff happened. `instruction` holds a credential reference,
+        # never credential material - see `CredentialService.use`.
         dispatches = await conn.fetch(
-            "SELECT id, kind, status, attempt, claim_count, leased_by, last_error_code, "
-            "finished_at IS NOT NULL AS finished, "
-            "side_effect_started_at IS NOT NULL AS was_in_flight "
-            "FROM dispatches WHERE execution_id = $1::uuid",
+            "SELECT d.id, s.step_key, d.kind, d.status, d.attempt, d.claim_count, "
+            "d.leased_by, d.last_error_code, d.instruction, "
+            "d.finished_at IS NOT NULL AS finished, "
+            "d.side_effect_started_at IS NOT NULL AS was_in_flight "
+            "FROM dispatches d "
+            "JOIN execution_steps s ON s.id = d.execution_step_id "
+            "WHERE d.execution_id = $1::uuid ORDER BY d.created_at, s.step_key",
             execution_id,
         )
         steps = await conn.fetch(
-            "SELECT step_key, status, attempt FROM execution_steps "
-            "WHERE execution_id = $1::uuid ORDER BY attempt",
+            "SELECT step_key, status, attempt, output FROM execution_steps "
+            "WHERE execution_id = $1::uuid ORDER BY step_key",
             execution_id,
         )
         # `type`, not `name`. The column has always been `type`, so the old
@@ -445,9 +503,9 @@ def _report_evidence(evidence: Evidence) -> None:
 
 
 def success_scenario(api: Acceptance, api_key: str, model_id: str) -> ScenarioResult:
-    print("\n== the success scenario: a real Anthropic call ==")
-    api.build_project(api_key, model_id, "success")
-    workflow_id = api.publish_workflow("success")
+    print("\n== the success scenario: two real Anthropic calls in sequence ==")
+    api.build_project(api_key, model_id, "success", second_agent=True)
+    workflow_id = api.publish_workflow("success", two_step=True)
     status = api.run_and_wait(workflow_id, "success")
     evidence = database_evidence(
         api.evidence["success_execution_id"], api.evidence["success_workspace_id"]
@@ -466,25 +524,125 @@ def success_scenario(api: Acceptance, api_key: str, model_id: str) -> ScenarioRe
     if not evidence.collected:
         return ScenarioResult("success", execution_ok=True, evidence=evidence)
 
-    claims_ok = True
-    rows = evidence.dispatches
-    if not rows:
-        print("  !! the execution completed with no dispatch row")
-        claims_ok = False
-    elif rows[0].get("status") != "succeeded":
-        print(f"  !! the dispatch is '{rows[0].get('status')}', not 'succeeded'")
-        claims_ok = False
-    elif not rows[0].get("finished"):
-        print("  !! the dispatch is terminal but finished_at is NULL")
-        claims_ok = False
+    claims_ok = _two_step_claims_hold(evidence)
     if not evidence.rows.get("events"):
         print("  !! no events were written for this execution")
         claims_ok = False
     if claims_ok:
-        print("  the dispatch succeeded, is stamped finished, and events were written")
+        print(
+            "  both steps succeeded, the handoff carried the first answer, and "
+            "events were written"
+        )
     return ScenarioResult(
         "success", execution_ok=True, evidence=evidence, claims_ok=claims_ok
     )
+
+
+def _two_step_claims_hold(evidence: Evidence) -> bool:
+    """Both steps ran, and the second was dispatched with the first's answer.
+
+    Every check reads a persisted row. The one thing this cannot see is the
+    HTTP request that actually left for api.anthropic.com: observing it would
+    mean putting something between the worker and the provider, which is the
+    guarded client's whole job and not something an acceptance run should
+    unpick. What it proves instead is tighter than a log line - the mapped
+    input the orchestrator committed for the second step is byte-equal to the
+    first step's persisted output, and the second step then produced its own
+    answer, which only a real completed call can do.
+    """
+    ok = True
+    rows = evidence.dispatches
+    by_step = {str(row.get("step_key")): row for row in rows}
+
+    if len(rows) != 2:
+        print(f"  !! expected two dispatches, found {len(rows)}: {sorted(by_step)}")
+        return False
+    for key in ("confirm", "relay"):
+        row = by_step.get(key)
+        if row is None:
+            print(f"  !! no dispatch for step '{key}'")
+            return False
+        if row.get("status") != "succeeded":
+            print(
+                f"  !! the '{key}' dispatch is '{row.get('status')}', not 'succeeded'"
+            )
+            ok = False
+        if not row.get("finished"):
+            print(f"  !! the '{key}' dispatch is terminal but finished_at is NULL")
+            ok = False
+
+    steps = {
+        str(row.get("step_key")): row for row in (evidence.rows.get("steps") or [])
+    }
+    if sorted(steps) != ["confirm", "relay"]:
+        print(f"  !! expected two step rows, found {sorted(steps)}")
+        return False
+    for key in ("confirm", "relay"):
+        if steps[key].get("status") != "succeeded":
+            print(f"  !! step '{key}' is '{steps[key].get('status')}', not 'succeeded'")
+            ok = False
+
+    first = _output_text(steps["confirm"])
+    if not first:
+        print(
+            "  !! the first step recorded no output text, so there was nothing to hand on"
+        )
+        return False
+
+    mapped = _instruction_input(by_step["relay"])
+    if mapped.get("received") != first:
+        print(
+            "  !! the handoff did not carry the first answer.\n"
+            f"     first step output : {first!r}\n"
+            f"     second step input : {mapped.get('received')!r}"
+        )
+        ok = False
+    else:
+        print(
+            f"  the second step was dispatched with the first step's answer: {first!r}"
+        )
+
+    second = _output_text(steps["relay"])
+    if not second:
+        print(
+            "  !! the second step recorded no output, so the second call never completed"
+        )
+        ok = False
+    else:
+        print(f"  the second step answered: {_truncate({'text': second})['text']!r}")
+        if first not in second:
+            # A warning, not a failure: the instruction asks the model to
+            # echo the value, and a model is free to paraphrase. The mapping
+            # is already proven by the dispatch instruction above.
+            print(
+                "  (note: the second answer does not quote the first; the model rephrased)"
+            )
+    return ok
+
+
+def _output_text(row: Any) -> str:
+    output = row.get("output")
+    if isinstance(output, str):
+        try:
+            output = json.loads(output)
+        except ValueError:
+            return ""
+    if isinstance(output, Mapping):
+        return str(output.get("text") or "")
+    return ""
+
+
+def _instruction_input(row: Any) -> Mapping[str, Any]:
+    instruction = row.get("instruction")
+    if isinstance(instruction, str):
+        try:
+            instruction = json.loads(instruction)
+        except ValueError:
+            return {}
+    if isinstance(instruction, Mapping):
+        mapped = instruction.get("input")
+        return mapped if isinstance(mapped, Mapping) else {}
+    return {}
 
 
 def failure_scenario(api: Acceptance, model_id: str) -> ScenarioResult:

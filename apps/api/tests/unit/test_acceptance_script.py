@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
+import json
 import pathlib
 import sys
 import types
@@ -200,11 +201,13 @@ class _Api:
         self._status = status
         self.evidence: dict[str, Any] = {}
 
-    def build_project(self, *args: Any) -> None:
+    def build_project(self, *args: Any, **kwargs: Any) -> None:
         self.evidence["failure_workspace_id"] = "ws-1"
         self.evidence["success_workspace_id"] = "ws-1"
+        self.second_agent = bool(kwargs.get("second_agent"))
 
-    def publish_workflow(self, *args: Any) -> str:
+    def publish_workflow(self, *args: Any, **kwargs: Any) -> str:
+        self.two_step = bool(kwargs.get("two_step"))
         return "wf-1"
 
     def run_and_wait(self, *args: Any, **kwargs: Any) -> str:
@@ -305,44 +308,165 @@ def test_the_success_scenario_does_not_claim_checks_it_could_not_make(
     assert result.evidence.collected is False
 
 
-def test_the_success_scenario_checks_the_row_when_it_has_one(
+# ------------------------------------------- the two-step success scenario ---
+
+FIRST = "ACCEPTED"
+SECOND = "RELAYED:ACCEPTED"
+
+#: `None` is a value these tests need to pass deliberately - "the step
+#: recorded no output" is one of the cases - so it cannot double as "use the
+#: default".
+_UNSET: Any = object()
+
+
+def _two_step(
+    *,
+    first_output: Any = _UNSET,
+    second_output: Any = _UNSET,
+    relay_input: Any = _UNSET,
+    dispatches: Any = None,
+    step_statuses: tuple[str, str] = ("succeeded", "succeeded"),
+    finished: tuple[bool, bool] = (True, True),
+) -> dict[str, Any]:
+    """Evidence for a healthy two-step run, with one thing varied at a time."""
+    if first_output is _UNSET:
+        first_output = {"text": FIRST}
+    if second_output is _UNSET:
+        second_output = {"text": SECOND}
+    if relay_input is _UNSET:
+        relay_input = {"received": FIRST}
+    rows = dispatches
+    if rows is None:
+        rows = [
+            {
+                "step_key": "confirm",
+                "status": "succeeded",
+                "finished": finished[0],
+                "instruction": {"input": {"prompt": "Say ACCEPTED"}},
+            },
+            {
+                "step_key": "relay",
+                "status": "succeeded",
+                "finished": finished[1],
+                "instruction": {"input": relay_input},
+            },
+        ]
+    return {
+        "dispatches": rows,
+        "steps": [
+            {"step_key": "confirm", "status": step_statuses[0], "output": first_output},
+            {"step_key": "relay", "status": step_statuses[1], "output": second_output},
+        ],
+        "events": {"execution.started": 1},
+    }
+
+
+def _ran(script: Any, monkeypatch: pytest.MonkeyPatch, rows: dict[str, Any]) -> Any:
+    monkeypatch.setattr(
+        script, "database_evidence", lambda *_: script.Evidence(collected=True, rows=rows)
+    )
+    return script.success_scenario(_Api("completed"), "key", "model-x")
+
+
+def test_the_success_scenario_asks_for_two_steps(
     script: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """The scenario must actually build the sequence, not just check for one."""
+    api = _Api("completed")
     monkeypatch.setattr(
         script,
         "database_evidence",
-        lambda *_: script.Evidence(
-            collected=True,
-            rows={
-                "dispatches": [{"status": "succeeded", "finished": True}],
-                "events": {"execution.started": 1},
-            },
-        ),
+        lambda *_: script.Evidence(collected=True, rows=_two_step()),
     )
 
-    result = script.success_scenario(_Api("completed"), "key", "model-x")
+    script.success_scenario(api, "key", "model-x")
+
+    assert api.second_agent is True, "the relay agent was never created"
+    assert api.two_step is True, "the published graph was not the two-step one"
+
+
+def test_a_healthy_two_step_run_passes(script: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    result = _ran(script, monkeypatch, _two_step())
 
     assert result.claims_ok is True
     assert result.passed is True
 
 
-def test_the_success_scenario_rejects_a_succeeded_dispatch_with_no_finish_time(
+def test_the_handoff_must_carry_the_first_step_output(
     script: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The invariant this task added, checked by the acceptance run too."""
-    monkeypatch.setattr(
-        script,
-        "database_evidence",
-        lambda *_: script.Evidence(
-            collected=True,
-            rows={
-                "dispatches": [{"status": "succeeded", "finished": False}],
-                "events": {"execution.started": 1},
-            },
-        ),
-    )
+    """The claim of the whole two-step scenario.
 
-    result = script.success_scenario(_Api("completed"), "key", "model-x")
+    The second step was dispatched with something, but not what the first
+    step actually said - which is what a broken mapping looks like once the
+    expression still resolves to *a* value.
+    """
+    result = _ran(script, monkeypatch, _two_step(relay_input={"received": "something else"}))
 
     assert result.claims_ok is False
     assert result.passed is False
+
+
+def test_an_empty_mapped_input_is_not_a_handoff(
+    script: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`_mapped` omits a field whose expression did not resolve."""
+    result = _ran(script, monkeypatch, _two_step(relay_input={}))
+
+    assert result.claims_ok is False
+
+
+def test_jsonb_arriving_as_text_is_still_read(script: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    """asyncpg hands JSONB back as `str` unless a codec is registered.
+
+    So the readers have to parse it. Without this the whole two-step check
+    would silently fail against the real database while passing here.
+    """
+    rows = _two_step()
+    rows["steps"][0]["output"] = json.dumps({"text": FIRST})
+    rows["steps"][1]["output"] = json.dumps({"text": SECOND})
+    rows["dispatches"][1]["instruction"] = json.dumps({"input": {"received": FIRST}})
+
+    result = _ran(script, monkeypatch, rows)
+
+    assert result.claims_ok is True, "JSONB returned as text was not parsed"
+
+
+def test_one_dispatch_is_not_two_steps(script: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    rows = _two_step()
+    rows["dispatches"] = rows["dispatches"][:1]
+
+    result = _ran(script, monkeypatch, rows)
+
+    assert result.claims_ok is False
+
+
+def test_a_second_step_with_no_output_means_the_second_call_never_completed(
+    script: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result = _ran(script, monkeypatch, _two_step(second_output=None))
+
+    assert result.claims_ok is False
+
+
+def test_a_first_step_with_no_output_has_nothing_to_hand_on(
+    script: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result = _ran(script, monkeypatch, _two_step(first_output=None))
+
+    assert result.claims_ok is False
+
+
+def test_a_failed_step_fails_the_claims(script: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    result = _ran(script, monkeypatch, _two_step(step_statuses=("succeeded", "failed")))
+
+    assert result.claims_ok is False
+
+
+def test_a_terminal_dispatch_with_no_finish_time_fails_the_claims(
+    script: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The finished_at invariant, checked by the acceptance run too."""
+    result = _ran(script, monkeypatch, _two_step(finished=(True, False)))
+
+    assert result.claims_ok is False

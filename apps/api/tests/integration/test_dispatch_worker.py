@@ -86,6 +86,16 @@ class FakeProvider:
     #: a thinking block that ate the whole output budget - which is how the
     #: live acceptance run found an empty answer recorded as success.
     body: dict[str, Any] | None = None
+    #: One response per call, consumed in order, falling back to `body` and
+    #: then to the default once empty. A two-step execution needs the second
+    #: step to see something the first did not say: with one canned answer
+    #: for every call, "the writer received the researcher's output" is
+    #: indistinguishable from "both steps were sent the same string".
+    responses: list[dict[str, Any]] = field(default_factory=list)
+    #: The parsed request bodies, in order. `requests` keeps the headers,
+    #: which is all T6 needed; proving an input *mapping* arrived requires
+    #: reading what was actually sent.
+    captured: list[dict[str, Any]] = field(default_factory=list)
 
     @property
     def base_url(self) -> str:
@@ -124,16 +134,23 @@ async def provider() -> AsyncIterator[FakeProvider]:
                 name, _, value = line.partition(":")
                 headers[name.strip().lower()] = value.strip()
         length = int(headers.get("content-length", "0"))
-        if length:
-            await reader.readexactly(length)
+        raw = await reader.readexactly(length) if length else b""
         state.requests.append(headers)
+        if raw:
+            try:
+                state.captured.append(json.loads(raw))
+            except ValueError:
+                # A body that is not JSON is a finding for whichever test
+                # cares, not a reason to stop answering.
+                state.captured.append({"unparsed": raw.decode("latin-1")})
         state.arrived.set()
 
         if state.hold is not None:
             await state.hold.wait()
         if state.delay:
             await asyncio.sleep(state.delay)
-        body = json.dumps(state.body if state.body is not None else default).encode()
+        chosen = state.responses.pop(0) if state.responses else state.body
+        body = json.dumps(chosen if chosen is not None else default).encode()
         extra = "".join(f"{k}: {v}\r\n" for k, v in state.extra_headers.items())
         writer.write(
             f"HTTP/1.1 {state.status} X\r\nContent-Type: application/json\r\n{extra}"

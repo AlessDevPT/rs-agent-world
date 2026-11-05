@@ -53,6 +53,8 @@ from agentworld.infra.db import Database
 from agentworld.repositories.unit_of_work import UnitOfWorkFactory
 from helpers import Actor
 
+pytestmark = pytest.mark.integration
+
 
 @pytest.fixture
 async def provider() -> Any:
