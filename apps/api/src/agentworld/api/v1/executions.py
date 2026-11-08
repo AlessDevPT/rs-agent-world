@@ -160,6 +160,60 @@ async def list_executions(
     return [ExecutionView.of(row) for row in rows]
 
 
+class CancellationView(BaseModel):
+    """What the cancellation stopped, and what it could not stop.
+
+    `cancelling` is the field that matters, and it is why this is not a
+    `204`. An execution whose dispatch a worker already holds is *being*
+    cancelled: the call may be on the wire, and nothing here can recall it.
+    The counts are returned so a client can say so rather than reporting a
+    stop that has not happened yet.
+    """
+
+    execution: ExecutionView
+    previous_status: ExecutionStatus = Field(description="What the execution was before this call.")
+    cancelled_dispatches: int = Field(
+        description="Queued dispatches dropped. These had not started."
+    )
+    in_flight_dispatches: int = Field(
+        description=(
+            "Dispatches a worker already holds. They settle when they report or their "
+            "lease expires."
+        )
+    )
+    cancelling: bool = Field(
+        description="True while work is still in flight, so the stop is not complete."
+    )
+
+
+@router.post(
+    "/{execution_id}/cancel",
+    response_model=CancellationView,
+    summary="Stop an execution",
+    description=(
+        "Drops queued work and marks the execution cancelled. Work a worker is already "
+        "performing cannot be recalled: it is asked to stop and settles when it reports "
+        "or its lease expires, which is what `cancelling` reports. Refused with 409 if "
+        "the execution has already finished."
+    ),
+)
+async def cancel_execution(
+    project_id: UUID,
+    execution_id: UUID,
+    principal: CurrentUser,
+    context: CallContextDep,
+    service: ExecutionServiceDep,
+) -> CancellationView:
+    result = await service.cancel(principal, context, project_id, execution_id)
+    return CancellationView(
+        execution=ExecutionView.of(await service.get(principal, project_id, execution_id)),
+        previous_status=result.previous_status,
+        cancelled_dispatches=result.cancelled_dispatches,
+        in_flight_dispatches=result.in_flight_dispatches,
+        cancelling=result.cancelling,
+    )
+
+
 @router.get(
     "/{execution_id}",
     response_model=ExecutionView,

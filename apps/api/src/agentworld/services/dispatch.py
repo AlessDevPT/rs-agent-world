@@ -44,7 +44,13 @@ from dataclasses import dataclass
 from typing import Any
 from uuid import uuid4
 
-from agentworld.domain.enums import DispatchKind, DispatchStatus, SideEffect, StepStatus
+from agentworld.domain.enums import (
+    DispatchKind,
+    DispatchStatus,
+    ExecutionStatus,
+    SideEffect,
+    StepStatus,
+)
 from agentworld.domain.errors import ConflictError, NotFoundError
 from agentworld.domain.protocol import PROTOCOL_VERSION, parse_envelope
 from agentworld.domain.reducers import fold
@@ -158,6 +164,30 @@ class StepRunner:
         into an uncertain one. The one thing that may raise is a programming
         error, which is what the loop's own handler is for.
         """
+        if not await self._execution_still_wants_this(claimed):
+            # Cancellation leaves a leased dispatch alone on purpose, because
+            # its call may be on the wire. If that worker then dies, the
+            # reaper returns the row to `pending` - correctly, as far as it
+            # can see, since no side effect had started - and the next worker
+            # would perform work the user stopped. Found by
+            # `test_a_lease_that_expires_after_cancellation_does_not_resume_the_work`,
+            # which made a real provider call for a cancelled execution.
+            #
+            # Checked here rather than in the claim query: this is the last
+            # point before the call, so it covers every route to a `pending`
+            # row under a dead execution, not just the reaper's.
+            log.info(
+                "dispatch_refused_execution_not_live",
+                dispatch_id=str(claimed.id),
+                execution_id=str(claimed.execution_id),
+            )
+            return Outcome(
+                status=DispatchStatus.CANCELLED,
+                error="the execution is no longer running",
+                error_code="execution_not_live",
+                retryable=False,
+            )
+
         if claimed.side_effect_class is SideEffect.CONSEQUENTIAL:
             # Unreachable through the approved path: `advance()` cannot emit
             # one. Refused rather than trusted, because a row carrying this
@@ -253,6 +283,20 @@ class StepRunner:
                 },
             },
         )
+
+    async def _execution_still_wants_this(self, claimed: ClaimedDispatch) -> bool:
+        """Whether the execution this dispatch belongs to may still progress.
+
+        One extra read per dispatch, which is the price of not performing
+        cancelled work. `ClaimedDispatch.execution_id` is not optional - the
+        claim query only yields dispatches that belong to an execution - so
+        there is no "no execution to ask about" case to handle here; mypy
+        said so when this was written defensively.
+        """
+        async with self._factory.begin(visible_workspaces={claimed.workspace_id}) as work:
+            scope = TenantScope(claimed.workspace_id, claimed.project_id)
+            header = await work.executions(scope).header(claimed.execution_id)
+        return header is not None and ExecutionStatus(header.status).is_live
 
     async def _plan(self, claimed: ClaimedDispatch) -> _TurnPlan:
         """Everything the call needs, gathered under one tenant scope."""

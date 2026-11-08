@@ -45,7 +45,7 @@ from dataclasses import dataclass
 from typing import Any
 from uuid import UUID, uuid4
 
-from agentworld.domain.enums import InitiatorKind, StepKind
+from agentworld.domain.enums import ExecutionStatus, InitiatorKind, StepKind
 from agentworld.domain.errors import (
     ConflictError,
     NotFoundError,
@@ -98,6 +98,29 @@ class Applied:
     @property
     def made_progress(self) -> bool:
         return bool(self.decisions)
+
+
+@dataclass(frozen=True, slots=True)
+class Cancellation:
+    """What cancelling an execution stopped, and what it could not stop."""
+
+    previous_status: ExecutionStatus
+    #: Queued dispatches dropped. These had not started.
+    cancelled_dispatches: int
+    #: Dispatches a worker already holds. Their calls may be on the wire, so
+    #: they settle when they report or their lease expires - nothing here can
+    #: recall them.
+    in_flight_dispatches: int
+
+    @property
+    def cancelling(self) -> bool:
+        """True while work is still in flight.
+
+        The distinction the specification insists on: an execution with a
+        leased dispatch is *cancelling*, not cancelled, and a UI that says
+        otherwise is claiming something it cannot know.
+        """
+        return self.in_flight_dispatches > 0
 
 
 class ExecutionService:
@@ -262,6 +285,92 @@ class ExecutionService:
         # at rather than a 500 and nothing.
         await self.advance_once(project_id, execution_id, visible={workspace_id})
         return execution_id
+
+    async def cancel(
+        self,
+        principal: UserPrincipal,
+        context: CallContext,
+        project_id: UUID,
+        execution_id: UUID,
+    ) -> Cancellation:
+        """Stop an execution: no new work, and the queued work dropped.
+
+        **The status is not written here.** `workflow.execution_cancelled` is
+        appended and the reducer's `_EXECUTION_STATUS` maps it to
+        `cancelled`, stamping `finished_at` because the status is not live.
+        That is the same arrangement `start` uses, and the reason is the one
+        in `advance_once`: one writer per field, because two is how the two
+        disagree.
+
+        **`advance()` needed no change for this.** It already returns no
+        decisions when `state.status` is not live, so a cancelled execution
+        cannot be advanced even by a reaper or a late worker report. The
+        cancellation is enforced by the state machine rather than by
+        remembering to check a flag at each call site.
+
+        **Queued work is cancelled; in-flight work is asked to stop.** The
+        count of leased dispatches comes back in the result so the caller can
+        say *cancelling* until they report. A request already on the wire
+        cannot be recalled, and claiming otherwise would be a lie the UI
+        repeats.
+
+        Under the execution's lock, so a cancel and an `advance_once` cannot
+        interleave and leave a dispatch created after the cancellation.
+        """
+        async with self._factory.begin(visible_workspaces=set(principal.memberships)) as work:
+            workspace_id = await _workspace_of(work, project_id)
+            authorize(principal, Action.EXECUTION_CANCEL, Resource(workspace_id))
+            scope = TenantScope(workspace_id, project_id)
+            executions = work.executions(scope)
+
+            if await executions.lock(execution_id) is None:
+                raise NotFoundError("Execution not found", execution_id=str(execution_id))
+            header = await executions.header(execution_id)
+            if header is None:  # pragma: no cover - the lock proved it
+                raise NotFoundError("Execution not found", execution_id=str(execution_id))
+
+            status = ExecutionStatus(header.status)
+            if not status.is_live:
+                # Already over. Refused rather than treated as a no-op,
+                # because "cancel" on a completed execution is a caller who
+                # believes something is still running, and silence would
+                # leave them believing it.
+                raise ConflictError(
+                    f"This execution is already {status.value}",
+                    execution_id=str(execution_id),
+                    status=status.value,
+                )
+
+            cancelled, in_flight = await work.dispatch_claims(scope).cancel_pending(execution_id)
+            await _append(
+                work,
+                scope,
+                event_type="workflow.execution_cancelled",
+                subject={"kind": "workflow_execution", "ref": str(execution_id)},
+                payload={"cancelled_dispatches": cancelled, "in_flight_dispatches": in_flight},
+                dedup_key=f"exec:{execution_id}:cancelled",
+                occurred_at=_now(),
+            )
+            await audit.record(
+                work,
+                principal,
+                context,
+                workspace_id=workspace_id,
+                action="execution.cancel",
+                resource_type="workflow_execution",
+                resource_id=execution_id,
+                metadata={
+                    "previous_status": status.value,
+                    "cancelled_dispatches": cancelled,
+                    "in_flight_dispatches": in_flight,
+                },
+            )
+
+        return Cancellation(
+            previous_status=status,
+            cancelled_dispatches=cancelled,
+            in_flight_dispatches=in_flight,
+        )
 
     # -------------------------------------------------------------- applying ---
 

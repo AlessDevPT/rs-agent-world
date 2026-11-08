@@ -289,6 +289,59 @@ class DispatchClaimRepository(ScopedRepository):
         ).scalar_one_or_none()
         return updated is not None
 
+    async def cancel_pending(self, execution_id: UUID) -> tuple[int, int]:
+        """Cancel this execution's queued work. Returns (cancelled, in_flight).
+
+        **Only `pending` rows.** A `leased` dispatch is already being
+        performed by a worker, and there is no way to recall a request that
+        has left the process - `02-ORCHESTRATION.md` §"Timeouts and
+        cancellation" is explicit that those are *asked* to stop and settle
+        when they report or their lease expires. Rewriting a leased row to
+        `cancelled` here would take its lease away mid-call, and the worker's
+        `settle` would then find nothing to update and silently drop a real
+        outcome - possibly the record that a consequential call went out.
+
+        So the in-flight count is returned rather than hidden: it is what
+        lets a caller say "cancelling" instead of "cancelled", which is the
+        one thing the specification insists the UI must not overclaim.
+
+        `finished_at` is stamped because `cancelled` is terminal, the same
+        rule `settle` follows.
+        """
+        cancelled = len(
+            (
+                await self._session.execute(
+                    sa.update(m.Dispatch)
+                    .where(
+                        m.Dispatch.execution_id == execution_id,
+                        m.Dispatch.workspace_id == self.scope.workspace_id,
+                        m.Dispatch.status == DispatchStatus.PENDING,
+                    )
+                    .values(
+                        status=DispatchStatus.CANCELLED,
+                        last_error="the execution was cancelled",
+                        last_error_code="execution_cancelled",
+                        leased_by=None,
+                        leased_until=None,
+                        finished_at=sa.func.now(),
+                    )
+                    .returning(m.Dispatch.id)
+                )
+            ).all()
+        )
+        in_flight = (
+            await self._session.execute(
+                sa.select(sa.func.count())
+                .select_from(m.Dispatch)
+                .where(
+                    m.Dispatch.execution_id == execution_id,
+                    m.Dispatch.workspace_id == self.scope.workspace_id,
+                    m.Dispatch.status == DispatchStatus.LEASED,
+                )
+            )
+        ).scalar_one()
+        return cancelled, int(in_flight)
+
     async def expire_leases(self, *, limit: int = 100) -> Sequence[ExpiredLease]:
         """Take back every lease that has run out. The reaper's one query.
 

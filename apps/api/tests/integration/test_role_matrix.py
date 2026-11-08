@@ -184,6 +184,9 @@ ENDPOINTS = [
     Endpoint("POST", "/v1/projects/{project}/workflows/{workflow}/run", MemberRole.MEMBER, {}),
     Endpoint("GET", "/v1/projects/{project}/executions", MemberRole.VIEWER),
     Endpoint("GET", "/v1/projects/{project}/executions/{execution}", MemberRole.VIEWER),
+    # member, per 05-PERMISSIONS.md: stopping work that is running is an
+    # operator action, not an administrative one.
+    Endpoint("POST", "/v1/projects/{project}/executions/{execution}/cancel", MemberRole.MEMBER),
     # ---- Phase 3 / T6b ----------------------------------------------------
     # The split in privilege is the design: seeing that an execution is
     # stuck is operational awareness, while asserting what happened to an
