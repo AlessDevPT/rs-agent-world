@@ -120,6 +120,21 @@ class WorkflowNotPublishableError(ValidationFailedError):
         self.findings = findings
 
 
+class DelegationNotCompilableError(WorkflowNotPublishableError):
+    """A delegation this release will not turn into a workflow, with reasons.
+
+    A subclass rather than a sibling, and deliberately: the findings travel
+    on the same attribute, render into the same `errors` array and resolve to
+    the same 422, so whatever eventually exposes compiling needs no new error
+    handling. Only the `code` differs, because "this delegation fans out" and
+    "this graph has a dangling edge" are not the same refusal and a client
+    that retried one would be wrong about the other.
+    """
+
+    code = "delegation_not_compilable"
+    title = "Delegation not compilable"
+
+
 class RateLimitedError(DomainError):
     code = "rate_limited"
     title = "Rate limited"

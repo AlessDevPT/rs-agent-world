@@ -38,13 +38,21 @@ from agentworld.domain.enums import (
     SideEffect,
     StepKind,
 )
-from agentworld.domain.errors import ConflictError, NotFoundError, ValidationFailedError
+from agentworld.domain.errors import (
+    ConflictError,
+    DelegationNotCompilableError,
+    NotFoundError,
+    ValidationFailedError,
+)
 from agentworld.domain.orchestration import (
     AgentFacts,
+    AgentIdentity,
+    DelegationFacts,
     EdgeDefinition,
     StepDefinition,
     ValidationReport,
     WorkflowDefinition,
+    compile_delegation,
 )
 from agentworld.domain.orchestration import validate as domain_validate
 from agentworld.domain.policy import Action, Condition, Resource, authorize
@@ -507,6 +515,127 @@ class WorkflowService:
             )
             return workflow, draft
 
+    async def compile_delegation(
+        self,
+        principal: UserPrincipal,
+        context: CallContext,
+        project_id: UUID,
+        connection_id: UUID,
+    ) -> tuple[Workflow, WorkflowDraft]:
+        """Turn a delegate connection into an ordinary unpublished draft.
+
+        `03-API-AND-FRONTEND.md` §7.1: a team is a `workflow_version`, not an
+        entity and not an execution path. So this method ends where `create`
+        ends - a workflow and its first draft - and everything after it is the
+        existing lifecycle: `validate`, `publish`, `run`, the worker. Nothing
+        here publishes, enables or starts anything, which is what keeps "the
+        builder leaves workflows unpublished" true of this path too.
+
+        The judgement is not here. `compile_delegation` in the domain decides
+        what the graph is and whether this release supports the shape; this
+        method gathers the rows, applies the authorization, and writes what
+        it is told - the same division `validate` and `publish` use, for the
+        same reason: a refusal has to be reproducible without a database.
+
+        One transaction, so the connection that was read is the connection
+        that was compiled. Two would let an agent be archived in between and
+        produce a draft naming it.
+
+        The eventual `services/builder.py` calls this. It gets no privileged
+        path of its own: `CREATE_TEAM` will arrive here, through these two
+        `authorize` calls and this audit row.
+        """
+        async with self._factory.begin(visible_workspaces=set(principal.memberships)) as work:
+            workspace_id = await _workspace_of(work, project_id)
+            resource = Resource(workspace_id)
+            # Both, in this order. Compiling reads a standing grant and
+            # creates a workflow; neither permission implies the other, and
+            # a viewer who may read connections must not end up with a
+            # workflow because the read was the only check.
+            authorize(principal, Action.CONNECTION_READ, resource)
+            authorize(principal, Action.WORKFLOW_CREATE, resource)
+
+            scope = TenantScope(workspace_id, project_id)
+            connections = work.connections(scope)
+            selected = await connections.get(connection_id)
+            if selected is None:
+                raise NotFoundError("Connection not found", connection_id=str(connection_id))
+
+            # Every delegation in the project, not just this one: whether a
+            # pair is unambiguous is a question about the others.
+            everything = await connections.list_all()
+            # `list_all` excludes archived agents, which is the whole of the
+            # rule - a delegation naming one is refused rather than compiled
+            # into a step nothing can run. Stated here rather than filtered
+            # again below: a second filter could only agree, and a reader
+            # would take it for the protection when it is not.
+            live = await work.agents(scope).list_all()
+
+            compilation = compile_delegation(
+                _delegation_facts(selected),
+                delegations=[
+                    _delegation_facts(connection)
+                    for connection in everything
+                    if connection.kind is ConnectionKind.DELEGATE
+                ],
+                agents=[
+                    AgentIdentity(
+                        agent_id=agent.id,
+                        agent_key=agent.agent_key,
+                        display_name=agent.display_name,
+                    )
+                    for agent in live
+                ],
+            )
+            compiled = compilation.workflow
+            if compiled is None:
+                raise DelegationNotCompilableError(
+                    "This delegation cannot be compiled into a workflow",
+                    findings=[
+                        {
+                            "pointer": finding.pointer,
+                            "code": finding.code.value,
+                            "detail": finding.detail,
+                        }
+                        for finding in compilation.findings
+                    ],
+                    connection_id=str(connection_id),
+                )
+
+            workflows = work.workflows(scope)
+            if await workflows.slug_taken(compiled.slug):
+                # Compiling the same pair twice. A conflict rather than a
+                # second workflow with a suffixed slug: the caller asked for
+                # this delegation to become a workflow and it already is one.
+                raise ConflictError(
+                    f"This project already has a workflow with the slug '{compiled.slug}'",
+                    slug=compiled.slug,
+                )
+            workflow, draft = await workflows.create(
+                slug=compiled.slug,
+                name=compiled.name,
+                description=compiled.description,
+                created_by_user_id=principal.user_id,
+                graph=compiled.graph,
+            )
+            await audit.record(
+                work,
+                principal,
+                context,
+                workspace_id=workspace_id,
+                action="workflow.compile_delegation",
+                resource_type="workflow",
+                resource_id=workflow.id,
+                metadata={
+                    "connection_id": str(connection_id),
+                    "slug": compiled.slug,
+                    # The step keys, because they are what a published
+                    # version freezes and what every later expression names.
+                    "steps": [compiled.upstream_step_key, compiled.downstream_step_key],
+                },
+            )
+            return workflow, draft
+
     async def get_draft(
         self, principal: UserPrincipal, project_id: UUID, workflow_id: UUID
     ) -> tuple[Workflow, WorkflowDraft]:
@@ -605,6 +734,24 @@ class WorkflowService:
         if draft is None:
             raise NotFoundError("This workflow has no draft", workflow_id=str(workflow_id))
         return workflow, draft
+
+
+def _delegation_facts(connection: Connection) -> DelegationFacts:
+    """A connection row in the shape the pure compiler reads.
+
+    A straight transcription, including `kind`: the compiler checks it rather
+    than trusting the caller to have filtered, so "this is a grant_tool, not
+    a delegation" is a finding a test can produce without a database.
+    """
+    return DelegationFacts(
+        connection_id=connection.id,
+        kind=connection.kind,
+        source_kind=connection.source_kind,
+        source_id=connection.source_id,
+        target_kind=connection.target_kind,
+        target_id=connection.target_id,
+        enabled=connection.enabled,
+    )
 
 
 def _elevation_for(kind: ConnectionKind, config: Mapping[str, Any] | None) -> frozenset[Condition]:
