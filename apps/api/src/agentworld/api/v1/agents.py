@@ -21,14 +21,17 @@ from typing import Annotated, Any
 from uuid import UUID
 
 from fastapi import APIRouter, Query, status
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from agentworld.api.deps import (
     AgentServiceDep,
+    AgentTestServiceDep,
     CallContextDep,
     CurrentUser,
+    ExecutionServiceDep,
     ModelProfileServiceDep,
 )
+from agentworld.api.v1.executions import ExecutionView
 from agentworld.domain.entities import Agent, ModelProfile
 from agentworld.domain.enums import AgentInteractionMode, AgentStatus
 from agentworld.repositories.definitions import UNSET
@@ -180,6 +183,22 @@ class AgentUpdate(BaseModel):
         }
 
 
+class AgentTestRequest(BaseModel):
+    """The sample input the agent is given, and nothing else.
+
+    `extra="forbid"`: a client that sends a model, a temperature or a system
+    prompt here has misunderstood what a test is. It runs *this* agent as
+    configured - that is the only question it answers, and overriding its
+    configuration for one run would answer a different one.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    input: Annotated[str, Field(min_length=1, max_length=20_000)] = Field(
+        description="The sample input. Reaches the agent as its one user message."
+    )
+
+
 class ModelProfileCreate(BaseModel):
     name: Name
     provider_slug: Name
@@ -287,6 +306,41 @@ async def archive_agent(
     it renders shuttered. Deleting it would rewrite what happened.
     """
     await service.archive(principal, context, project_id, agent_id)
+
+
+@project_router.post(
+    "/{agent_id}/test",
+    response_model=ExecutionView,
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="Run this agent once against a sample input",
+    description=(
+        "A real execution, not a preview: it spends money, it produces the ordinary "
+        "events, and it appears in `GET /executions`. 202, not 201, for the same "
+        "reason running a workflow is - the execution exists when this returns and "
+        "the turn has not happened yet. Read the agent's answer from `output` on "
+        "`GET /v1/projects/{project_id}/executions/{execution_id}`; there is no "
+        "second result endpoint. The first test of an agent also creates and "
+        "publishes the one-step workflow it runs, which later tests reuse."
+    ),
+)
+async def test_agent(
+    project_id: UUID,
+    agent_id: UUID,
+    body: AgentTestRequest,
+    principal: CurrentUser,
+    context: CallContextDep,
+    service: AgentTestServiceDep,
+    executions: ExecutionServiceDep,
+) -> ExecutionView:
+    """Returns the execution, read back through the ordinary execution read.
+
+    Two services, deliberately: the test starts it and `ExecutionService`
+    reports it, exactly as `POST .../run` does. A view built here from what
+    the service happened to know would be a second description of an
+    execution, and the two would drift.
+    """
+    execution_id = await service.run(principal, context, project_id, agent_id, sample=body.input)
+    return ExecutionView.of(await executions.get(principal, project_id, execution_id))
 
 
 @profiles_router.get("", response_model=list[ModelProfileView], summary="Model profiles")

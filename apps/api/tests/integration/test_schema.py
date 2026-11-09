@@ -353,3 +353,213 @@ async def test_exactly_one_default_model_profile_per_workspace(
                 {"w": workspace_id},
             )
     assert "one_default_model_profile" in str(caught.value)
+
+
+async def test_an_agent_has_at_most_one_test_workflow(owner_database: Database) -> None:
+    """`workflows_test_for_agent_key`, and why it is the whole concurrency story.
+
+    One reusable test workflow per agent is what `agent.test` promises. The
+    service finds or creates it, and two people pressing Test at the same
+    moment both find nothing - so without this index they both insert, and
+    the agent ends up with two test harnesses whose published versions
+    diverge. With it, one insert wins, the loser's `ON CONFLICT DO NOTHING`
+    writes nothing, and a re-read hands it the winner's row.
+    """
+    import uuid
+
+    user_id, workspace_id, project_id = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    agent_id = uuid.uuid4()
+
+    async with owner_database.session() as session:
+        await session.execute(
+            text("INSERT INTO users (id, email) VALUES (:i, 'harness@example.com')"),
+            {"i": user_id},
+        )
+        await session.execute(
+            text("INSERT INTO workspaces (id, slug, name, created_by) VALUES (:i, :s, :n, :u)"),
+            {"i": workspace_id, "s": "harness", "n": "Harness", "u": user_id},
+        )
+        await session.execute(
+            text("INSERT INTO projects (id, workspace_id, slug, name) VALUES (:i, :w, :s, :n)"),
+            {"i": project_id, "w": workspace_id, "s": "harness", "n": "Harness"},
+        )
+        await session.execute(
+            text(
+                "INSERT INTO agents (id, workspace_id, project_id, agent_key, "
+                "interaction_mode, display_name) VALUES (:i, :w, :p, :key, 'managed', :name)"
+            ),
+            {
+                "i": agent_id,
+                "w": workspace_id,
+                "p": project_id,
+                "key": "researcher",
+                "name": "Researcher",
+            },
+        )
+
+    async def insert(slug: str, *, test_for: uuid.UUID | None) -> None:
+        async with owner_database.session() as session:
+            await session.execute(
+                text(
+                    "INSERT INTO workflows (workspace_id, project_id, slug, name, "
+                    "test_for_agent_id) VALUES (:w, :p, :slug, :name, :agent)"
+                ),
+                {
+                    "w": workspace_id,
+                    "p": project_id,
+                    "slug": slug,
+                    "name": slug,
+                    "agent": test_for,
+                },
+            )
+
+    await insert("test-researcher", test_for=agent_id)
+
+    with pytest.raises(Exception) as caught:
+        await insert("test-researcher-again", test_for=agent_id)
+    assert "workflows_test_for_agent_key" in str(caught.value)
+
+    # The index constrains only the rows that name an agent, so an ordinary
+    # workflow is unaffected and there may be any number of them.
+    await insert("hand-written", test_for=None)
+    await insert("hand-written-too", test_for=None)
+
+    # Behaviour cannot tell a partial unique index from a total one here - a
+    # unique index over a nullable column does not consider two NULLs equal,
+    # so the two assertions above would hold either way. The predicate is
+    # what keeps the index to the few rows that have a value instead of one
+    # entry per workflow in the project, and the catalog is the only place
+    # that difference is visible.
+    async with owner_database.session() as session:
+        definition = (
+            await session.execute(
+                text(
+                    "SELECT indexdef FROM pg_indexes "
+                    "WHERE indexname = 'workflows_test_for_agent_key'"
+                )
+            )
+        ).scalar_one()
+    assert "CREATE UNIQUE INDEX" in definition
+    assert "WHERE (test_for_agent_id IS NOT NULL)" in definition
+
+
+async def test_deleting_an_agent_takes_its_unpublished_test_workflow_with_it(
+    owner_database: Database,
+) -> None:
+    """`ON DELETE CASCADE`, and the one window in which it can fire.
+
+    A test harness has no meaning without its agent, so it goes. But the
+    cascade is narrower than it looks: `workflow_steps.agent_id` is RESTRICT,
+    so from the first publish onwards the agent cannot be deleted at all.
+    Both halves are asserted here, because reading the new column without the
+    second one would suggest that deleting an agent quietly discards
+    execution history. It cannot.
+    """
+    import uuid
+
+    user_id, workspace_id, project_id = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    draft_agent, published_agent = uuid.uuid4(), uuid.uuid4()
+    pair = ((draft_agent, "drafted"), (published_agent, "published"))
+    workflows: dict[str, uuid.UUID] = {}
+
+    async with owner_database.session() as session:
+        await session.execute(
+            text("INSERT INTO users (id, email) VALUES (:i, 'cascade@example.com')"),
+            {"i": user_id},
+        )
+        await session.execute(
+            text("INSERT INTO workspaces (id, slug, name, created_by) VALUES (:i, :s, :n, :u)"),
+            {"i": workspace_id, "s": "cascade", "n": "Cascade", "u": user_id},
+        )
+        await session.execute(
+            text("INSERT INTO projects (id, workspace_id, slug, name) VALUES (:i, :w, :s, :n)"),
+            {"i": project_id, "w": workspace_id, "s": "cascade", "n": "Cascade"},
+        )
+        for agent_id, key in pair:
+            await session.execute(
+                text(
+                    "INSERT INTO agents (id, workspace_id, project_id, agent_key, "
+                    "interaction_mode, display_name) VALUES (:i, :w, :p, :key, 'managed', :name)"
+                ),
+                {"i": agent_id, "w": workspace_id, "p": project_id, "key": key, "name": key},
+            )
+            workflows[key] = (
+                await session.execute(
+                    text(
+                        "INSERT INTO workflows (workspace_id, project_id, slug, name, "
+                        "test_for_agent_id) VALUES (:w, :p, :slug, :name, :agent) RETURNING id"
+                    ),
+                    {
+                        "w": workspace_id,
+                        "p": project_id,
+                        "slug": f"test-{key}",
+                        "name": f"test-{key}",
+                        "agent": agent_id,
+                    },
+                )
+            ).scalar_one()
+
+        # Only the second one gets a published version with a step in it,
+        # which is what makes its agent undeletable. The graph goes in before
+        # `published_at` because migration 0018's trigger refuses an insert
+        # into a version that is already published - the same order
+        # `WorkflowRepository.publish` is forced into.
+        version_id = (
+            await session.execute(
+                text(
+                    "INSERT INTO workflow_versions (workflow_id, workspace_id, project_id, "
+                    "version, graph) VALUES (:f, :w, :p, 1, :graph) RETURNING id"
+                ),
+                {
+                    "f": workflows["published"],
+                    "w": workspace_id,
+                    "p": project_id,
+                    "graph": "{}",
+                },
+            )
+        ).scalar_one()
+        await session.execute(
+            text(
+                "INSERT INTO workflow_steps (workflow_version_id, workspace_id, project_id, "
+                "step_key, name, kind, agent_id) "
+                "VALUES (:v, :w, :p, :key, :name, 'agent_task', :agent)"
+            ),
+            {
+                "v": version_id,
+                "w": workspace_id,
+                "p": project_id,
+                "key": "published",
+                "name": "published",
+                "agent": published_agent,
+            },
+        )
+        await session.execute(
+            text("UPDATE workflow_versions SET published_at = now() WHERE id = :i"),
+            {"i": version_id},
+        )
+
+    # Unpublished: the agent goes, and the harness goes with it.
+    async with owner_database.session() as session:
+        await session.execute(text("DELETE FROM agents WHERE id = :i"), {"i": draft_agent})
+        remaining = (
+            await session.execute(
+                text("SELECT count(*) FROM workflows WHERE id = :i"),
+                {"i": workflows["drafted"]},
+            )
+        ).scalar_one()
+    assert remaining == 0
+
+    # Published: refused, by the step's own foreign key rather than by this one.
+    with pytest.raises(Exception) as caught:
+        async with owner_database.session() as session:
+            await session.execute(text("DELETE FROM agents WHERE id = :i"), {"i": published_agent})
+    assert "workflow_steps" in str(caught.value)
+
+    async with owner_database.session() as session:
+        survived = (
+            await session.execute(
+                text("SELECT count(*) FROM workflows WHERE id = :i"),
+                {"i": workflows["published"]},
+            )
+        ).scalar_one()
+    assert survived == 1

@@ -287,8 +287,17 @@ class Workflow:
     #: NULL until the first publish, which is why a workflow starts disabled.
     current_version_id: UUID | None = None
     enabled: bool = False
+    #: Set means this is that agent's test harness rather than something a
+    #: person authored: hidden from the ordinary listing, and refused by the
+    #: ordinary draft editor. Carried on the entity because the services
+    #: that enforce both read it.
+    test_for_agent_id: UUID | None = None
     created_at: datetime | None = None
     archived_at: datetime | None = None
+
+    @property
+    def is_test_harness(self) -> bool:
+        return self.test_for_agent_id is not None
 
 
 @dataclass(frozen=True, slots=True)

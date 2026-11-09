@@ -658,8 +658,10 @@ class WorkflowService:
             authorize(principal, Action.WORKFLOW_UPDATE_DRAFT, Resource(workspace_id))
             scope = TenantScope(workspace_id, project_id)
             workflows = work.workflows(scope)
-            if await workflows.get(workflow_id) is None:
+            existing = await workflows.get(workflow_id)
+            if existing is None:
                 raise NotFoundError("Workflow not found", workflow_id=str(workflow_id))
+            _not_a_test_harness(existing, doing="edited")
             draft = await workflows.save_draft(workflow_id, graph=graph)
             if draft is None:
                 raise NotFoundError(
@@ -688,7 +690,14 @@ class WorkflowService:
             workspace_id = await _workspace_of(work, project_id)
             authorize(principal, Action.WORKFLOW_ARCHIVE, Resource(workspace_id))
             scope = TenantScope(workspace_id, project_id)
-            if not await work.workflows(scope).archive(workflow_id):
+            workflows = work.workflows(scope)
+            existing = await workflows.get(workflow_id)
+            if existing is not None:
+                # Before the attempt, so that a refused harness is told apart
+                # from a workflow that is not there. The repository refuses
+                # it either way, but "not found" would be a lie.
+                _not_a_test_harness(existing, doing="archived")
+            if not await workflows.archive(workflow_id):
                 raise NotFoundError("Workflow not found", workflow_id=str(workflow_id))
             await audit.record(
                 work,
@@ -734,6 +743,26 @@ class WorkflowService:
         if draft is None:
             raise NotFoundError("This workflow has no draft", workflow_id=str(workflow_id))
         return workflow, draft
+
+
+def _not_a_test_harness(workflow: Workflow, *, doing: str) -> None:
+    """Refuse the ordinary workflow-management verbs on a compiled harness.
+
+    An agent's test workflow is created, published and run by `agent.test`
+    and by nothing else. Editing its draft would change what the next test
+    runs into something the compiler did not decide; archiving it would
+    leave a row no later test can insert past, because the unique index on
+    `test_for_agent_id` spans archived rows. Both are a 409 naming the
+    agent, rather than a 404 pretending the workflow is not there - it is,
+    the caller may read it, and it belongs to something.
+    """
+    if workflow.test_for_agent_id is None:
+        return
+    raise ConflictError(
+        f"This workflow is the test harness for an agent and cannot be {doing}",
+        workflow_id=str(workflow.id),
+        agent_id=str(workflow.test_for_agent_id),
+    )
 
 
 def _delegation_facts(connection: Connection) -> DelegationFacts:

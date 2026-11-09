@@ -584,12 +584,36 @@ class Workflow(Base):
     created_by_user_id: Mapped[UUID | None] = mapped_column(
         sa.ForeignKey("users.id", ondelete="SET NULL")
     )
+    #: Set means this workflow is that agent's test harness, compiled by
+    #: `agent.test` rather than authored by a person - which is why it is
+    #: hidden from the ordinary listing and refuses ordinary draft edits.
+    #: Nothing else in this table could say it: `created_by_user_id` is
+    #: `SET NULL` on a deleted account and so already means something else,
+    #: and `enabled` is the trigger flag.
+    #:
+    #: CASCADE, because a test harness has no meaning without its agent.
+    #: `workflow_steps.agent_id` is RESTRICT, so once this workflow is
+    #: published the agent cannot be hard deleted at all and the cascade
+    #: applies only before the first publish. Migration 0021 says more.
+    test_for_agent_id: Mapped[UUID | None] = mapped_column(
+        sa.ForeignKey("agents.id", ondelete="CASCADE")
+    )
     created_at: Mapped[dt.datetime] = _created_at()
     archived_at: Mapped[dt.datetime | None]
 
     __table_args__ = (
         _project_fk("workflows"),
         sa.UniqueConstraint("project_id", "slug", name="workflows_project_slug_key"),
+        # One test workflow per agent, as a database guarantee: it is what
+        # lets the first test be an `ON CONFLICT DO NOTHING` and a re-read
+        # rather than a lock, so two concurrent first tests converge on one
+        # workflow.
+        sa.Index(
+            "workflows_test_for_agent_key",
+            "test_for_agent_id",
+            unique=True,
+            postgresql_where=sa.text("test_for_agent_id IS NOT NULL"),
+        ),
         # Composite, so the named version must belong to this workflow.
         #
         # `use_alter` is not cosmetic. `workflows` and `workflow_versions`

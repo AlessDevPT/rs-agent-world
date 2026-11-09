@@ -561,15 +561,113 @@ class WorkflowRepository(ScopedRepository):
         return _to_workflow(row) if row is not None else None
 
     async def list_all(self) -> Sequence[Workflow]:
+        """Every workflow somebody authored, newest last.
+
+        Test harnesses are excluded. They are real workflows and they run on
+        the ordinary orchestrator, but nobody drew them and nobody edits
+        them: listing one next to a person's own workflows would invite
+        exactly the hand-editing that `save_draft` refuses. `get` still
+        finds one by id, because publishing and running it are how a test
+        happens.
+        """
         rows = await self._session.execute(
             sa.select(m.Workflow)
             .where(
                 m.Workflow.project_id == self.scope.require_project(),
                 m.Workflow.archived_at.is_(None),
+                m.Workflow.test_for_agent_id.is_(None),
             )
             .order_by(m.Workflow.created_at)
         )
         return [_to_workflow(row) for row in rows.scalars().all()]
+
+    async def test_for(self, agent_id: UUID) -> Workflow | None:
+        """That agent's test harness, if it has one.
+
+        No `archived_at` filter, deliberately. The partial unique index does
+        not exclude archived rows either, so a harness hidden from this read
+        would be a harness `find_or_create_test` could never insert past -
+        every later test of that agent would fail on a constraint instead of
+        running. `archive` refuses a harness for the same reason, which is
+        what keeps the two views of this row in agreement.
+        """
+        row = (
+            await self._session.execute(
+                sa.select(m.Workflow).where(
+                    m.Workflow.test_for_agent_id == agent_id,
+                    m.Workflow.project_id == self.scope.require_project(),
+                )
+            )
+        ).scalar_one_or_none()
+        return _to_workflow(row) if row is not None else None
+
+    async def find_or_create_test(
+        self,
+        *,
+        agent_id: UUID,
+        slug: str,
+        name: str,
+        description: str | None = None,
+        graph: Mapping[str, Any],
+        created_by_user_id: UUID | None = None,
+    ) -> tuple[Workflow | None, bool]:
+        """That agent's test harness, creating it if this is the first test.
+
+        Three outcomes, because there are three things that can be true:
+
+        - `(workflow, True)` - this call created it, and the caller owes an
+          audit row for a workflow it created;
+        - `(workflow, False)` - it was already there, whether from an earlier
+          test or from a transaction that beat this one by a moment;
+        - `(None, False)` - the insert conflicted with a row that is *not*
+          this agent's harness, which can only mean the slug belongs to a
+          workflow somebody authored. The caller decides what to say about
+          that; this layer does not raise.
+
+        **`ON CONFLICT DO NOTHING` and a re-read, rather than a lock.** Two
+        people pressing Test at the same moment both find nothing and both
+        insert. Postgres waits for the first transaction to finish before
+        deciding the second insert, and under READ COMMITTED the re-read
+        takes a fresh snapshot - so the loser sees the committed row rather
+        than nothing. Had the winner rolled back instead, the loser's insert
+        is the one that lands.
+
+        **The conflict is left uninferred, which was measured rather than
+        chosen.** This first named the partial index on `test_for_agent_id`
+        as the arbiter, on the reasoning that a slug collision is a different
+        problem and should not be swallowed here. The concurrency test then
+        failed on `workflows_project_slug_key`: two first tests of one agent
+        collide on *both* indexes, and `DO NOTHING` on one arbiter does not
+        protect against the other. An unqualified `DO NOTHING` is the only
+        form that covers the real race - and it is still not a swallowed
+        error, because the re-read tells the two conflicts apart afterwards.
+        """
+        inserted = (
+            await self._session.execute(
+                sa.dialects.postgresql.insert(m.Workflow)
+                .values(
+                    workspace_id=self.scope.workspace_id,
+                    project_id=self.scope.require_project(),
+                    slug=slug,
+                    name=name,
+                    description=description,
+                    created_by_user_id=created_by_user_id,
+                    test_for_agent_id=agent_id,
+                )
+                .on_conflict_do_nothing()
+                .returning(m.Workflow)
+            )
+        ).scalar_one_or_none()
+
+        if inserted is not None:
+            # The same pairing `create` makes: a workflow with no version at
+            # all is a row every reader has to special-case.
+            await self._new_version(
+                inserted.id, version=1, graph=graph, created_by_user_id=created_by_user_id
+            )
+            return _to_workflow(inserted), True
+
+        return await self.test_for(agent_id), False
 
     async def slug_taken(self, slug: str) -> bool:
         found = (
@@ -603,6 +701,15 @@ class WorkflowRepository(ScopedRepository):
     async def save_draft(
         self, workflow_id: UUID, *, graph: Mapping[str, Any]
     ) -> WorkflowDraft | None:
+        """Replace the draft's graph, unless this workflow is a test harness.
+
+        The harness condition is in the statement rather than in a read
+        before it, so no caller can write through this method by forgetting
+        to check - including the conversational builder, which will one day
+        hold `workflow.update_draft` and have no reason to know that some
+        workflows are compiled. `WorkflowService.save_draft` checks first and
+        says why; what reaches here is the floor under that.
+        """
         row = (
             await self._session.execute(
                 sa.update(m.WorkflowVersion)
@@ -610,6 +717,12 @@ class WorkflowRepository(ScopedRepository):
                     m.WorkflowVersion.workflow_id == workflow_id,
                     m.WorkflowVersion.project_id == self.scope.require_project(),
                     m.WorkflowVersion.published_at.is_(None),
+                    ~sa.select(m.Workflow.id)
+                    .where(
+                        m.Workflow.id == m.WorkflowVersion.workflow_id,
+                        m.Workflow.test_for_agent_id.isnot(None),
+                    )
+                    .exists(),
                 )
                 .values(graph=dict(graph))
                 .returning(m.WorkflowVersion)
@@ -740,6 +853,13 @@ class WorkflowRepository(ScopedRepository):
         )
 
     async def archive(self, workflow_id: UUID) -> bool:
+        """Archive a workflow, unless it is a test harness.
+
+        A harness has to stay archivable-by-nobody for the reason `test_for`
+        gives: the unique index spans archived rows, so an archived harness
+        is one no later test can replace and none can use. Refused in the
+        statement for the same reason `save_draft` is.
+        """
         return bool(
             await _rows(
                 self._session,
@@ -748,6 +868,7 @@ class WorkflowRepository(ScopedRepository):
                     m.Workflow.id == workflow_id,
                     m.Workflow.project_id == self.scope.require_project(),
                     m.Workflow.archived_at.is_(None),
+                    m.Workflow.test_for_agent_id.is_(None),
                 )
                 .values(archived_at=sa.func.now()),
             )
@@ -805,6 +926,7 @@ def _to_workflow(row: m.Workflow) -> Workflow:
         description=row.description,
         current_version_id=row.current_version_id,
         enabled=row.enabled,
+        test_for_agent_id=row.test_for_agent_id,
         created_at=row.created_at,
         archived_at=row.archived_at,
     )

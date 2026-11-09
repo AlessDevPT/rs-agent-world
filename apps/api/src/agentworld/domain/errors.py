@@ -135,6 +135,20 @@ class DelegationNotCompilableError(WorkflowNotPublishableError):
     title = "Delegation not compilable"
 
 
+class AgentNotTestableError(WorkflowNotPublishableError):
+    """An agent `agent.test` will not run, with the reasons.
+
+    The same shape as `DelegationNotCompilableError` and for the same
+    reasons: findings on the attribute, rendered into the same `errors`
+    array, resolving to the same 422. A distinct `code` because "this agent
+    only reports its own activity" is not a graph problem and a client that
+    offered to fix the graph would be offering nonsense.
+    """
+
+    code = "agent_not_testable"
+    title = "Agent not testable"
+
+
 class RateLimitedError(DomainError):
     code = "rate_limited"
     title = "Rate limited"

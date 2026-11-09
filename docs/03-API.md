@@ -154,6 +154,7 @@ honest 404. Tracked in `docs/05-ROADMAP.md`.
 | `GET` | `/v1/agents/{id}` | viewer+ | |
 | `PATCH` | `/v1/agents/{id}` | member+ | `display_name`, `kind`, `labels`, `heartbeat_ttl_seconds`. **Not** `status`. |
 | `POST` | `/v1/agents/{id}/maintenance` | member+ | `{"enabled": true, "reason": "deploy"}` — mutes alerts and the island's error glow. |
+| `POST` | `/v1/projects/{id}/agents/{agent_id}/test` | member+ | `{"input": "..."}` → `202` and the execution. A real run: it spends money and appears in `GET /executions`. Read the answer from `output` on the execution. |
 | `DELETE` | `/v1/agents/{id}` | admin+ | Archive. History is retained. |
 | `GET` | `/v1/agents/{id}/status-history` | viewer+ | |
 | `GET` | `/v1/agents/{id}/runs` | viewer+ | |

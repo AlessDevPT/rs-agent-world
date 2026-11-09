@@ -100,6 +100,16 @@ ENDPOINTS = [
         {"display_name": "Renamed"},
     ),
     Endpoint("DELETE", "/v1/projects/{project}/agents/{agent}", MemberRole.ADMIN),
+    # `member`, and sensitive: a test run spends money. It also creates and
+    # publishes the agent's one-step harness on first use, so the roles for
+    # `workflow.create`, `workflow.publish` and `workflow.run` have to admit
+    # a member too - `tests/unit/test_policy.py` holds them to that.
+    Endpoint(
+        "POST",
+        "/v1/projects/{project}/agents/{agent}/test",
+        MemberRole.MEMBER,
+        {"input": "Say hello."},
+    ),
     Endpoint("GET", "/v1/workspaces/{workspace}/model-profiles", MemberRole.VIEWER),
     Endpoint(
         "POST",

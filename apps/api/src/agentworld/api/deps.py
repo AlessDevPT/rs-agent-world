@@ -27,6 +27,7 @@ from agentworld.infra.auth.supabase import CHALLENGE as BEARER_CHALLENGE
 from agentworld.infra.db import Database
 from agentworld.infra.secrets import EnvelopeSecretStore
 from agentworld.repositories.unit_of_work import UnitOfWorkFactory
+from agentworld.services.agent_test import AgentTestService
 from agentworld.services.api_keys import CHALLENGE as KEY_CHALLENGE
 from agentworld.services.api_keys import ApiKeyService
 from agentworld.services.context import CallContext
@@ -260,6 +261,17 @@ def get_execution_service(factory: FactoryDep) -> ExecutionService:
     return ExecutionService(factory)
 
 
+def get_agent_test_service(factory: FactoryDep) -> AgentTestService:
+    """Testing one agent.
+
+    Holds an `ExecutionService` because a test publishes and runs through the
+    same two methods the publish and run routes call. There is no second way
+    to start an execution, and this is where that would otherwise be the
+    obvious shortcut.
+    """
+    return AgentTestService(factory, executions=ExecutionService(factory))
+
+
 def get_review_service(factory: FactoryDep) -> ReviewService:
     """Resolving uncertain outcomes.
 
@@ -292,4 +304,5 @@ ConnectionServiceDep = Annotated[ConnectionService, Depends(get_connection_servi
 WorkflowServiceDep = Annotated[WorkflowService, Depends(get_workflow_service)]
 CredentialServiceDep = Annotated[CredentialService, Depends(get_credential_service)]
 ExecutionServiceDep = Annotated[ExecutionService, Depends(get_execution_service)]
+AgentTestServiceDep = Annotated[AgentTestService, Depends(get_agent_test_service)]
 ReviewServiceDep = Annotated[ReviewService, Depends(get_review_service)]

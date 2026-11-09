@@ -399,3 +399,26 @@ def test_no_action_can_read_a_secret() -> None:
     assert not any("read_secret" in action.value for action in Action)
     assert not any(action.value == "agent.set_status" for action in Action)
     assert not any(action.value == "execution.edit" for action in Action)
+
+
+def test_testing_an_agent_needs_no_more_than_the_actions_a_test_performs() -> None:
+    """Why `AgentTestService`'s `workflow.create` check cannot be tested.
+
+    A first test performs four privileged actions, and the service checks or
+    delegates every one of them. Three of those checks are provable by
+    behaviour - a role that cannot do it is refused - but
+    `authorize(WORKFLOW_CREATE)` is not: every role that holds `agent.test`
+    holds the other three too, so no caller exists for whom removing that
+    line changes the outcome. A non-vacuity probe on it reports nothing, and
+    that is honest rather than a gap in the tests.
+
+    This is the test that notices if that stops being true. If any of these
+    ever outranks `agent.test`, the probe becomes meaningful and the
+    authorization test it needs has to be written.
+    """
+    performed = (Action.WORKFLOW_CREATE, Action.WORKFLOW_PUBLISH, Action.WORKFLOW_RUN)
+    for action in performed:
+        assert MINIMUM_ROLE[action] is MINIMUM_ROLE[Action.AGENT_TEST], (
+            f"{action.value} now differs from agent.test: AgentTestService needs an "
+            "authorization test for it, and the order of its checks matters"
+        )
