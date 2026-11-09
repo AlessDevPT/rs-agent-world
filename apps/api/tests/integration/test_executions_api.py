@@ -220,6 +220,94 @@ async def test_a_refused_publish_leaves_nothing_behind(
     assert published == 0
 
 
+async def test_a_publish_that_collides_is_a_conflict(
+    scenario: Scenario, owner_database: Database
+) -> None:
+    """A real unique violation, through the real route, without a race.
+
+    Two simultaneous publishes of one draft collide on
+    `workflow_steps_key_key`: both freeze the same version and both insert
+    the same `(workflow_version_id, step_key)`. That is reachable from the
+    API - `agent.test` found it first, where the first test of an agent
+    publishes the harness it just created - but a test that raced two
+    requests could pass by serialising them.
+
+    So the collision is arranged instead of hoped for. Migration 0018 refuses
+    step inserts only into a version that is *already published*, so seeding
+    one into the open draft is allowed, and the publish then tries to write
+    the same key underneath it. No constraint is weakened and no migration is
+    touched: the row below is one a publish would have written anyway.
+
+    This is also what keeps `tests/unit/test_problem_details.py` honest. Those
+    cases fabricate an `IntegrityError`; this one comes from asyncpg, so if
+    the handler read `sqlstate` or `constraint_name` off the wrong object the
+    fabricated cases would still pass and this would return 500.
+    """
+    workflow_id = scenario.workflow()
+
+    async with owner_database.session() as session:
+        draft_id = (
+            await session.execute(
+                text(
+                    "SELECT id FROM workflow_versions "
+                    "WHERE workflow_id = :w AND published_at IS NULL"
+                ),
+                {"w": uuid.UUID(workflow_id)},
+            )
+        ).scalar_one()
+        await session.execute(
+            text(
+                "INSERT INTO workflow_steps "
+                "(workflow_version_id, workspace_id, project_id, step_key, name, kind, agent_id) "
+                "VALUES (:v, :w, :p, 'research', 'research', 'agent_task', :a)"
+            ),
+            {
+                "v": draft_id,
+                "w": uuid.UUID(scenario.workspace_id),
+                "p": uuid.UUID(scenario.project_id),
+                "a": uuid.UUID(str(scenario.agent["id"])),
+            },
+        )
+
+    response = scenario.publish(workflow_id)
+
+    assert response.status_code == 409, response.text
+    assert response.headers["content-type"].startswith("application/problem+json")
+    body = response.json()
+    assert body["type"].endswith("/conflict")
+    assert body["title"] == "Conflict"
+    assert body["status"] == 409
+    assert body["detail"] == "That change collided with a concurrent change. Try again."
+    # The property `docs/03-API.md` section 2 states for every response, and
+    # the one an unmodelled exception cannot keep.
+    assert body["instance"] == response.headers["X-Request-Id"]
+    for leaked in ("workflow_steps_key_key", "duplicate key", "INSERT INTO", "asyncpg"):
+        assert leaked not in response.text, f"the response named {leaked!r}"
+
+    async with owner_database.session() as session:
+        published = (
+            await session.execute(
+                text(
+                    "SELECT count(*) FROM workflow_versions "
+                    "WHERE workflow_id = :w AND published_at IS NOT NULL"
+                ),
+                {"w": uuid.UUID(workflow_id)},
+            )
+        ).scalar_one()
+        versions = (
+            await session.execute(
+                text("SELECT count(*) FROM workflow_versions WHERE workflow_id = :w"),
+                {"w": uuid.UUID(workflow_id)},
+            )
+        ).scalar_one()
+    assert published == 0, "the refused publish published something anyway"
+    assert versions == 1, "the refused publish opened the next draft anyway"
+    # One row: the seeded one. The publish's own insert, and everything after
+    # it, went back.
+    assert await _count(owner_database, "workflow_steps", workflow_version_id=draft_id) == 1
+    assert await _count(owner_database, "workflow_edges") == 0
+
+
 async def test_a_tool_call_step_cannot_be_published_yet(scenario: Scenario) -> None:
     """Stated as a test because it is a real product limitation.
 

@@ -40,10 +40,16 @@ types.
 | 401 | Missing/invalid credential, or wrong plane |
 | 403 | Authenticated but the role forbids the action |
 | 404 | Not found **or** not visible to this tenant (deliberately indistinguishable) |
-| 409 | Conflict (slug taken, task already terminal, optimistic-concurrency mismatch) |
+| 409 | Conflict (slug taken, task already terminal, optimistic-concurrency mismatch, or a database uniqueness race) |
 | 422 | Semantic validation failure |
 | 429 | Rate limited; `Retry-After` and `X-RateLimit-*` headers set |
 | 503 | Dependency unavailable; safe to retry with backoff |
+
+A 409 is either the application's own check refusing the request, or PostgreSQL
+refusing the loser of a race on a unique, exclusion or immutability constraint -
+the second kind is safe to retry. Neither names a table, column or constraint in
+`detail`. A 409 says the transaction that raised it was rolled back whole; it does
+not say that a request made of several transactions left nothing behind.
 
 **Pagination** — cursor-based everywhere. `?limit=50&cursor=<opaque>`:
 

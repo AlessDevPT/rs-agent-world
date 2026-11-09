@@ -2,6 +2,13 @@
 
 Every error response the API produces has the same shape, including the ones
 FastAPI and Starlette raise themselves. Clients get one parser, not three.
+
+That includes the ones the database raises. A unique index is the only thing
+that can decide a race between two requests, and the loser's `IntegrityError`
+would otherwise arrive here as an unmodelled exception and leave as a 500 -
+telling a caller their request was this server's fault when in fact somebody
+else got there first. `_integrity` is where that is told apart, by SQLSTATE
+rather than by message text.
 """
 
 from __future__ import annotations
@@ -12,6 +19,7 @@ from typing import Any, Final
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from sqlalchemy.exc import IntegrityError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from agentworld.domain import errors as domain_errors
@@ -50,6 +58,43 @@ _TITLE_BY_STATUS: dict[int, str] = {
     502: "Bad gateway",
     503: "Service unavailable",
 }
+
+#: The integrity violations that mean "somebody else got there first", and
+#: nothing else. Everything outside this set keeps the generic 500, because a
+#: 409 is a statement that the request was fine and only the timing was not:
+#:
+#: - `23502` not-null and `23514` check are this server writing a row it
+#:   should never have built. Telling the caller to retry would be telling
+#:   them to reproduce a bug, and the 500 is what carries the traceback to
+#:   whoever has to fix it.
+#: - `23503` foreign key is ambiguous by nature: a delete that lost a race to
+#:   a new reference is a conflict, while a caller naming an id that does not
+#:   exist is a validation failure wanting 404 or 422. One status cannot be
+#:   honest about both, so it keeps the 500 that leaves the gap visible.
+#: - `23001` restrict is in the set because the only things that raise it here
+#:   are the guard triggers in migrations 0018 and 0019, which chose
+#:   `ERRCODE = 'restrict_violation'` deliberately. "This version is published
+#:   and cannot be edited" is a conflict in anybody's language.
+#:
+#: Row-level security and the append-only grants are *not* integrity
+#: violations - they fail with `42501`, a `ProgrammingError` - so nothing here
+#: can turn a tenancy refusal into a 409.
+CONFLICT_SQLSTATES: Final = frozenset(
+    {
+        "23505",  # unique_violation
+        "23P01",  # exclusion_violation
+        "23001",  # restrict_violation
+    }
+)
+
+#: Deliberately the same sentence whatever collided. The constraint name is a
+#: detail of this schema and the table name a detail of this release; neither
+#: is actionable by a caller whose only useful move is to try again.
+CONFLICT_DETAIL: Final = "That change collided with a concurrent change. Try again."
+
+INTERNAL_ERROR_DETAIL: Final = (
+    "An unexpected error occurred. Quote the instance id when reporting it."
+)
 
 log = get_logger(__name__)
 
@@ -120,6 +165,42 @@ def _json_pointer(loc: tuple[int | str, ...], code: str) -> str:
     # RFC 6901 escaping: "~" -> "~0", "/" -> "~1".
     escaped = (str(p).replace("~", "~0").replace("/", "~1") for p in parts)
     return "/" + "/".join(escaped) if parts else ""
+
+
+def _internal_error() -> JSONResponse:
+    """The one 500 this module produces, shared by both of its callers."""
+    return problem(
+        status=500,
+        code="internal_error",
+        title="Internal server error",
+        detail=INTERNAL_ERROR_DETAIL,
+    )
+
+
+def _sqlstate(exc: IntegrityError) -> str | None:
+    """The five-character SQLSTATE, when the driver attached one.
+
+    `exc.orig` is the DBAPI-level exception - for asyncpg, a wrapper the
+    SQLAlchemy dialect builds, which copies `sqlstate` off the real error. A
+    driver that attaches nothing, or a future one that spells it differently,
+    yields None and therefore a 500: the allow-list fails closed.
+    """
+    sqlstate = getattr(exc.orig, "sqlstate", None)
+    return sqlstate if isinstance(sqlstate, str) else None
+
+
+def _constraint(exc: IntegrityError) -> str | None:
+    """The violated constraint's name, **for the log only**.
+
+    One level further down than `_sqlstate`: the asyncpg dialect raises its
+    wrapper `from` the original error, so the object carrying
+    `constraint_name` is `exc.orig.__cause__`. It is None for a not-null
+    violation, which names a column instead.
+    """
+    orig = exc.orig
+    cause = orig.__cause__ if orig is not None else None
+    constraint = getattr(cause, "constraint_name", None)
+    return constraint if isinstance(constraint, str) else None
 
 
 def _status_for(exc: domain_errors.DomainError) -> int:
@@ -195,14 +276,53 @@ def register_error_handlers(app: FastAPI) -> None:
             headers=getattr(exc, "headers", None),
         )
 
+    @app.exception_handler(IntegrityError)
+    async def _integrity(request: Request, exc: Exception) -> JSONResponse:
+        """A database constraint refused the write. 409 when it was a race.
+
+        Registered for the SQLAlchemy exception rather than translated in a
+        service, for two reasons. A service cannot catch one and carry on -
+        PostgreSQL aborts the whole transaction, so its next statement fails
+        with `25P02` - and `services` may not import SQLAlchemy at all, which
+        is an architecture contract. One handler also means a route written
+        next year is covered without anybody remembering to cover it.
+
+        **A 409 from here does not promise that nothing happened.** The
+        transaction that raised is rolled back whole - PostgreSQL cannot
+        commit an aborted transaction even if asked - but a request made of
+        several transactions keeps whatever earlier ones committed. The first
+        test of an agent is the example in the tree: the harness row is
+        committed by one transaction and published by the next, so a conflict
+        while publishing leaves the harness behind, unpublished and ready for
+        the retry this status is asking for.
+        """
+        assert isinstance(exc, IntegrityError)
+        sqlstate = _sqlstate(exc)
+        constraint = _constraint(exc)
+        if sqlstate not in CONFLICT_SQLSTATES:
+            # Still a 500, and still logged as one: this is a bug in a
+            # statement this server built, and the traceback is the point.
+            log.exception(
+                "integrity_error",
+                path=request.url.path,
+                sqlstate=sqlstate,
+                constraint=constraint,
+            )
+            return _internal_error()
+        # A race is not a server fault, so not an `error` - but it is worth
+        # seeing, because a constraint that loses races constantly is saying
+        # something about the code above it.
+        log.warning(
+            "integrity_conflict",
+            path=request.url.path,
+            sqlstate=sqlstate,
+            constraint=constraint,
+        )
+        return problem(status=409, code="conflict", title="Conflict", detail=CONFLICT_DETAIL)
+
     @app.exception_handler(Exception)
     async def _unhandled(request: Request, exc: Exception) -> JSONResponse:
         # Never leak internals to the caller; the request id is the join key
         # for whoever reads the logs.
         log.exception("unhandled_exception", path=request.url.path)
-        return problem(
-            status=500,
-            code="internal_error",
-            title="Internal server error",
-            detail="An unexpected error occurred. Quote the instance id when reporting it.",
-        )
+        return _internal_error()
