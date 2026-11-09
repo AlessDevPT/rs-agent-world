@@ -738,7 +738,7 @@ class WorkflowRepository(ScopedRepository):
         steps: Sequence[Mapping[str, Any]],
         edges: Sequence[Mapping[str, Any]],
     ) -> dt.datetime:
-        """Freeze a draft into `workflow_steps` and `workflow_edges`.
+        """Freeze a draft, and point the workflow at what was frozen.
 
         **The order is forced by migration 0018 and is not a style choice.**
         The trigger refuses an INSERT into either table when the version it
@@ -753,6 +753,17 @@ class WorkflowRepository(ScopedRepository):
         `to_step` as **step keys**, which this maps to the ids it just
         inserted. The caller works in keys because that is what the author
         wrote; ids exist only once the rows do.
+
+        **`workflows.current_version_id` moves here, in this transaction.**
+        Publishing *is* moving that pointer - `01-DOMAIN-AND-PROTOCOL.md`
+        says "publishing moves `current_version_id`" as one sentence about
+        one act - and a publish that could commit without moving it is a
+        publish that can leave the column lying. It lay for every workflow
+        in the system until now: the column was declared, foreign-keyed and
+        read by the entity, the repository mapper and the API view, and
+        written by nothing, so every reader reassembled the answer with
+        `ORDER BY version DESC` and two of them carried a comment
+        apologising for it.
         """
         ids: dict[str, UUID] = {}
         for step in steps:
@@ -806,6 +817,30 @@ class WorkflowRepository(ScopedRepository):
         # set to `now()`, so this cannot be None. Narrowed rather than cast,
         # so that a future change making the column nullable fails here.
         assert published is not None
+
+        # `workflow_id` is in this predicate rather than unused - it was
+        # unused until now, which is how a publish identified by `version_id`
+        # alone kept the "this version belongs to this workflow" guarantee
+        # entirely in its caller's head. The composite foreign key
+        # `(id, current_version_id) -> workflow_versions(workflow_id, id)`
+        # refuses a mismatched pair outright, so this statement cannot point
+        # a workflow at another one's graph however it is called.
+        #
+        # `scalar_one` for the reason the update above uses it: the caller
+        # read this workflow under this scope in this transaction, so no row
+        # here means something is badly wrong, and a silent no-op is how a
+        # column stops being written without anybody noticing.
+        (
+            await self._session.execute(
+                sa.update(m.Workflow)
+                .where(
+                    m.Workflow.id == workflow_id,
+                    m.Workflow.project_id == self.scope.require_project(),
+                )
+                .values(current_version_id=version_id)
+                .returning(m.Workflow.id)
+            )
+        ).scalar_one()
         return published
 
     async def published_version(self, workflow_id: UUID) -> WorkflowDraft | None:

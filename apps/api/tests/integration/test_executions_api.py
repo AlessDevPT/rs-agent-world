@@ -329,6 +329,143 @@ async def test_a_tool_call_step_cannot_be_published_yet(scenario: Scenario) -> N
     assert "tool_call" in response.text
 
 
+# --------------------------------------------- the workflow's current version ---
+#
+# `workflows.current_version_id` was declared by migration 0008 and given a
+# composite foreign key so that it could not name another workflow's version.
+# It was read by the entity, the repository mapper and the API view, and
+# written by nothing at all: every reader reassembled the answer with
+# `ORDER BY version DESC` instead - two of them with a comment apologising
+# for it - and `GET /workflows` told every client `null` forever. Publishing
+# moves it now, in the transaction that freezes the version.
+
+
+async def _pointer(owner_database: Database, workflow_id: str) -> str | None:
+    """`workflows.current_version_id`, read as the schema owner."""
+    async with owner_database.session() as session:
+        value = (
+            await session.execute(
+                text("SELECT current_version_id FROM workflows WHERE id = :id"),
+                {"id": workflow_id},
+            )
+        ).scalar_one()
+    return str(value) if value is not None else None
+
+
+def _listed(scenario: Scenario, workflow_id: str) -> dict[str, Any]:
+    """One workflow as the ordinary listing shows it."""
+    listing = scenario.client.get(
+        f"/v1/projects/{scenario.project_id}/workflows", headers=scenario.actor.headers
+    )
+    assert listing.status_code == 200, listing.text
+    return next(row for row in listing.json() if row["id"] == workflow_id)
+
+
+async def test_publishing_moves_the_workflows_current_version(
+    scenario: Scenario, owner_database: Database
+) -> None:
+    """NULL until the first publish, and then the version just frozen.
+
+    Asserted through the API as well as against the column, because the
+    reason this mattered is that a client reading `GET /workflows` could not
+    tell a published workflow from an unpublished one.
+    """
+    workflow_id = scenario.workflow()
+    assert await _pointer(owner_database, workflow_id) is None
+    assert _listed(scenario, workflow_id)["current_version_id"] is None
+
+    version_id = scenario.publish(workflow_id).json()["version_id"]
+
+    assert await _pointer(owner_database, workflow_id) == version_id
+    assert _listed(scenario, workflow_id)["current_version_id"] == version_id
+
+    # Not the draft publishing opened behind it. A workflow points at what
+    # can run, and version 2 is an editor's copy that nothing may execute.
+    draft = scenario.client.get(
+        f"/v1/projects/{scenario.project_id}/workflows/{workflow_id}/draft",
+        headers=scenario.actor.headers,
+    ).json()
+    assert draft["version"] == 2
+    assert draft["id"] != version_id
+
+
+async def test_publishing_again_moves_the_pointer_to_the_newer_version(
+    scenario: Scenario, owner_database: Database
+) -> None:
+    """And leaves the older published version exactly where it was.
+
+    The pointer says what a *new* run resolves. The version an older run is
+    bound to lives on the execution row, and the two are allowed to differ -
+    which is the whole reason an execution carries a `workflow_version_id`
+    of its own.
+    """
+    workflow_id = scenario.workflow()
+    first = scenario.publish(workflow_id).json()["version_id"]
+    saved = scenario.client.put(
+        f"/v1/projects/{scenario.project_id}/workflows/{workflow_id}/draft",
+        json={"graph": _two_step_graph()},
+        headers=scenario.actor.headers,
+    )
+    assert saved.status_code == 200, saved.text
+    second = scenario.publish(workflow_id).json()["version_id"]
+
+    assert second != first
+    assert await _pointer(owner_database, workflow_id) == second
+    assert _listed(scenario, workflow_id)["current_version_id"] == second
+
+    async with owner_database.session() as session:
+        versions = (
+            await session.execute(
+                text(
+                    "SELECT version, id, published_at IS NOT NULL AS frozen "
+                    "FROM workflow_versions WHERE workflow_id = :id ORDER BY version"
+                ),
+                {"id": workflow_id},
+            )
+        ).all()
+    assert [(row.version, row.frozen) for row in versions] == [(1, True), (2, True), (3, False)]
+    assert str(versions[0].id) == first, "version 1 is still published and still itself"
+
+
+async def test_a_refused_publish_does_not_move_the_pointer(
+    scenario: Scenario, owner_database: Database
+) -> None:
+    """The pointer moves in the publish's own transaction or not at all.
+
+    Both halves matter. A workflow that has never published must still read
+    NULL after a refusal, and one that has must still read its last good
+    version rather than the draft that was just refused.
+    """
+    base = f"/v1/projects/{scenario.project_id}/workflows"
+    broken = {
+        "steps": [{"step_key": "a", "kind": "agent_task", "agent_key": "nobody"}],
+        "edges": [],
+    }
+    workflow_id = scenario.workflow()
+
+    saved = scenario.client.put(
+        f"{base}/{workflow_id}/draft", json={"graph": broken}, headers=scenario.actor.headers
+    )
+    assert saved.status_code == 200, saved.text
+    assert scenario.publish(workflow_id).status_code == 422
+    assert await _pointer(owner_database, workflow_id) is None
+
+    repaired = scenario.client.put(
+        f"{base}/{workflow_id}/draft",
+        json={"graph": _one_step_graph()},
+        headers=scenario.actor.headers,
+    )
+    assert repaired.status_code == 200, repaired.text
+    version_id = scenario.publish(workflow_id).json()["version_id"]
+
+    broke_again = scenario.client.put(
+        f"{base}/{workflow_id}/draft", json={"graph": broken}, headers=scenario.actor.headers
+    )
+    assert broke_again.status_code == 200, broke_again.text
+    assert scenario.publish(workflow_id).status_code == 422
+    assert await _pointer(owner_database, workflow_id) == version_id
+
+
 # ---------------------------------------------------------------------- run ---
 
 

@@ -563,9 +563,16 @@ ON_FAILURE: tuple[str, ...] = ("fail", "continue", "route")
 class Workflow(Base):
     """A workflow definition. Executions reference a *version*, never this.
 
-    `current_version_id` is the published version that triggers and manual
-    runs use, and its foreign key targets `(workflow_id, id)` so it cannot
-    name a version belonging to a different workflow.
+    `current_version_id` is the version this workflow last published, moved
+    by `WorkflowRepository.publish` in the transaction that freezes it. Its
+    foreign key targets `(workflow_id, id)`, so it cannot name a version
+    belonging to a different workflow.
+
+    It is not yet what a run *resolves*: `ExecutionService.start` still asks
+    `published_version` for the newest published row, and the two agree
+    because one act writes both. Moving `start` onto this column is a change
+    of its own, and until it happens this is a published fact about the
+    workflow rather than the path a run takes.
     """
 
     __tablename__ = "workflows"

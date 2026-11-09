@@ -196,14 +196,16 @@ class AgentTestService:
                 },
             )
             # Asked of `workflow_versions`, not of `workflows`. The obvious
-            # predicate is `current_version_id is None`, and it is wrong:
-            # **nothing in this codebase ever writes that column.** It is
-            # read by the entity, the API view and nothing else, so it is
-            # NULL for every workflow that has ever been published, and a
-            # test would republish on every run - version 3, 4, 5 - which is
-            # how this was found. `published_version` is what
-            # `ExecutionService.start` consults for the version it executes,
-            # so it is the authority this decision has to share.
+            # predicate is `current_version_id is None`, and when this was
+            # written it was simply wrong: nothing in the codebase wrote that
+            # column, so it was NULL for every workflow that had ever been
+            # published and a test republished on every run - version 3, 4,
+            # 5 - which is how the dead column was found. `publish` now moves
+            # it, so the two answers agree; this still asks the version
+            # table, because `ExecutionService.start` resolves what it runs
+            # with `published_version` and this decision has to share
+            # `start`'s authority rather than hold a second opinion about it.
+            # Both move together or neither does.
             published = await workflows.published_version(harness.id)
             return harness, published is None
 

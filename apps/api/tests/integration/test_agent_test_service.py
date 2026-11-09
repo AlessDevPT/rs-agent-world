@@ -99,14 +99,17 @@ async def _rows(owner_database: Database, sql: str, **binds: Any) -> list[Any]:
 async def _harnesses(owner_database: Database, project_id: uuid.UUID) -> list[Any]:
     """The project's test harnesses, with the version a run would execute.
 
-    `published` comes from `workflow_versions` rather than from
-    `workflows.current_version_id`: **nothing writes that column**, so it is
-    NULL for every published workflow in the system and an assertion on it
-    would hold whatever the code did.
+    Two answers to one question, deliberately. `published` is derived from
+    `workflow_versions`, which is what `ExecutionService.start` resolves;
+    `pointer` is `workflows.current_version_id`, which is what a reader of
+    the workflow row is told. `publish` writes them in one transaction, so
+    they agree or something is wrong. Only the derived one existed here at
+    first, because the column was written by nothing and an assertion on it
+    would have held whatever the code did.
     """
     return await _rows(
         owner_database,
-        "SELECT w.id, w.slug, w.test_for_agent_id, ("
+        "SELECT w.id, w.slug, w.test_for_agent_id, w.current_version_id AS pointer, ("
         "  SELECT v.id FROM workflow_versions v"
         "   WHERE v.workflow_id = w.id AND v.published_at IS NOT NULL"
         "   ORDER BY v.version DESC LIMIT 1"
@@ -161,6 +164,11 @@ async def test_the_first_test_creates_publishes_and_runs_one_harness(
     harnesses = await _harnesses(owner_database, harness.project_id)
     assert len(harnesses) == 1
     assert harnesses[0].published is not None, "the first test publishes it"
+    # A harness publishes through `ExecutionService.publish` like anything
+    # else, so it gets a current version like anything else. Nothing here
+    # arranges that - it would be a hole if a compiled workflow were the one
+    # kind whose workflow row did not say what it had published.
+    assert harnesses[0].pointer == harnesses[0].published
     assert uuid.UUID(str(harnesses[0].test_for_agent_id)) == harness.agent_id
 
     executions = await _executions(owner_database, harness.project_id)

@@ -164,10 +164,13 @@ async def test_the_first_test_creates_the_harness_and_its_first_version(
     async with factory.begin(visible_workspaces={harness.workspace_id}) as work:
         workflows = work.workflows(harness.scope)
         # Unpublished, asked of `workflow_versions`. This first asserted
-        # `workflow.current_version_id is None` - which holds whatever the
-        # code does, because nothing in this codebase ever writes that
-        # column. S4 found that by republishing on every test.
+        # `workflow.current_version_id is None`, which held whatever the code
+        # did, because at the time nothing in this codebase wrote that
+        # column. S4 found that by republishing on every test. `publish` now
+        # moves it, but `find_or_create_test` does not publish, so the
+        # harness it just made has no version either way.
         assert await workflows.published_version(workflow.id) is None
+        assert workflow.current_version_id is None
         draft = await workflows.draft_of(workflow.id)
     assert draft is not None
     assert draft.version == 1
