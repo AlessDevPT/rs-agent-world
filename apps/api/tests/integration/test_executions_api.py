@@ -637,6 +637,242 @@ async def test_the_three_writes_commit_together(
     assert status == StepStatus.PENDING
 
 
+# ------------------------------------------------ a run keeps its own version ---
+#
+# An execution is bound to one `workflow_version_id` for its whole life, and
+# the advancement path did not honour that: it asked for the newest published
+# version of the workflow every time it decided anything. Republishing
+# therefore reached inside a run already in flight - quietly when the new
+# graph kept its step keys, and fatally when it did not.
+#
+# Two transform steps rather than an agent task, deliberately. A transform is
+# completed by `advance` itself, so these tests can take a workflow all the
+# way to `succeeded` through the real service with no worker, no provider and
+# no settled dispatch. The question is which graph a decision came from, and
+# answering it needs no model call.
+
+
+def _chain(reads: str, *, keys: tuple[str, str] = ("first", "second")) -> dict[str, Any]:
+    """Two transforms, the second reading one named field of the first's output."""
+    entry, follower = keys
+    return {
+        "steps": [
+            {
+                "step_key": entry,
+                "kind": "transform",
+                "input_mapping": {"kept": "$.input.kept", "changed": "$.input.changed"},
+            },
+            {
+                "step_key": follower,
+                "kind": "transform",
+                "input_mapping": {"value": f"$.steps.{entry}.output.{reads}"},
+            },
+        ],
+        "edges": [{"from": entry, "to": follower}],
+    }
+
+
+#: Two fields with recognisable values, so which expression ran is readable
+#: off the output rather than inferred.
+CHAIN_INPUT = {"kept": "version-one", "changed": "version-two"}
+
+
+def _republish(scenario: Scenario, workflow_id: str, graph: dict[str, Any]) -> None:
+    """Save a new draft over what was frozen, and freeze that as the next version."""
+    base = f"/v1/projects/{scenario.project_id}/workflows/{workflow_id}"
+    saved = scenario.client.put(
+        f"{base}/draft", json={"graph": graph}, headers=scenario.actor.headers
+    )
+    assert saved.status_code == 200, saved.text
+    published = scenario.publish(workflow_id)
+    assert published.status_code == 201, published.text
+
+
+async def _versions(owner_database: Database, workflow_id: str) -> list[Any]:
+    async with owner_database.session() as session:
+        return list(
+            (
+                await session.execute(
+                    text(
+                        "SELECT version, id, published_at IS NOT NULL AS published "
+                        "FROM workflow_versions WHERE workflow_id = :id ORDER BY version"
+                    ),
+                    {"id": workflow_id},
+                )
+            ).all()
+        )
+
+
+async def _steps_of(owner_database: Database, execution_id: str) -> dict[str, Any]:
+    async with owner_database.session() as session:
+        return {
+            row.step_key: row
+            for row in (
+                await session.execute(
+                    text(
+                        "SELECT step_key, status, output, workflow_version_id "
+                        "FROM execution_steps WHERE execution_id = :id"
+                    ),
+                    {"id": execution_id},
+                )
+            ).all()
+        }
+
+
+async def _drain(factory: UnitOfWorkFactory, scenario: Scenario, execution_id: str) -> list[str]:
+    """Advance until there is nothing left to decide; what was decided, in order.
+
+    Bounded, so a graph that never settles fails the test instead of hanging
+    it - and `advance` returning nothing is the documented way an execution
+    says it is finished with this round, not a sign of trouble.
+    """
+    service = _service(factory)
+    decided: list[str] = []
+    for _ in range(8):
+        applied = await service.advance_once(
+            uuid.UUID(scenario.project_id),
+            uuid.UUID(execution_id),
+            visible={uuid.UUID(scenario.workspace_id)},
+        )
+        if not applied.decisions:
+            return decided
+        decided.extend(type(decision).__name__ for decision in applied.decisions)
+    raise AssertionError(f"advance never settled: {decided}")
+
+
+async def test_a_republish_with_new_step_keys_does_not_strand_a_running_execution(
+    scenario: Scenario, factory: UnitOfWorkFactory, owner_database: Database
+) -> None:
+    """Case A: the renamed graph is version 2's business, not this run's.
+
+    Before the fix the next advance planned version 2's entry step, `_apply`
+    found no `execution_steps` row for a step this execution was never seeded
+    with, and raised. The execution then stayed `running` for good: every
+    reconciler sweep decided the same impossible step and logged the same
+    failure. That is the louder half of the defect and the one with no
+    recovery.
+    """
+    workflow_id = scenario.workflow(_chain("kept"))
+    scenario.publish(workflow_id)
+    execution_id = scenario.run(workflow_id, input=CHAIN_INPUT).json()["id"]
+
+    _republish(scenario, workflow_id, _chain("kept", keys=("third", "fourth")))
+    versions = await _versions(owner_database, workflow_id)
+    assert [(row.version, row.published) for row in versions] == [
+        (1, True),
+        (2, True),
+        (3, False),
+    ], versions
+
+    decided = await _drain(factory, scenario, execution_id)
+    assert decided == ["CompleteStep", "CompleteExecution"], decided
+
+    steps = await _steps_of(owner_database, execution_id)
+    assert sorted(steps) == ["first", "second"], "the run kept version 1's steps"
+    assert {row.status for row in steps.values()} == {StepStatus.SUCCEEDED}
+    assert {str(row.workflow_version_id) for row in steps.values()} == {str(versions[0].id)}
+
+    execution = scenario.client.get(
+        f"/v1/projects/{scenario.project_id}/executions/{execution_id}",
+        headers=scenario.actor.headers,
+    ).json()
+    assert execution["status"] == ExecutionStatus.COMPLETED
+    assert execution["workflow_version_id"] == str(versions[0].id)
+
+
+async def test_a_republished_expression_does_not_reach_a_running_execution(
+    scenario: Scenario, factory: UnitOfWorkFactory, owner_database: Database
+) -> None:
+    """Case B: the half that never raised.
+
+    Same step keys, one changed expression. Nothing refuses it and nothing
+    logs it - the run simply begins to mean something else. So the assertion
+    is on the value the second step produced, because that is the only place
+    the difference between the two graphs can be seen at all.
+    """
+    workflow_id = scenario.workflow(_chain("kept"))
+    scenario.publish(workflow_id)
+    execution_id = scenario.run(workflow_id, input=CHAIN_INPUT).json()["id"]
+
+    _republish(scenario, workflow_id, _chain("changed"))
+
+    # Version 2 really does say something else. Without this the test would
+    # also pass against a republish that changed nothing.
+    async with owner_database.session() as session:
+        frozen = (
+            await session.execute(
+                text(
+                    "SELECT s.input_mapping FROM workflow_steps s "
+                    "JOIN workflow_versions v ON v.id = s.workflow_version_id "
+                    "WHERE v.workflow_id = :id AND v.version = 2 AND s.step_key = 'second'"
+                ),
+                {"id": workflow_id},
+            )
+        ).scalar_one()
+    assert frozen == {"value": "$.steps.first.output.changed"}
+
+    assert await _drain(factory, scenario, execution_id) == ["CompleteStep", "CompleteExecution"]
+
+    steps = await _steps_of(owner_database, execution_id)
+    assert steps["first"].output == {"kept": "version-one", "changed": "version-two"}
+    assert steps["second"].output == {"value": "version-one"}, (
+        "the running execution was decided from version 2's expression"
+    )
+
+    execution = scenario.client.get(
+        f"/v1/projects/{scenario.project_id}/executions/{execution_id}",
+        headers=scenario.actor.headers,
+    ).json()
+    assert execution["output"] == {"second": {"value": "version-one"}}
+
+
+async def test_a_run_started_after_a_republish_uses_the_new_version(
+    scenario: Scenario, factory: UnitOfWorkFactory, owner_database: Database
+) -> None:
+    """And the two coexist, each finishing on the graph it was created with.
+
+    The other side of the fix: pinning a running execution to its own version
+    must not pin the *workflow*. A run started after the republish gets
+    version 2, with version 2's steps seeded, while the older run is still in
+    flight on version 1.
+    """
+    workflow_id = scenario.workflow(_chain("kept"))
+    scenario.publish(workflow_id)
+    first_execution = scenario.run(workflow_id, input=CHAIN_INPUT).json()["id"]
+
+    _republish(scenario, workflow_id, _chain("changed", keys=("third", "fourth")))
+    second_execution = scenario.run(workflow_id, input=CHAIN_INPUT).json()["id"]
+
+    versions = await _versions(owner_database, workflow_id)
+    one, two = str(versions[0].id), str(versions[1].id)
+
+    async with owner_database.session() as session:
+        bound = dict(
+            (
+                await session.execute(
+                    text(
+                        "SELECT id, workflow_version_id FROM workflow_executions "
+                        "WHERE workflow_id = :id"
+                    ),
+                    {"id": workflow_id},
+                )
+            ).all()
+        )
+    assert str(bound[uuid.UUID(first_execution)]) == one
+    assert str(bound[uuid.UUID(second_execution)]) == two
+
+    assert sorted(await _steps_of(owner_database, second_execution)) == ["fourth", "third"]
+
+    await _drain(factory, scenario, first_execution)
+    await _drain(factory, scenario, second_execution)
+
+    old = await _steps_of(owner_database, first_execution)
+    new = await _steps_of(owner_database, second_execution)
+    assert old["second"].output == {"value": "version-one"}, "version 1's expression"
+    assert new["fourth"].output == {"value": "version-two"}, "version 2's expression"
+    assert {row.status for row in list(old.values()) + list(new.values())} == {StepStatus.SUCCEEDED}
+
+
 # --------------------------------------------------------- replay and tenancy ---
 
 

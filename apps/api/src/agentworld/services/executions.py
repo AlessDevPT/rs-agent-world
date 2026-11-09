@@ -520,16 +520,30 @@ def _validated(definition: WorkflowDefinition) -> ValidationReport:
 async def _definition_of(
     work: UnitOfWork, scope: TenantScope, workspace_id: UUID, header: Any
 ) -> WorkflowDefinition:
-    """The frozen graph, plus the facts that can have changed since publish.
+    """The execution's own frozen graph, plus the facts that can have changed.
+
+    **The version comes off the execution, not off the workflow.** This read
+    used to ask for the newest published version of `header.workflow_id`,
+    which is the same row right up to the moment somebody publishes again -
+    and then is not. A run bound to version 1 was decided from version 2's
+    graph: silently, when the new graph kept its step keys and changed only
+    an expression, and fatally when it renamed one, because `_apply` then
+    finds no `execution_steps` row and the execution is stranded `running`
+    for every sweep the reconciler makes. `header.workflow_version_id` is
+    written once by `start` and never recomputed, so it is the only honest
+    source for the graph a running execution means.
 
     The graph is immutable; the agents it names are not. An agent archived
     or switched to `observed` after publish makes the version unrunnable, and
     `advance` is given current facts precisely so it notices - which is why
     its validate gate runs at decision time rather than being trusted from
-    publish.
+    publish. That is unchanged: instructions and model profiles are still
+    resolved live, at dispatch, by the step runner.
     """
-    version = await work.workflows(scope).published_version(header.workflow_id)
-    if version is None:  # pragma: no cover - an execution cannot exist without one
+    version = await work.workflows(scope).published_version_by_id(
+        header.workflow_id, version_id=header.workflow_version_id
+    )
+    if version is None:  # pragma: no cover - the row's foreign key is RESTRICT
         raise NotFoundError("The executed version is gone", execution_id=str(header.id))
     facts, effects, approvers = await facts_and_effects(work, scope, workspace_id)
     return definition_for_execution(version, facts, effects, approvers)

@@ -809,13 +809,16 @@ class WorkflowRepository(ScopedRepository):
         return published
 
     async def published_version(self, workflow_id: UUID) -> WorkflowDraft | None:
-        """The newest published version, which is the one a run executes.
+        """The newest published version, which is the one a *new* run executes.
 
         Returns the same shape as `draft_of` because a frozen version keeps
         its `graph` column: the normalised tables are what the island, the
         DAG canvas and `execution_steps`' foreign keys read, and the jsonb is
         what the orchestrator reads. Both are immutable after publish, so
         they cannot disagree.
+
+        Not the question to ask about a run that has already started: see
+        `published_version_by_id`.
         """
         row = (
             await self._session.execute(
@@ -827,6 +830,42 @@ class WorkflowRepository(ScopedRepository):
                 )
                 .order_by(m.WorkflowVersion.version.desc())
                 .limit(1)
+            )
+        ).scalar_one_or_none()
+        return _to_draft(row) if row is not None else None
+
+    async def published_version_by_id(
+        self, workflow_id: UUID, *, version_id: UUID
+    ) -> WorkflowDraft | None:
+        """One published version, named rather than inferred.
+
+        What a *running* execution advances against. "The newest published
+        version" is the right answer only at the moment a run is created;
+        afterwards publishing moves it, while the execution stays bound to
+        the version it was created with. Deciding from the newer graph
+        changes what a running execution means retroactively, which is the
+        one thing `WorkflowExecution`'s docstring and migration 0018 both
+        promise cannot happen.
+
+        `workflow_id` as well, because nothing in the schema makes
+        `workflow_executions.workflow_version_id` a version *of that*
+        workflow - that foreign key names `workflow_versions(id)` alone,
+        unlike the composite pairs everywhere else here. Asking for both
+        costs one more predicate and means a mismatch reads as "gone"
+        instead of as another workflow's graph.
+
+        `published_at IS NOT NULL`, because an execution of a draft is not a
+        state this system has: `start` binds what `published_version`
+        returned, and a published version can never be unpublished.
+        """
+        row = (
+            await self._session.execute(
+                sa.select(m.WorkflowVersion).where(
+                    m.WorkflowVersion.id == version_id,
+                    m.WorkflowVersion.workflow_id == workflow_id,
+                    m.WorkflowVersion.project_id == self.scope.require_project(),
+                    m.WorkflowVersion.published_at.is_not(None),
+                )
             )
         ).scalar_one_or_none()
         return _to_draft(row) if row is not None else None
