@@ -601,17 +601,22 @@ class PublishFails(ExecutionService):
     Induced rather than imagined: the lifecycle commits the harness before
     publishing it, so a publish that fails has to leave something behind,
     and the only honest way to know what is to make one fail.
+
+    `publish_test_harness`, because that is the entry point `AgentTestService`
+    calls - the ordinary `publish` refuses a harness. Overriding the public
+    verb here would be a double that intercepts nothing, which is how this
+    test would quietly stop testing anything.
     """
 
     def __init__(self, factory: UnitOfWorkFactory) -> None:
         super().__init__(factory)
         self.attempts = 0
 
-    async def publish(self, *args: Any, **kwargs: Any) -> Any:
+    async def publish_test_harness(self, *args: Any, **kwargs: Any) -> Any:
         self.attempts += 1
         if self.attempts == 1:
             raise RuntimeError("the publish failed")
-        return await super().publish(*args, **kwargs)
+        return await super().publish_test_harness(*args, **kwargs)
 
 
 async def test_a_failed_publication_leaves_one_unpublished_harness(

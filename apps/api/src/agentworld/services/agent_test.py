@@ -4,8 +4,13 @@
 producing real events, not a preview", and this service is the whole of how
 that is arranged. It arranges nothing new: it compiles the one-step graph,
 finds or creates the agent's harness, and then hands the harness to
-`ExecutionService.publish` and `ExecutionService.start` - the same two
-methods the publish and run routes call.
+`ExecutionService.publish_test_harness` and
+`ExecutionService.start_test_harness` - the same publish and the same run
+the workflow routes reach, through the two names that are allowed to name a
+harness. The public `publish` and `start` refuse one, because a harness
+published or run by hand is a version `agent.test` did not freeze and an
+execution nobody asked for; these two are the same body with that refusal
+lifted, and they are the only callers of it in `src/`.
 
 **Four things happen and four things are recorded.** A first test creates a
 workflow, publishes it and runs it; a later test only runs it. Each of those
@@ -86,10 +91,12 @@ class AgentTestService:
             # The ordinary publish, with its own authorization and its own
             # `workflow.publish` audit row. Its findings surface unchanged:
             # a graph this release cannot freeze must say so in the same
-            # words it would for a workflow somebody drew.
-            await self._executions.publish(principal, context, project_id, harness.id)
+            # words it would for a workflow somebody drew. The entry point
+            # is the harness one, which differs from the public verb in
+            # exactly one respect - it does not refuse a harness.
+            await self._executions.publish_test_harness(principal, context, project_id, harness.id)
 
-        return await self._executions.start(
+        return await self._executions.start_test_harness(
             principal,
             context,
             project_id,

@@ -37,7 +37,7 @@ from agentworld.domain.enums import (
     StepKind,
     StepStatus,
 )
-from agentworld.domain.expressions import evaluate
+from agentworld.domain.expressions import MISSING, evaluate
 from agentworld.domain.orchestration import (
     AgentFacts,
     AgentTestCode,
@@ -140,6 +140,54 @@ def test_the_entry_mapping_is_the_contract_a_compiled_team_also_uses() -> None:
     """
     assert module.INPUT_FIELD == delegation.HANDOFF_FIELD
     assert module.ENTRY_EXPRESSION == delegation.ENTRY_EXPRESSION
+
+
+def test_the_persisted_entry_contract_cannot_be_renamed() -> None:
+    """The frozen expression and the live envelope, pinned as literals.
+
+    This pair is not an implementation detail of this module.
+
+    **A published version freezes the expression.** `publish` writes
+    `input_mapping` into `workflow_steps`, and `_definition_of` builds the
+    definition from the execution's own frozen rows rather than recompiling,
+    so the `$.input.input` a version was published with is what it reads for
+    as long as it exists.
+
+    **An Agent Test harness is not republished after creation.**
+    `AgentTestService` publishes only while `current_version_id` is NULL, and
+    both `save_draft` and `archive` refuse a harness - so no path, for a
+    person or for the service, hands an existing harness a newly compiled
+    graph. An authored workflow has a remedy this does not: somebody can
+    publish it again.
+
+    **The envelope is supplied live.** `AgentTestService.run` passes
+    `inputs={INPUT_FIELD: sample}` from *this* release's constant into a
+    version frozen by whichever release first tested that agent.
+
+    So renaming this pair does not fail loudly. `_mapped` omits a field whose
+    expression does not resolve, `_prompt` then falls back to "Begin the task
+    you have been assigned.", and every harness published before the rename
+    keeps running - spending money, succeeding - with the sample silently
+    discarded.
+
+    Changing either constant therefore requires designing a supported way to
+    republish existing harnesses first. Until that exists, this test is the
+    mechanism, which is why it asserts the literal persisted strings rather
+    than comparing the two constants with each other: a coordinated rename
+    satisfies that comparison and breaks every published harness.
+    """
+    assert module.INPUT_FIELD == "input"
+    assert module.ENTRY_EXPRESSION == "$.input.input"
+    assert compiled().graph["steps"][0]["input_mapping"] == {"input": "$.input.input"}
+
+    # The frozen expression as a literal, resolved against the scope
+    # `advance` builds from the envelope the service sends. The two halves
+    # are written by different releases, so this pairing - not either half -
+    # is the contract.
+    assert evaluate("$.input.input", {"input": {module.INPUT_FIELD: SAMPLE}, "steps": {}}) == SAMPLE
+    # And what a rename would produce instead, which is why it is silent:
+    # not an error, just nothing where the sample was.
+    assert evaluate("$.input.input", {"input": {"renamed": SAMPLE}, "steps": {}}) is MISSING
 
 
 def test_the_entry_expression_resolves_to_the_sample_input() -> None:

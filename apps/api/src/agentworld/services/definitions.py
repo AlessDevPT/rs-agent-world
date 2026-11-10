@@ -661,7 +661,7 @@ class WorkflowService:
             existing = await workflows.get(workflow_id)
             if existing is None:
                 raise NotFoundError("Workflow not found", workflow_id=str(workflow_id))
-            _not_a_test_harness(existing, doing="edited")
+            not_a_test_harness(existing, doing="edited")
             draft = await workflows.save_draft(workflow_id, graph=graph)
             if draft is None:
                 raise NotFoundError(
@@ -696,7 +696,7 @@ class WorkflowService:
                 # Before the attempt, so that a refused harness is told apart
                 # from a workflow that is not there. The repository refuses
                 # it either way, but "not found" would be a lie.
-                _not_a_test_harness(existing, doing="archived")
+                not_a_test_harness(existing, doing="archived")
             if not await workflows.archive(workflow_id):
                 raise NotFoundError("Workflow not found", workflow_id=str(workflow_id))
             await audit.record(
@@ -745,16 +745,25 @@ class WorkflowService:
         return workflow, draft
 
 
-def _not_a_test_harness(workflow: Workflow, *, doing: str) -> None:
-    """Refuse the ordinary workflow-management verbs on a compiled harness.
+def not_a_test_harness(workflow: Workflow, *, doing: str) -> None:
+    """Refuse the ordinary workflow lifecycle verbs on a compiled harness.
 
     An agent's test workflow is created, published and run by `agent.test`
     and by nothing else. Editing its draft would change what the next test
     runs into something the compiler did not decide; archiving it would
     leave a row no later test can insert past, because the unique index on
-    `test_for_agent_id` spans archived rows. Both are a 409 naming the
-    agent, rather than a 404 pretending the workflow is not there - it is,
-    the caller may read it, and it belongs to something.
+    `test_for_agent_id` spans archived rows. Publishing it would freeze a
+    third version behind the pointer - S4's version churn, arriving from
+    outside the service S4 fixed - and running it would produce an
+    execution of a workflow nobody drew, with no `agent.test` row to say
+    who asked for it. All four are a 409 naming the agent, rather than a
+    404 pretending the workflow is not there - it is, the caller may read
+    it, and it belongs to something.
+
+    Public, unlike the rest of this module's helpers, because the publish
+    and run verbs live in `ExecutionService` and have to refuse by the same
+    rule in the same words. One function and four call sites: a second
+    spelling of "is this a harness" is how the two come to disagree.
     """
     if workflow.test_for_agent_id is None:
         return

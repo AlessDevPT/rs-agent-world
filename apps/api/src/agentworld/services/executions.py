@@ -73,7 +73,11 @@ from agentworld.repositories.base import TenantScope
 from agentworld.repositories.unit_of_work import UnitOfWork, UnitOfWorkFactory
 from agentworld.services import audit
 from agentworld.services.context import CallContext
-from agentworld.services.definitions import definition_for_execution, facts_and_effects
+from agentworld.services.definitions import (
+    definition_for_execution,
+    facts_and_effects,
+    not_a_test_harness,
+)
 
 log = get_logger(__name__)
 
@@ -138,18 +142,72 @@ class ExecutionService:
     ) -> tuple[UUID, dt.datetime]:
         """Freeze the current draft, or refuse with the reasons.
 
+        **The public verb**, and the one that refuses an agent's test
+        harness. A harness is published by `agent.test` and by nothing else,
+        so a caller holding its id - which is not secret: the workflow is
+        readable, its draft is readable, and an execution names it - must
+        not be able to freeze that draft, move the pointer and open a third
+        version behind it. `publish_test_harness` is how the test itself
+        publishes.
+
         The refusal carries the findings, because "no" on its own is useless
         to the person who has to fix it - the same reason `validate` returns
         a report rather than a boolean.
         """
+        return await self._publish(principal, context, project_id, workflow_id, refuse_harness=True)
+
+    async def publish_test_harness(
+        self,
+        principal: UserPrincipal,
+        context: CallContext,
+        project_id: UUID,
+        workflow_id: UUID,
+    ) -> tuple[UUID, dt.datetime]:
+        """`agent.test`'s publish, and nothing else's.
+
+        The same body as `publish` with the harness refusal lifted, and not
+        a second publish path: one implementation, one transaction, one
+        `workflow.publish` audit row, one set of validation findings. A
+        method rather than an argument on `publish`, because a parameter is
+        something a request body might one day be allowed to reach, while
+        this name is reachable only by code holding the service -
+        `AgentTestService` is its only caller in `src/`, and nothing in the
+        API layer mentions it.
+
+        Authorization is unchanged and not relaxed: `_publish` checks
+        `workflow.publish` for this caller exactly as it does for anybody
+        pressing Publish on a workflow they drew.
+        """
+        return await self._publish(
+            principal, context, project_id, workflow_id, refuse_harness=False
+        )
+
+    async def _publish(
+        self,
+        principal: UserPrincipal,
+        context: CallContext,
+        project_id: UUID,
+        workflow_id: UUID,
+        *,
+        refuse_harness: bool,
+    ) -> tuple[UUID, dt.datetime]:
+        """Freeze the current draft. The body both entry points share."""
         async with self._factory.begin(visible_workspaces=set(principal.memberships)) as work:
             workspace_id = await _workspace_of(work, project_id)
             authorize(principal, Action.WORKFLOW_PUBLISH, Resource(workspace_id))
             scope = TenantScope(workspace_id, project_id)
             workflows = work.workflows(scope)
 
-            if await workflows.get(workflow_id) is None:
+            workflow = await workflows.get(workflow_id)
+            if workflow is None:
                 raise NotFoundError("Workflow not found", workflow_id=str(workflow_id))
+            if refuse_harness:
+                # After `authorize`, so a caller who may not publish here
+                # learns nothing about what this workflow is; inside the
+                # transaction that read the row, so the marker cannot change
+                # between the check and the freeze. Both are `save_draft`'s
+                # arrangement, which is the point - this is the same refusal.
+                not_a_test_harness(workflow, doing="published")
             draft = await workflows.draft_of(workflow_id)
             if draft is None:
                 raise ConflictError(
@@ -217,7 +275,71 @@ class ExecutionService:
         inputs: Mapping[str, Any] | None = None,
         idempotency_key: str | None = None,
     ) -> UUID:
+        """Run the version the workflow names, unless it is a test harness.
+
+        **The public verb.** Running a harness from here would produce an
+        execution of a workflow nobody drew, outside the four actions
+        `agent.test` records and with no `agent.test` row to say who asked
+        for it - and it would do it on the version a test published, which
+        is the one thing about a harness a person is not meant to drive.
+        `start_test_harness` is how the test itself runs.
+
+        What runs, and whose authority it carries, is `_start`'s docstring.
+        """
+        return await self._start(
+            principal,
+            context,
+            project_id,
+            workflow_id,
+            inputs=inputs,
+            idempotency_key=idempotency_key,
+            refuse_harness=True,
+        )
+
+    async def start_test_harness(
+        self,
+        principal: UserPrincipal,
+        context: CallContext,
+        project_id: UUID,
+        workflow_id: UUID,
+        *,
+        inputs: Mapping[str, Any] | None = None,
+    ) -> UUID:
+        """`agent.test`'s run, and nothing else's.
+
+        The same body as `start` with the harness refusal lifted: the same
+        version resolution, the same `workflow.run` audit row, the same
+        `advance_once` afterwards. There is no test execution path, and this
+        method is why there does not need to be one.
+
+        No `idempotency_key`. `agent.test` has never passed one, and a
+        parameter no caller uses is a parameter whose behaviour nothing
+        checks; the ordinary `start` still has it for the run route.
+        """
+        return await self._start(
+            principal,
+            context,
+            project_id,
+            workflow_id,
+            inputs=inputs,
+            idempotency_key=None,
+            refuse_harness=False,
+        )
+
+    async def _start(
+        self,
+        principal: UserPrincipal,
+        context: CallContext,
+        project_id: UUID,
+        workflow_id: UUID,
+        *,
+        inputs: Mapping[str, Any] | None,
+        idempotency_key: str | None,
+        refuse_harness: bool,
+    ) -> UUID:
         """Create an execution of the version the workflow names, and advance it.
+
+        The body both entry points share.
 
         **The version comes from `workflows.current_version_id`.** This used
         to re-derive it with `ORDER BY version DESC` over the published rows,
@@ -242,6 +364,12 @@ class ExecutionService:
             workflow = await work.workflows(scope).get(workflow_id)
             if workflow is None:
                 raise NotFoundError("Workflow not found", workflow_id=str(workflow_id))
+            if refuse_harness:
+                # Before the published-version check, so that refusing a
+                # harness does not depend on whether a test has ever run it:
+                # the answer is the same for a harness with no pointer and
+                # one with three published versions behind it.
+                not_a_test_harness(workflow, doing="run")
             if workflow.current_version_id is None:
                 # NULL has one meaning here and has had it since migration
                 # 0008: nothing has been published. The message and the 409

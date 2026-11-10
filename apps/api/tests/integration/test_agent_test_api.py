@@ -15,13 +15,21 @@ from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy import text
 from test_agent_test_harness import Harness
 
+from agentworld.infra.db import Database
 from helpers import Actor
 
 pytestmark = pytest.mark.integration
 
 SAMPLE = "Summarise the fintech funding news."
+
+#: What building the fixture through the API records before any of these
+#: tests acts: a workspace, a project and an agent, each its own action.
+#: Spelled out so the audit assertions below can compare the *whole* log
+#: and still say which rows are the fixture's.
+SETUP = {"workspace.create": 1, "project.create": 1, "agent.create": 1}
 
 
 @pytest.fixture
@@ -35,6 +43,21 @@ def post_test(harness: Harness, actor: Actor, body: Any, agent_id: str | None = 
         json=body,
         headers=actor.headers,
     )
+
+
+async def _actions(owner_database: Database, workspace_id: Any) -> dict[str, int]:
+    """Every audit action recorded in this workspace, counted by name."""
+    async with owner_database.session() as session:
+        rows = (
+            await session.execute(
+                text("SELECT action FROM audit_log WHERE workspace_id = :w"),
+                {"w": workspace_id},
+            )
+        ).all()
+    counted: dict[str, int] = {}
+    for (action,) in rows:
+        counted[action] = counted.get(action, 0) + 1
+    return counted
 
 
 def test_a_test_returns_202_and_the_execution(harness: Harness, actor: Actor) -> None:
@@ -116,6 +139,164 @@ def test_editing_the_harness_through_the_draft_api_is_refused(
     assert refused.status_code == 409, refused.text
     assert refused.headers["content-type"].startswith("application/problem+json")
     assert "test harness" in refused.json()["detail"]
+
+
+def test_publishing_the_harness_through_the_workflow_api_is_refused(
+    harness: Harness, actor: Actor
+) -> None:
+    """409, and the draft the next test would run is still the draft it was.
+
+    The public publish route was the one way a person could give a harness a
+    second published version - S4's version churn, arriving from outside the
+    service S4 fixed. The harness is not hidden from this route: it is
+    readable by id and its draft is readable, as the listing test above
+    shows, so the refusal is what stands in the way and not obscurity.
+    """
+    started = post_test(harness, actor, {"input": SAMPLE}).json()
+    draft_url = f"/v1/projects/{harness.project_id}/workflows/{started['workflow_id']}/draft"
+    before = harness.client.get(draft_url, headers=actor.headers).json()
+
+    refused = harness.client.post(
+        f"/v1/projects/{harness.project_id}/workflows/{started['workflow_id']}/publish",
+        headers=actor.headers,
+    )
+
+    assert refused.status_code == 409, refused.text
+    assert refused.headers["content-type"].startswith("application/problem+json")
+    detail = refused.json()["detail"]
+    assert "test harness" in detail
+    assert "cannot be published" in detail
+    assert "workflow_versions" not in refused.text, "no schema detail in a refusal"
+
+    after = harness.client.get(draft_url, headers=actor.headers).json()
+    assert (after["id"], after["version"]) == (before["id"], before["version"]), (
+        "the draft was frozen after all"
+    )
+
+
+def test_running_the_harness_through_the_workflow_api_is_refused(
+    harness: Harness, actor: Actor
+) -> None:
+    """409, and no second execution.
+
+    A harness run from here would be an execution of a workflow nobody drew,
+    outside the four actions `agent.test` records and with nothing saying who
+    asked for it. The refusal is checked before the published-version check,
+    so it reads the same whether or not a test has ever run.
+    """
+    started = post_test(harness, actor, {"input": SAMPLE}).json()
+
+    refused = harness.client.post(
+        f"/v1/projects/{harness.project_id}/workflows/{started['workflow_id']}/run",
+        json={"input": {"input": SAMPLE}},
+        headers=actor.headers,
+    )
+
+    assert refused.status_code == 409, refused.text
+    assert refused.headers["content-type"].startswith("application/problem+json")
+    detail = refused.json()["detail"]
+    assert "test harness" in detail
+    assert "cannot be run" in detail
+
+    listed = harness.client.get(
+        f"/v1/projects/{harness.project_id}/executions", headers=actor.headers
+    )
+    assert [row["id"] for row in listed.json()] == [started["id"]], "a run got through"
+
+
+async def test_the_refusals_record_nothing_and_leave_agent_test_working(
+    harness: Harness, actor: Actor, owner_database: Database
+) -> None:
+    """The refusals are not a half-done publish, and they change nothing.
+
+    Two claims in one test, because they are the same claim from both sides.
+    A refused call writes no audit row - the guard is raised before
+    `audit.record` and inside the transaction, so there is no `workflow.publish`
+    a digest could report for something that did not happen. And the service
+    path is untouched: a second test still runs, still on the version the
+    first one published, because `publish_test_harness` and
+    `start_test_harness` are the same body with only the harness refusal
+    lifted.
+    """
+    first = post_test(harness, actor, {"input": SAMPLE}).json()
+    workflow_id = first["workflow_id"]
+
+    assert await _actions(owner_database, harness.workspace_id) == SETUP | {
+        "workflow.create": 1,
+        "workflow.publish": 1,
+        "agent.test": 1,
+        "workflow.run": 1,
+    }
+
+    for url, body in (
+        (f"/v1/projects/{harness.project_id}/workflows/{workflow_id}/publish", None),
+        (f"/v1/projects/{harness.project_id}/workflows/{workflow_id}/run", {"input": {}}),
+    ):
+        assert harness.client.post(url, json=body, headers=actor.headers).status_code == 409
+
+    assert await _actions(owner_database, harness.workspace_id) == SETUP | {
+        "workflow.create": 1,
+        "workflow.publish": 1,
+        "agent.test": 1,
+        "workflow.run": 1,
+    }, "a refused call recorded something"
+
+    second = post_test(harness, actor, {"input": SAMPLE})
+    assert second.status_code == 202, second.text
+    assert second.json()["workflow_version_id"] == first["workflow_version_id"], (
+        "the second test should run the version the first one published"
+    )
+    assert await _actions(owner_database, harness.workspace_id) == SETUP | {
+        "workflow.create": 1,
+        # Still one: `agent.test` publishes only while the pointer is NULL,
+        # and the refusals above did not move it.
+        "workflow.publish": 1,
+        "agent.test": 2,
+        "workflow.run": 2,
+    }
+
+
+def test_an_ordinary_workflow_is_still_published_and_run(harness: Harness, actor: Actor) -> None:
+    """The guard reads the marker, not the verb: a drawn workflow is unaffected.
+
+    `test_executions_api.py` is where publish and run are tested properly.
+    This is the one assertion that belongs *here*: that the refusal added for
+    harnesses did not arrive as a refusal for everybody.
+    """
+    created = harness.client.post(
+        f"/v1/projects/{harness.project_id}/workflows",
+        json={
+            "name": "Drawn by hand",
+            "graph": {
+                "steps": [
+                    {
+                        "step_key": "writer",
+                        "kind": "agent_task",
+                        "agent_key": "writer",
+                        "input_mapping": {"input": "$.input.input"},
+                    }
+                ],
+                "edges": [],
+            },
+        },
+        headers=actor.headers,
+    )
+    assert created.status_code == 201, created.text
+    workflow_id = created.json()["workflow"]["id"]
+
+    published = harness.client.post(
+        f"/v1/projects/{harness.project_id}/workflows/{workflow_id}/publish",
+        headers=actor.headers,
+    )
+    assert published.status_code == 201, published.text
+
+    ran = harness.client.post(
+        f"/v1/projects/{harness.project_id}/workflows/{workflow_id}/run",
+        json={"input": {"input": SAMPLE}},
+        headers=actor.headers,
+    )
+    assert ran.status_code == 202, ran.text
+    assert ran.json()["workflow_version_id"] == published.json()["version_id"]
 
 
 def test_an_empty_sample_is_refused(harness: Harness, actor: Actor) -> None:

@@ -168,6 +168,38 @@ def test_the_handoff_reads_the_upstream_text_output() -> None:
     assert evaluate(ENTRY_EXPRESSION, scope) == "look into fintech"
 
 
+def test_the_persisted_entry_contract_cannot_be_renamed() -> None:
+    """The same two literals, pinned here too, and for the same reason.
+
+    A team's compiled graph is published like any other workflow and frozen
+    the same way: `workflow_steps.input_mapping` holds `$.input.input`, and
+    `advance` is given the execution's own frozen rows rather than a fresh
+    compilation. Every version published before a rename would keep reading
+    the old expression while callers sent the new field, and `_mapped` omits
+    what does not resolve instead of failing - so an old team's first step
+    would receive nothing at all, and its execution would succeed.
+
+    Agent Test harnesses are not republished after creation, which is the
+    sharper case and is why `test_agent_test_compiler.py` pins the identical
+    pair: an authored workflow can be published again, a harness cannot.
+    Changing either constant requires designing a supported harness
+    republishing mechanism first.
+
+    Asserted as literals rather than against `agent_test`'s constants,
+    because two modules renamed together agree with each other while
+    disagreeing with every graph already in the database.
+    """
+    assert HANDOFF_FIELD == "input"
+    assert ENTRY_EXPRESSION == "$.input.input"
+
+    workflow = compiled().workflow
+    assert workflow is not None
+    assert workflow.graph["steps"][0]["input_mapping"] == {"input": "$.input.input"}
+
+    scope = {"input": {HANDOFF_FIELD: "look into fintech"}, "steps": {}}
+    assert evaluate("$.input.input", scope) == "look into fintech"
+
+
 def test_the_name_comes_from_display_names_and_the_slug_from_keys() -> None:
     """Identity and label are not the same thing.
 
