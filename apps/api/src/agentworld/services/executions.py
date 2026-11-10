@@ -217,7 +217,17 @@ class ExecutionService:
         inputs: Mapping[str, Any] | None = None,
         idempotency_key: str | None = None,
     ) -> UUID:
-        """Create an execution of the newest published version and advance it.
+        """Create an execution of the version the workflow names, and advance it.
+
+        **The version comes from `workflows.current_version_id`.** This used
+        to re-derive it with `ORDER BY version DESC` over the published rows,
+        which is the same answer by construction - `publish` moves the
+        pointer in the transaction that freezes the version - and one answer
+        too many. Two ways to compute the same fact do not stay the same: the
+        column is what the schema's composite foreign key constrains, what
+        `GET /workflows` reports to a client, and what a trigger will read
+        when Phase 7 fires one, so a run that resolved it any other way would
+        be the one reader with its own opinion.
 
         The initiator is this user, written once and never recomputed. A
         `system` initiator comes from a trigger and arrives in Phase 7; there
@@ -232,11 +242,31 @@ class ExecutionService:
             workflow = await work.workflows(scope).get(workflow_id)
             if workflow is None:
                 raise NotFoundError("Workflow not found", workflow_id=str(workflow_id))
-            version = await work.workflows(scope).published_version(workflow_id)
-            if version is None:
+            if workflow.current_version_id is None:
+                # NULL has one meaning here and has had it since migration
+                # 0008: nothing has been published. The message and the 409
+                # are unchanged, because the case is unchanged - only where
+                # the answer is read from.
                 raise ConflictError(
                     "This workflow has no published version to run",
                     workflow_id=str(workflow_id),
+                )
+            # Named, and verified rather than trusted. `published_version_by_id`
+            # asks for the version *of this workflow* that is published, so a
+            # pointer at a draft - which the composite foreign key permits,
+            # since it constrains which workflow a version belongs to and not
+            # whether it was ever frozen - comes back as None here instead of
+            # as a graph to execute. A 409 for it: the row is inconsistent
+            # with the lifecycle, not absent, and a workflow somebody can see
+            # in a listing must not answer a run with a 500.
+            version = await work.workflows(scope).published_version_by_id(
+                workflow_id, version_id=workflow.current_version_id
+            )
+            if version is None:
+                raise ConflictError(
+                    "The version this workflow names is not published and cannot be run",
+                    workflow_id=str(workflow_id),
+                    workflow_version_id=str(workflow.current_version_id),
                 )
 
             executions = work.executions(scope)

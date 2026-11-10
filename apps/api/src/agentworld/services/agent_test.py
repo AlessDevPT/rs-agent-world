@@ -195,19 +195,21 @@ class AgentTestService:
                     "created_harness": created,
                 },
             )
-            # Asked of `workflow_versions`, not of `workflows`. The obvious
-            # predicate is `current_version_id is None`, and when this was
-            # written it was simply wrong: nothing in the codebase wrote that
-            # column, so it was NULL for every workflow that had ever been
-            # published and a test republished on every run - version 3, 4,
-            # 5 - which is how the dead column was found. `publish` now moves
-            # it, so the two answers agree; this still asks the version
-            # table, because `ExecutionService.start` resolves what it runs
-            # with `published_version` and this decision has to share
-            # `start`'s authority rather than hold a second opinion about it.
-            # Both move together or neither does.
-            published = await workflows.published_version(harness.id)
-            return harness, published is None
+            # The pointer, which is the same question `ExecutionService.start`
+            # now asks: does this workflow name a version that can run. A
+            # harness with no pointer has never been published - either this
+            # call just created it, or an earlier test created it and the
+            # publish that followed failed - and in both cases the caller
+            # publishes before starting.
+            #
+            # Not "does it have a draft". Every publish opens the next draft
+            # behind itself, so a harness that has run once always has one,
+            # and a predicate that looked at drafts would freeze a new
+            # version on every test: versions 3, 4, 5, which is the shape of
+            # the bug that found this column dead in the first place. The
+            # pointer moves only when something is published, so asking it is
+            # what makes a later test a run and not a republish.
+            return harness, harness.current_version_id is None
 
 
 def _compiled_for(agent: Agent) -> CompiledTestWorkflow:

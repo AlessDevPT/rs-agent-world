@@ -1066,3 +1066,153 @@ async def test_another_workspace_cannot_publish_or_run(
         ).status_code
         == 404
     )
+
+
+# ----------------------------------------- the version a new run resolves ---
+#
+# `start` reads `workflows.current_version_id` and nothing else. It used to
+# re-derive the same answer with `ORDER BY version DESC` over the published
+# rows, which agrees with the pointer in every state publishing can produce -
+# so these tests move the pointer by hand where they have to, because two
+# readings of one fact can only be told apart in a state that makes them
+# differ. What a *running* execution advances on is a different question,
+# answered above: its own `workflow_version_id`, for its whole life.
+
+
+async def _point_at(owner_database: Database, workflow_id: str, version_id: str) -> None:
+    """Move `current_version_id` as the schema owner.
+
+    No route does this and no service does either - publishing moves the
+    pointer forward and nothing moves it anywhere else - which is exactly why
+    a test that wants to know which column was read has to write it here.
+    """
+    async with owner_database.session() as session:
+        await session.execute(
+            text("UPDATE workflows SET current_version_id = :version WHERE id = :id"),
+            {"version": version_id, "id": workflow_id},
+        )
+
+
+def _view(scenario: Scenario, execution_id: str) -> dict[str, Any]:
+    response = scenario.client.get(
+        f"/v1/projects/{scenario.project_id}/executions/{execution_id}",
+        headers=scenario.actor.headers,
+    )
+    assert response.status_code == 200, response.text
+    return dict(response.json())
+
+
+async def test_a_new_run_binds_the_version_the_workflow_names(
+    scenario: Scenario, owner_database: Database
+) -> None:
+    """The pointer, the publish route's answer and the execution's row, equal.
+
+    Three spellings of one version id, which is the point: a client is told
+    `current_version_id` by `GET /workflows`, and that has to be the version
+    it gets when it presses Run.
+    """
+    workflow_id = scenario.workflow()
+    version_id = scenario.publish(workflow_id).json()["version_id"]
+    assert await _pointer(owner_database, workflow_id) == version_id
+
+    execution_id = scenario.run(workflow_id).json()["id"]
+
+    assert _view(scenario, execution_id)["workflow_version_id"] == version_id
+
+
+async def test_a_new_run_follows_the_pointer_and_not_the_newest_published_version(
+    scenario: Scenario, factory: UnitOfWorkFactory, owner_database: Database
+) -> None:
+    """Which of the two answers `start` reads, asked so that they differ.
+
+    Version 2 is published and version 1 is what the workflow names. Deriving
+    the version would give 2; reading the column gives 1. The run is bound to
+    1 and then *decided* from 1 as well - the output names version one's
+    expression - because binding the right version and advancing on the bound
+    version are two separate guarantees and this exercises both.
+
+    Pointing the column backwards is not a state the application can reach.
+    It is the only state that distinguishes the two readings, and the column
+    is the one the schema constrains, the API reports and a Phase 7 trigger
+    will fire on.
+    """
+    workflow_id = scenario.workflow(_chain("kept"))
+    first = scenario.publish(workflow_id).json()["version_id"]
+    _republish(scenario, workflow_id, _chain("changed"))
+
+    versions = await _versions(owner_database, workflow_id)
+    assert [(row.version, row.published) for row in versions] == [
+        (1, True),
+        (2, True),
+        (3, False),
+    ]
+    assert await _pointer(owner_database, workflow_id) == str(versions[1].id)
+
+    await _point_at(owner_database, workflow_id, first)
+    execution_id = scenario.run(workflow_id, input=CHAIN_INPUT).json()["id"]
+
+    assert _view(scenario, execution_id)["workflow_version_id"] == first
+    # `start` advanced once already, completing the entry step; the rest is
+    # the second transform and the execution itself.
+    assert await _drain(factory, scenario, execution_id) == [
+        "CompleteStep",
+        "CompleteExecution",
+    ]
+
+    execution = _view(scenario, execution_id)
+    assert execution["status"] == ExecutionStatus.COMPLETED
+    assert execution["output"] == {"second": {"value": "version-one"}}
+
+
+async def test_a_workflow_that_names_an_unpublished_version_refuses_to_run(
+    scenario: Scenario, owner_database: Database
+) -> None:
+    """A pointer at a draft is a 409, not a 500 and not an executed draft.
+
+    The composite foreign key says the version belongs to this workflow and
+    says nothing about `published_at`, so the row is storable; `start` asks
+    for the *published* version of this workflow by id and gets nothing back.
+    Refusing is the only honest answer - a draft is an editor's copy that
+    `workflow_steps` has never been written for - and it has to arrive as a
+    modelled error, because an unmodelled one loses the problem document and
+    the request id with it.
+    """
+    workflow_id = scenario.workflow()
+    scenario.publish(workflow_id)
+    versions = await _versions(owner_database, workflow_id)
+    assert [(row.version, row.published) for row in versions] == [(1, True), (2, False)]
+    await _point_at(owner_database, workflow_id, str(versions[1].id))
+
+    response = scenario.run(workflow_id)
+
+    assert response.status_code == 409, response.text
+    assert response.headers["content-type"].startswith("application/problem+json")
+    body = response.json()
+    assert body["status"] == 409
+    assert body["title"] == "Conflict"
+    assert "not published" in body["detail"]
+    assert body["instance"] == response.headers["X-Request-Id"]
+    assert await _count(owner_database, "workflow_executions", workflow_id=workflow_id) == 0
+
+
+async def test_a_workflow_cannot_name_another_workflows_version(
+    scenario: Scenario, owner_database: Database
+) -> None:
+    """The third case the database refuses outright, so `start` never sees it.
+
+    `(id, current_version_id) -> workflow_versions(workflow_id, id)` has been
+    there since migration 0008. It is what makes "validate that the version
+    belongs to this workflow" a property of the schema rather than a check
+    somebody has to remember - and now that a run resolves the column, it is
+    load-bearing rather than tidy.
+    """
+    mine = scenario.workflow(name="Mine")
+    theirs = scenario.workflow(name="Theirs")
+    scenario.publish(mine)
+    stolen = scenario.publish(theirs).json()["version_id"]
+
+    with pytest.raises(Exception, match="workflows_current_version_fkey"):
+        await _point_at(owner_database, mine, stolen)
+
+    # And the run it would have broken still works.
+    assert scenario.run(mine).status_code == 202

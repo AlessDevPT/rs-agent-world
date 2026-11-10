@@ -568,11 +568,12 @@ class Workflow(Base):
     foreign key targets `(workflow_id, id)`, so it cannot name a version
     belonging to a different workflow.
 
-    It is not yet what a run *resolves*: `ExecutionService.start` still asks
-    `published_version` for the newest published row, and the two agree
-    because one act writes both. Moving `start` onto this column is a change
-    of its own, and until it happens this is a published fact about the
-    workflow rather than the path a run takes.
+    It is also what a new run *resolves*: `ExecutionService.start` reads this
+    column and nothing else, and `AgentTestService` reads it to decide whether
+    a harness still needs its first publish. A run already under way is a
+    different question with a different answer - `workflow_executions`
+    carries its own `workflow_version_id` and advances on that for its whole
+    life, however often this pointer moves afterwards.
     """
 
     __tablename__ = "workflows"

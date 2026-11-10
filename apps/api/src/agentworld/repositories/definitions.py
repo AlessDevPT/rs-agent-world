@@ -844,7 +844,7 @@ class WorkflowRepository(ScopedRepository):
         return published
 
     async def published_version(self, workflow_id: UUID) -> WorkflowDraft | None:
-        """The newest published version, which is the one a *new* run executes.
+        """The newest published version, derived rather than read.
 
         Returns the same shape as `draft_of` because a frozen version keeps
         its `graph` column: the normalised tables are what the island, the
@@ -852,8 +852,16 @@ class WorkflowRepository(ScopedRepository):
         what the orchestrator reads. Both are immutable after publish, so
         they cannot disagree.
 
-        Not the question to ask about a run that has already started: see
-        `published_version_by_id`.
+        **No longer how anything decides what to run.** `start` reads
+        `workflows.current_version_id`, and the harness predicate in
+        `AgentTestService` reads the same column; this is the independent
+        second opinion they are checked against, which is the one job it is
+        now good for. The two answers are the same fact computed two ways and
+        a test that asserts they agree is a test that the pointer has not
+        drifted - so this method stays, and nothing in `services/` calls it.
+
+        Not the question to ask about a run that has already started either:
+        see `published_version_by_id`.
         """
         row = (
             await self._session.execute(
@@ -890,8 +898,10 @@ class WorkflowRepository(ScopedRepository):
         instead of as another workflow's graph.
 
         `published_at IS NOT NULL`, because an execution of a draft is not a
-        state this system has: `start` binds what `published_version`
-        returned, and a published version can never be unpublished.
+        state this system has: `start` binds the version
+        `workflows.current_version_id` names, having asked this same method
+        whether it is published, and a published version can never be
+        unpublished afterwards.
         """
         row = (
             await self._session.execute(

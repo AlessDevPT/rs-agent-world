@@ -269,7 +269,61 @@ async def test_a_second_test_reuses_the_harness_and_adds_one_execution(
 
     executions = await _executions(owner_database, harness.project_id)
     assert {row.id for row in executions} == {first, second}
-    assert {row.workflow_version_id for row in executions} == {harnesses[0].published}
+    # Both answers, because a run resolves the pointer and this file's other
+    # assertions are about the derived one. The draft above is the reason
+    # this matters: a predicate that asked "is there a draft" would have
+    # frozen a third version and bound the second run to it.
+    assert {row.workflow_version_id for row in executions} == {harnesses[0].pointer}
+    assert harnesses[0].pointer == harnesses[0].published
+
+
+async def test_the_pointer_is_what_decides_whether_to_publish(
+    factory: UnitOfWorkFactory, harness: Harness, owner_database: Database
+) -> None:
+    """Which column the predicate reads, asked the only way that can tell.
+
+    "Has this harness been published" has two answers - the workflow's
+    `current_version_id`, and the newest published row in
+    `workflow_versions` - and in every state the application can produce
+    they are the same id, because one transaction writes both. So this test
+    clears the pointer by hand, which migration 0022 is what guarantees does
+    not happen in a real database, and watches what the next test does.
+
+    It publishes: the pointer is the authority, and the same column
+    `ExecutionService.start` resolves. What it publishes is the draft that
+    the first publish opened behind itself, so the harness ends with two
+    frozen versions and a third draft - and the run is bound to the second,
+    not to the version the first test used.
+    """
+    await run_test(factory, harness, request_id="req-1")
+    first = (await _harnesses(owner_database, harness.project_id))[0]
+    assert first.pointer == first.published
+
+    async with owner_database.session() as session:
+        await session.execute(
+            text("UPDATE workflows SET current_version_id = NULL WHERE id = :w"),
+            {"w": first.id},
+        )
+
+    second_execution = await run_test(factory, harness, request_id="req-2")
+
+    versions = await _rows(
+        owner_database,
+        "SELECT version, published_at FROM workflow_versions WHERE workflow_id = :w "
+        "ORDER BY version",
+        w=first.id,
+    )
+    assert [(row.version, row.published_at is not None) for row in versions] == [
+        (1, True),
+        (2, True),
+        (3, False),
+    ]
+
+    after = (await _harnesses(owner_database, harness.project_id))[0]
+    assert after.pointer == after.published, "the publish moved both or neither"
+    assert after.pointer != first.pointer
+    executions = {row.id: row for row in await _executions(owner_database, harness.project_id)}
+    assert executions[second_execution].workflow_version_id == after.pointer
 
 
 async def test_changed_instructions_are_picked_up_without_republishing(
