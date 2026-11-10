@@ -39,9 +39,11 @@ class Fixture:
 async def published(owner_database: Database) -> Fixture:
     """One published version with a step, and one unpublished draft version.
 
-    Note the order: steps first, `published_at` last. That is not a stylistic
-    choice - the trigger refuses adding a step to a version that is already
-    published, so it is the order a real publish must use.
+    Note the order: for each version, the step first and `published_at` last,
+    and version 1 published before version 2 is inserted at all. Neither is a
+    stylistic choice - the trigger refuses adding a step to a version that is
+    already published, and `workflow_versions_open_draft_key` refuses a second
+    open draft, so this is the order a real publish must use.
     """
     f = Fixture()
     async with owner_database.session() as session:
@@ -64,7 +66,10 @@ async def published(owner_database: Database) -> Fixture:
             ),
             {"i": f.workflow_id, "w": f.workspace_id, "p": f.project_id},
         )
-        for version_id, number in ((f.live_version, 1), (f.draft_version, 2)):
+        for version_id, number, step_id, publish in (
+            (f.live_version, 1, f.live_step, True),
+            (f.draft_version, 2, f.draft_step, False),
+        ):
             await session.execute(
                 text(
                     "INSERT INTO workflow_versions "
@@ -79,7 +84,6 @@ async def published(owner_database: Database) -> Fixture:
                     "v": number,
                 },
             )
-        for step_id, version_id in ((f.live_step, f.live_version), (f.draft_step, f.draft_version)):
             await session.execute(
                 text(
                     "INSERT INTO workflow_steps "
@@ -88,11 +92,15 @@ async def published(owner_database: Database) -> Fixture:
                 ),
                 {"i": step_id, "v": version_id, "w": f.workspace_id, "p": f.project_id},
             )
-        # Only now, and only one of them.
-        await session.execute(
-            text("UPDATE workflow_versions SET published_at = now() WHERE id = :i"),
-            {"i": f.live_version},
-        )
+            if publish:
+                # Before version 2 exists, not after: migration 0023 permits
+                # one open draft per workflow, so the live version has to be
+                # frozen before the next one is opened above it. Which is
+                # what publishing does.
+                await session.execute(
+                    text("UPDATE workflow_versions SET published_at = now() WHERE id = :i"),
+                    {"i": version_id},
+                )
     return f
 
 

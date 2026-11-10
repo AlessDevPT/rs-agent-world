@@ -667,7 +667,8 @@ class WorkflowVersion(Base):
     input_schema: Mapped[dict[str, Any]] = mapped_column(
         nullable=False, server_default=sa.text("'{}'::jsonb")
     )
-    #: NULL means a draft. Only a published version may be executed.
+    #: NULL means a draft. Only a published version may be executed, and a
+    #: workflow has at most one row in this state - see the index below.
     published_at: Mapped[dt.datetime | None]
     created_by_user_id: Mapped[UUID | None] = mapped_column(
         sa.ForeignKey("users.id", ondelete="SET NULL")
@@ -678,8 +679,21 @@ class WorkflowVersion(Base):
         _project_fk("workflow_versions"),
         sa.CheckConstraint("version > 0", name="version_is_positive"),
         sa.UniqueConstraint("workflow_id", "version", name="workflow_versions_number_key"),
-        # Redundant alone; the target of `workflows.current_version_id`.
+        # Redundant alone; the target of `workflows.current_version_id` and
+        # of `workflow_executions_version_fkey`. One unique key serves any
+        # number of references.
         sa.UniqueConstraint("workflow_id", "id", name="workflow_versions_workflow_id_id_key"),
+        # One open draft per workflow. Every path that creates a version
+        # creates exactly one draft - `create` and `find_or_create_test` open
+        # version 1, `next_draft` opens the one above what was just
+        # published - and `save_draft` edits that draft in place. This is
+        # what makes `draft_of` single-valued rather than merely ordered.
+        sa.Index(
+            "workflow_versions_open_draft_key",
+            "workflow_id",
+            unique=True,
+            postgresql_where=sa.text("published_at IS NULL"),
+        ),
     )
 
 
@@ -847,11 +861,10 @@ class WorkflowExecution(Base):
     workflow_id: Mapped[UUID] = mapped_column(
         sa.ForeignKey("workflows.id", ondelete="CASCADE"), nullable=False
     )
-    #: RESTRICT: the frozen version cannot be deleted while an execution
-    #: references it, or the record would describe a graph nobody can read.
-    workflow_version_id: Mapped[UUID] = mapped_column(
-        sa.ForeignKey("workflow_versions.id", ondelete="RESTRICT"), nullable=False
-    )
+    #: Bound with `workflow_id` by the composite key below, so the version
+    #: is always a version *of this workflow*. The plain foreign key this
+    #: replaced could not say that; migration 0023 says why it matters.
+    workflow_version_id: Mapped[UUID] = mapped_column(sa.Uuid, nullable=False)
     status: Mapped[enums.ExecutionStatus] = mapped_column(
         pg_enum(enums.ExecutionStatus, "execution_status"),
         nullable=False,
@@ -891,6 +904,16 @@ class WorkflowExecution(Base):
 
     __table_args__ = (
         _project_fk("workflow_executions"),
+        # The version an execution is bound to must belong to the workflow it
+        # claims to run. RESTRICT, unchanged from the single-column key this
+        # replaced: the frozen version cannot be deleted while an execution
+        # references it, or the record would describe a graph nobody can read.
+        sa.ForeignKeyConstraint(
+            ["workflow_id", "workflow_version_id"],
+            ["workflow_versions.workflow_id", "workflow_versions.id"],
+            name="workflow_executions_version_fkey",
+            ondelete="RESTRICT",
+        ),
         # Exactly one of the two ids, matching the kind. A `system` initiator
         # names no user, which is the whole point.
         sa.CheckConstraint(

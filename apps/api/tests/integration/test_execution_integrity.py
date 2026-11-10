@@ -57,11 +57,16 @@ async def seeded(owner_database: Database) -> Fixture:
             ),
             {"i": f.workflow_id, "w": f.workspace_id, "p": f.project_id, "s": "run", "n": "Run"},
         )
-        # Unpublished at first, published after the steps are in. Migration
-        # 0018 refuses an insert into `workflow_steps` whose version is
-        # already published, so this is the order a real publish has to use
-        # too - and this fixture is the first thing that would have found out.
-        for version_id, number in ((f.version_a, 1), (f.version_b, 2)):
+        # One version at a time, insert then step then publish, because two
+        # database constraints meet here. Migration 0018 refuses a step on a
+        # version that is already published, and 0023 refuses a second open
+        # draft - so between them they leave exactly the order a real publish
+        # uses, and this fixture can no longer hold a state the application
+        # cannot reach.
+        for version_id, number, step_id in (
+            (f.version_a, 1, f.step_a),
+            (f.version_b, 2, f.step_b),
+        ):
             await session.execute(
                 text(
                     "INSERT INTO workflow_versions "
@@ -76,7 +81,6 @@ async def seeded(owner_database: Database) -> Fixture:
                     "v": number,
                 },
             )
-        for step_id, version_id in ((f.step_a, f.version_a), (f.step_b, f.version_b)):
             await session.execute(
                 text(
                     "INSERT INTO workflow_steps "
@@ -92,10 +96,10 @@ async def seeded(owner_database: Database) -> Fixture:
                     "name": "Shape",
                 },
             )
-        await session.execute(
-            text("UPDATE workflow_versions SET published_at = now() WHERE id IN (:a, :b)"),
-            {"a": f.version_a, "b": f.version_b},
-        )
+            await session.execute(
+                text("UPDATE workflow_versions SET published_at = now() WHERE id = :i"),
+                {"i": version_id},
+            )
         # An execution bound to version A, initiated by a user.
         await session.execute(
             text(

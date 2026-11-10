@@ -19,7 +19,16 @@ pytestmark = pytest.mark.integration
 
 
 class Graph:
-    """Ids for one workflow with two published versions, each holding a step."""
+    """Ids for one workflow with two versions, and a second workflow with one.
+
+    `version_a` is the open draft and is where every test below writes: the
+    graph tables are immutable once a version is published (migration 0018),
+    so the draft is the only version a step or an edge can be added to.
+    `version_b` is the published version 1 below it, holding `step_b` - the
+    other version of the same workflow that a cross-version reference can
+    point at. The letters pair each step with its version rather than
+    ordering the two.
+    """
 
     def __init__(self) -> None:
         self.user_id = uuid.uuid4()
@@ -68,10 +77,15 @@ async def graph(owner_database: Database) -> Graph:
                     "name": slug,
                 },
             )
-        for version_id, workflow_id, number in (
-            (g.version_a, g.workflow_id, 1),
-            (g.version_b, g.workflow_id, 2),
-            (g.other_version, g.other_workflow_id, 1),
+        # Each version with its steps, and published before the next one is
+        # opened above it. Two constraints force this: migration 0018 refuses
+        # a step on a published version, and `workflow_versions_open_draft_key`
+        # refuses a second open draft of one workflow - so a fixture cannot
+        # hold two half-built versions at once any more than a publish can.
+        for version_id, workflow_id, number, publish, steps in (
+            (g.version_b, g.workflow_id, 1, True, ((g.step_b, "research"),)),
+            (g.version_a, g.workflow_id, 2, False, ((g.step_a, "research"), (g.step_a2, "write"))),
+            (g.other_version, g.other_workflow_id, 1, False, ()),
         ):
             await session.execute(
                 text(
@@ -87,29 +101,30 @@ async def graph(owner_database: Database) -> Graph:
                     "v": number,
                 },
             )
-        for step_id, version_id, key in (
-            (g.step_a, g.version_a, "research"),
-            (g.step_a2, g.version_a, "write"),
-            (g.step_b, g.version_b, "research"),
-        ):
-            await session.execute(
-                text(
-                    "INSERT INTO workflow_steps "
-                    "(id, workflow_version_id, workspace_id, project_id, step_key, name, kind) "
-                    "VALUES (:i, :v, :w, :p, :key, :name, 'transform')"
-                ),
-                {
-                    "i": step_id,
-                    "v": version_id,
-                    "w": g.workspace_id,
-                    "p": g.project_id,
-                    "key": key,
-                    # Separate bind from `key`: one parameter used for both a
-                    # citext and a text column leaves asyncpg unable to
-                    # deduce a single type for it.
-                    "name": key.title(),
-                },
-            )
+            for step_id, key in steps:
+                await session.execute(
+                    text(
+                        "INSERT INTO workflow_steps (id, workflow_version_id, workspace_id, "
+                        "project_id, step_key, name, kind) "
+                        "VALUES (:i, :v, :w, :p, :key, :name, 'transform')"
+                    ),
+                    {
+                        "i": step_id,
+                        "v": version_id,
+                        "w": g.workspace_id,
+                        "p": g.project_id,
+                        "key": key,
+                        # Separate bind from `key`: one parameter used for
+                        # both a citext and a text column leaves asyncpg
+                        # unable to deduce a single type for it.
+                        "name": key.title(),
+                    },
+                )
+            if publish:
+                await session.execute(
+                    text("UPDATE workflow_versions SET published_at = now() WHERE id = :i"),
+                    {"i": version_id},
+                )
     return g
 
 

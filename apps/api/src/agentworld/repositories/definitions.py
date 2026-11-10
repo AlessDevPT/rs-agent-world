@@ -683,7 +683,13 @@ class WorkflowRepository(ScopedRepository):
         return found is not None
 
     async def draft_of(self, workflow_id: UUID) -> WorkflowDraft | None:
-        """The newest unpublished version, which is the one being edited."""
+        """The unpublished version, which is the one being edited.
+
+        At most one exists: `workflow_versions_open_draft_key` makes a second
+        draft of one workflow unstorable, so the ordering below is a tiebreak
+        for a tie the schema no longer permits rather than a choice between
+        candidates.
+        """
         row = (
             await self._session.execute(
                 sa.select(m.WorkflowVersion)
@@ -890,12 +896,13 @@ class WorkflowRepository(ScopedRepository):
         one thing `WorkflowExecution`'s docstring and migration 0018 both
         promise cannot happen.
 
-        `workflow_id` as well, because nothing in the schema makes
-        `workflow_executions.workflow_version_id` a version *of that*
-        workflow - that foreign key names `workflow_versions(id)` alone,
-        unlike the composite pairs everywhere else here. Asking for both
-        costs one more predicate and means a mismatch reads as "gone"
-        instead of as another workflow's graph.
+        `workflow_id` as well. Migration 0023 now makes the pair on
+        `workflow_executions` a composite foreign key, so a stored execution
+        cannot name another workflow's version in the first place - but this
+        method is also how `start` checks the pointer it was handed, where
+        the pair has not been stored yet and where a mismatch must read as
+        "gone" rather than as somebody else's graph. One predicate, holding
+        on both sides of the write.
 
         `published_at IS NOT NULL`, because an execution of a draft is not a
         state this system has: `start` binds the version
