@@ -168,14 +168,23 @@ def test_an_unknown_workflow_is_a_404(scenario: Scenario) -> None:
 
 
 def test_an_archived_workflow_cannot_be_renamed(scenario: Scenario) -> None:
-    """404, like every other write verb, while the read still answers 200."""
+    """409 naming the remedy, while the read still answers 200.
+
+    This asserted a 404 until stage C2. There was nothing a caller could do
+    about an archived workflow then, so "not found" was only unhelpful;
+    now that it can be restored, the refusal says which state it is in and
+    what to do about it.
+    """
     workflow_id = scenario.workflow()
     scenario.client.delete(
         f"/v1/projects/{scenario.project_id}/workflows/{workflow_id}",
         headers=scenario.actor.headers,
     )
 
-    assert patch(scenario, workflow_id, {"name": "Back from the dead"}).status_code == 404
+    refused = patch(scenario, workflow_id, {"name": "Back from the dead"})
+    assert refused.status_code == 409, refused.text
+    assert "archived" in refused.json()["detail"]
+    assert "restored" in refused.json()["detail"]
     assert read(scenario, workflow_id).status_code == 200, "still readable"
 
 

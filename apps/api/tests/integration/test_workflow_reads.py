@@ -106,16 +106,21 @@ def test_an_archived_workflow_is_readable_and_says_it_is_archived(scenario: Scen
     body = read(scenario, workflow_id).json()
     assert body["archived_at"] is not None
 
-    assert scenario.publish(workflow_id).status_code == 404
-    assert scenario.run(workflow_id).status_code == 404
-    assert read(scenario, workflow_id, "/draft").status_code == 404
-    assert (
+    # 409 since stage C2: the row is readable, so a refusal that said "not
+    # found" would contradict the read above. The draft route is the one
+    # exception and deliberately unchanged - it is a read, and stage C2
+    # changed write verbs only.
+    for refused in (
+        scenario.publish(workflow_id),
+        scenario.run(workflow_id),
         scenario.client.post(
             f"/v1/projects/{scenario.project_id}/workflows/{workflow_id}/validate",
             headers=scenario.actor.headers,
-        ).status_code
-        == 404
-    )
+        ),
+    ):
+        assert refused.status_code == 409, refused.text
+        assert "archived" in refused.json()["detail"]
+    assert read(scenario, workflow_id, "/draft").status_code == 404
 
 
 # ---------------------------------------------------------------- versions ---

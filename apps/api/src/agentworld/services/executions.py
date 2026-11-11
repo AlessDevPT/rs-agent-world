@@ -77,6 +77,7 @@ from agentworld.services.definitions import (
     definition_for_execution,
     facts_and_effects,
     not_a_test_harness,
+    not_archived,
 )
 
 log = get_logger(__name__)
@@ -198,7 +199,7 @@ class ExecutionService:
             scope = TenantScope(workspace_id, project_id)
             workflows = work.workflows(scope)
 
-            workflow = await workflows.get(workflow_id)
+            workflow = await workflows.get(workflow_id, include_archived=True)
             if workflow is None:
                 raise NotFoundError("Workflow not found", workflow_id=str(workflow_id))
             if refuse_harness:
@@ -208,6 +209,10 @@ class ExecutionService:
                 # between the check and the freeze. Both are `save_draft`'s
                 # arrangement, which is the point - this is the same refusal.
                 not_a_test_harness(workflow, doing="published")
+            # Whoever is calling: an archived workflow is not publishable,
+            # and `agent.test` cannot reach an archived harness because a
+            # harness cannot be archived at all.
+            not_archived(workflow, kind="workflow", doing="published")
             draft = await workflows.draft_of(workflow_id)
             if draft is None:
                 raise ConflictError(
@@ -361,7 +366,7 @@ class ExecutionService:
             authorize(principal, Action.WORKFLOW_RUN, Resource(workspace_id))
             scope = TenantScope(workspace_id, project_id)
 
-            workflow = await work.workflows(scope).get(workflow_id)
+            workflow = await work.workflows(scope).get(workflow_id, include_archived=True)
             if workflow is None:
                 raise NotFoundError("Workflow not found", workflow_id=str(workflow_id))
             if refuse_harness:
@@ -370,6 +375,9 @@ class ExecutionService:
                 # the answer is the same for a harness with no pointer and
                 # one with three published versions behind it.
                 not_a_test_harness(workflow, doing="run")
+            # Also before it, and for everybody: "this is archived, restore
+            # it" is the answer whether or not it ever published a version.
+            not_archived(workflow, kind="workflow", doing="run")
             if workflow.current_version_id is None:
                 # NULL has one meaning here and has had it since migration
                 # 0008: nothing has been published. The message and the 409

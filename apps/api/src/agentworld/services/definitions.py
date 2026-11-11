@@ -383,9 +383,14 @@ class AgentService:
 
             scope = TenantScope(workspace_id, project_id)
             agents = work.agents(scope)
-            existing = await agents.get(agent_id)
+            # `include_archived=True`, so that an archived agent is refused
+            # as archived rather than reported missing. The repository's
+            # `update` still excludes archived rows, so the refusal below is
+            # the message and the statement is the enforcement.
+            existing = await agents.get(agent_id, include_archived=True)
             if existing is None:
                 raise NotFoundError("Agent not found", agent_id=str(agent_id))
+            not_archived(existing, kind="agent", doing="edited")
 
             mode = sent.get("interaction_mode", existing.interaction_mode)
             profile = sent.get("model_profile_id", existing.model_profile_id)
@@ -477,7 +482,12 @@ class AgentService:
             workspace_id = await _workspace_of(work, project_id)
             authorize(principal, Action.AGENT_ARCHIVE, Resource(workspace_id))
             scope = TenantScope(workspace_id, project_id)
-            if not await work.agents(scope).archive(agent_id):
+            agents = work.agents(scope)
+            existing = await agents.get(agent_id, include_archived=True)
+            if existing is None:
+                raise NotFoundError("Agent not found", agent_id=str(agent_id))
+            already_archived(existing, kind="agent")
+            if not await agents.archive(agent_id):  # pragma: no cover - read above
                 raise NotFoundError("Agent not found", agent_id=str(agent_id))
             await audit.record(
                 work,
@@ -840,10 +850,11 @@ class WorkflowService:
             scope = TenantScope(workspace_id, project_id)
             workflows = work.workflows(scope)
 
-            existing = await workflows.get(workflow_id)
+            existing = await workflows.get(workflow_id, include_archived=True)
             if existing is None:
                 raise NotFoundError("Workflow not found", workflow_id=str(workflow_id))
             not_a_test_harness(existing, doing="edited")
+            not_archived(existing, kind="workflow", doing="edited")
 
             workflow = await workflows.update(workflow_id, **sent)
             if workflow is None:  # pragma: no cover - the row was read above
@@ -1007,10 +1018,11 @@ class WorkflowService:
             authorize(principal, Action.WORKFLOW_UPDATE_DRAFT, Resource(workspace_id))
             scope = TenantScope(workspace_id, project_id)
             workflows = work.workflows(scope)
-            existing = await workflows.get(workflow_id)
+            existing = await workflows.get(workflow_id, include_archived=True)
             if existing is None:
                 raise NotFoundError("Workflow not found", workflow_id=str(workflow_id))
             not_a_test_harness(existing, doing="edited")
+            not_archived(existing, kind="workflow", doing="edited")
             draft = await workflows.save_draft(workflow_id, graph=graph)
             if draft is None:
                 raise NotFoundError(
@@ -1090,13 +1102,16 @@ class WorkflowService:
             authorize(principal, Action.WORKFLOW_ARCHIVE, Resource(workspace_id))
             scope = TenantScope(workspace_id, project_id)
             workflows = work.workflows(scope)
-            existing = await workflows.get(workflow_id)
-            if existing is not None:
-                # Before the attempt, so that a refused harness is told apart
-                # from a workflow that is not there. The repository refuses
-                # it either way, but "not found" would be a lie.
-                not_a_test_harness(existing, doing="archived")
-            if not await workflows.archive(workflow_id):
+            existing = await workflows.get(workflow_id, include_archived=True)
+            if existing is None:
+                raise NotFoundError("Workflow not found", workflow_id=str(workflow_id))
+            # Before the attempt, so that a refused harness is told apart
+            # from a workflow that is not there, and an archived one from
+            # both. The repository refuses all three either way, but "not
+            # found" would be a lie about two of them.
+            not_a_test_harness(existing, doing="archived")
+            already_archived(existing, kind="workflow")
+            if not await workflows.archive(workflow_id):  # pragma: no cover - read above
                 raise NotFoundError("Workflow not found", workflow_id=str(workflow_id))
             await audit.record(
                 work,
@@ -1124,6 +1139,17 @@ class WorkflowService:
             authorize(principal, Action.WORKFLOW_VALIDATE, Resource(workspace_id))
             scope = TenantScope(workspace_id, project_id)
 
+            # Archived workflows are refused here too, although this writes
+            # nothing. `validate` answers "could this draft run", and an
+            # archived workflow cannot run at all - a report full of green
+            # ticks would be true of the graph and misleading about the
+            # workflow. The state is readable through `GET /workflows/{id}`,
+            # which is where a client learns why.
+            existing = await work.workflows(scope).get(workflow_id, include_archived=True)
+            if existing is None:
+                raise NotFoundError("Workflow not found", workflow_id=str(workflow_id))
+            not_archived(existing, kind="workflow", doing="validated")
+
             _, draft = await self._draft(work, scope, workflow_id)
             facts, effects, approvers = await facts_and_effects(work, scope, workspace_id)
 
@@ -1142,6 +1168,52 @@ class WorkflowService:
         if draft is None:
             raise NotFoundError("This workflow has no draft", workflow_id=str(workflow_id))
         return workflow, draft
+
+
+def not_archived(row: Agent | Workflow, *, kind: str, doing: str) -> None:
+    """Refuse a write to an archived row, and say which it is.
+
+    Until stage C there was nothing a caller could do about an archived
+    resource, so every write answered 404 and "archived" was
+    indistinguishable from "never existed". Restoring exists now, which
+    makes the distinction worth drawing: a 409 naming the state and the
+    remedy is a sentence a client can act on, and `agent.test` has been
+    answering in those terms since it was written - "'x' is archived, so it
+    is not an agent this project still runs", remedy "Restore the agent,
+    then test it".
+
+    A 409 rather than a 404 for the same reason `not_a_test_harness` gives:
+    the row is there, the caller may read it - `GET` answers for an archived
+    agent, and for an archived workflow since stage A - and it belongs to
+    something. An unknown id is still a 404, which is what keeps the pair
+    meaningful.
+
+    The id goes in the error's context, which is the log; the body carries
+    `LOCATOR_KEYS` and nothing else, so no caller learns anything here it
+    did not already have.
+    """
+    if row.archived_at is None:
+        return
+    raise ConflictError(
+        f"This {kind} is archived and must be restored before it can be {doing}",
+        **{f"{kind}_id": str(row.id)},
+    )
+
+
+def already_archived(row: Agent | Workflow, *, kind: str) -> None:
+    """Refuse archiving something that is already archived.
+
+    A separate sentence, because the remedy is not "restore it first" - the
+    caller asked for the state the row is already in. 409 rather than the
+    404 this used to be: "not found" about a row the caller can read is the
+    answer stage C exists to stop giving.
+    """
+    if row.archived_at is None:
+        return
+    raise ConflictError(
+        f"This {kind} is already archived",
+        **{f"{kind}_id": str(row.id)},
+    )
 
 
 def not_a_test_harness(workflow: Workflow, *, doing: str) -> None:
