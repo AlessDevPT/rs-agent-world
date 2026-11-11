@@ -19,7 +19,7 @@ import datetime as dt
 from typing import Annotated, Any
 from uuid import UUID
 
-from fastapi import APIRouter, status
+from fastapi import APIRouter, Query, status
 from pydantic import BaseModel, ConfigDict, Field
 
 from agentworld.api.deps import (
@@ -377,9 +377,19 @@ class ValidationView(BaseModel):
 
 @workflows_router.get("", response_model=list[WorkflowView], summary="Workflows in a project")
 async def list_workflows(
-    project_id: UUID, principal: CurrentUser, service: WorkflowServiceDep
+    project_id: UUID,
+    principal: CurrentUser,
+    service: WorkflowServiceDep,
+    include_archived: Annotated[bool, Query()] = False,
 ) -> list[WorkflowView]:
-    return [WorkflowView.of(w) for w in await service.list_in(principal, project_id)]
+    """Authored workflows, oldest first. Harnesses are never listed.
+
+    `include_archived=true` is how a client finds a workflow to restore,
+    and the only way to reach one without having kept its id. It is the
+    agent listing's parameter, spelled the same way.
+    """
+    workflows = await service.list_in(principal, project_id, include_archived=include_archived)
+    return [WorkflowView.of(w) for w in workflows]
 
 
 @workflows_router.post(
@@ -435,6 +445,32 @@ async def update_workflow(
     """
     workflow = await service.update(principal, context, project_id, workflow_id, **body.sent())
     return WorkflowView.of(workflow)
+
+
+@workflows_router.post(
+    "/{workflow_id}/restore",
+    response_model=WorkflowView,
+    summary="Restore an archived workflow",
+    description=(
+        "`admin`, like archiving. The workflow returns with its published versions, its "
+        "open draft and the version its pointer named, so it is runnable again at once - "
+        "and nothing here publishes or starts anything. A workflow that is not archived "
+        "is a `404`."
+    ),
+)
+async def restore_workflow(
+    project_id: UUID,
+    workflow_id: UUID,
+    principal: CurrentUser,
+    context: CallContextDep,
+    service: WorkflowServiceDep,
+) -> WorkflowView:
+    """The inverse of `DELETE`, and an action rather than a field.
+
+    `WorkflowUpdate` has no `archived_at`: the lifecycle is verbs, and this
+    is the one that was missing.
+    """
+    return WorkflowView.of(await service.restore(principal, context, project_id, workflow_id))
 
 
 @workflows_router.get("/{workflow_id}", response_model=WorkflowView, summary="One workflow")

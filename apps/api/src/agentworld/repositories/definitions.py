@@ -286,6 +286,39 @@ class AgentRepository(ScopedRepository):
             )
         )
 
+    async def restore(self, agent_id: UUID) -> bool:
+        """Bring an archived agent back, with nothing else changed.
+
+        `archived_at IS NOT NULL`, so restoring a live agent is false rather
+        than a silent no-op - the service turns that into the same 404 a
+        second `archive` gets, because "restore this" about something that
+        was never away is a caller who believes something that is not true.
+
+        One column. No `status`, no `last_heartbeat_at`, no `capabilities`,
+        no `current_task_id`: those are folded from events and this is not an
+        event. An agent archived while `working` comes back saying
+        `working`, with the heartbeat it last sent - which is honest, and
+        which `AgentView` already shows a reader. Writing a status here
+        would be this class inventing one, and `update` refuses to do that
+        for the same reason.
+
+        There is no identity to re-check. `key_taken` counts archived rows,
+        so the archived row has held its `agent_key` all along and
+        `agents_project_key_key` cannot refuse this.
+        """
+        return bool(
+            await _rows(
+                self._session,
+                sa.update(m.Agent)
+                .where(
+                    m.Agent.id == agent_id,
+                    m.Agent.project_id == self.scope.require_project(),
+                    m.Agent.archived_at.is_not(None),
+                )
+                .values(archived_at=None),
+            )
+        )
+
     async def profile_in_use(self, profile_id: UUID) -> bool:
         """Whether any agent in this workspace still names that profile.
 
@@ -606,24 +639,30 @@ class WorkflowRepository(ScopedRepository):
         ).scalar_one_or_none()
         return _to_workflow(row) if row is not None else None
 
-    async def list_all(self) -> Sequence[Workflow]:
+    async def list_all(self, *, include_archived: bool = False) -> Sequence[Workflow]:
         """Every workflow somebody authored, newest last.
 
-        Test harnesses are excluded. They are real workflows and they run on
-        the ordinary orchestrator, but nobody drew them and nobody edits
-        them: listing one next to a person's own workflows would invite
-        exactly the hand-editing that `save_draft` refuses. `get` still
-        finds one by id, because publishing and running it are how a test
-        happens.
+        Test harnesses are excluded in both modes. They are real workflows
+        and they run on the ordinary orchestrator, but nobody drew them and
+        nobody edits them: listing one next to a person's own workflows
+        would invite exactly the hand-editing that `save_draft` refuses.
+        `get` still finds one by id, because publishing and running it are
+        how a test happens - and since Stage A it says that it is one.
+
+        `include_archived` is what makes restoring a workflow possible: a
+        caller cannot restore what it cannot find, and before this the only
+        way to reach an archived workflow was to have kept its id. The
+        parameter, its name and its default are the agent listing's, so a
+        client meets one convention rather than two.
         """
+        conditions = [
+            m.Workflow.project_id == self.scope.require_project(),
+            m.Workflow.test_for_agent_id.is_(None),
+        ]
+        if not include_archived:
+            conditions.append(m.Workflow.archived_at.is_(None))
         rows = await self._session.execute(
-            sa.select(m.Workflow)
-            .where(
-                m.Workflow.project_id == self.scope.require_project(),
-                m.Workflow.archived_at.is_(None),
-                m.Workflow.test_for_agent_id.is_(None),
-            )
-            .order_by(m.Workflow.created_at)
+            sa.select(m.Workflow).where(*conditions).order_by(m.Workflow.created_at)
         )
         return [_to_workflow(row) for row in rows.scalars().all()]
 
@@ -1020,6 +1059,40 @@ class WorkflowRepository(ScopedRepository):
         ).scalar_one()
         return await self._new_version(
             workflow_id, version=after + 1, graph=previous, created_by_user_id=None
+        )
+
+    async def restore(self, workflow_id: UUID) -> bool:
+        """Bring an archived workflow back, with nothing else changed.
+
+        A harness is excluded here as it is in `archive`, and the exclusion
+        can never fire: a harness cannot be archived, so there is none to
+        restore. It is in the statement anyway, because the pair of verbs
+        should be refusable by the same predicate rather than by a reader
+        remembering which one needed it.
+
+        Nothing about the versions. `archive` never touched them, so a
+        restored workflow comes back with its history, its open draft and
+        the `current_version_id` it had - immediately runnable at the
+        version it was runnable at. `workflow_versions_open_draft_key` does
+        not look at `workflows.archived_at`, so the draft was never in
+        question either.
+
+        `slug_taken` counts archived rows, so `workflows_project_slug_key`
+        cannot refuse this: the row has held its slug since the day it was
+        archived.
+        """
+        return bool(
+            await _rows(
+                self._session,
+                sa.update(m.Workflow)
+                .where(
+                    m.Workflow.id == workflow_id,
+                    m.Workflow.project_id == self.scope.require_project(),
+                    m.Workflow.archived_at.is_not(None),
+                    m.Workflow.test_for_agent_id.is_(None),
+                )
+                .values(archived_at=None),
+            )
         )
 
     async def archive(self, workflow_id: UUID) -> bool:

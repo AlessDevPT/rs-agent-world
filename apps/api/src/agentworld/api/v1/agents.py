@@ -342,6 +342,32 @@ async def archive_agent(
 
 
 @project_router.post(
+    "/{agent_id}/restore",
+    response_model=AgentView,
+    summary="Restore an archived agent",
+    description=(
+        "`admin`, like archiving. The agent returns with the status and heartbeat it had "
+        "when it was archived - nothing derived is rewritten, so `last_heartbeat_at` is "
+        "how a reader judges whether it is really back. Workflows that name it can run "
+        "again; none of them is started. An agent that is not archived is a `404`."
+    ),
+)
+async def restore_agent(
+    project_id: UUID,
+    agent_id: UUID,
+    principal: CurrentUser,
+    context: CallContextDep,
+    service: AgentServiceDep,
+) -> AgentView:
+    """The inverse of `DELETE`, and an action rather than a field.
+
+    `AgentUpdate` has no `archived_at` for the same reason it has no
+    `status`: the lifecycle is verbs, not columns a client can assign.
+    """
+    return AgentView.of(await service.restore(principal, context, project_id, agent_id))
+
+
+@project_router.post(
     "/{agent_id}/test",
     response_model=ExecutionView,
     status_code=status.HTTP_202_ACCEPTED,

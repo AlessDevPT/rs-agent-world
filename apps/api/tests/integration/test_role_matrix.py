@@ -35,6 +35,16 @@ class Endpoint:
     path: str
     minimum: MemberRole
     body: dict[str, Any] | None = None
+    #: What a *permitted* caller gets here, when it is not a success.
+    #:
+    #: One shape of endpoint needs this: a verb whose precondition the
+    #: scenario deliberately does not meet. `POST .../restore` is the
+    #: example - the scenario's agent and workflow are live, so a permitted
+    #: caller gets the 404 that restoring something never archived earns,
+    #: while a member and a viewer still get 403. Leaving it unset asserts
+    #: the usual `< 400`; setting it keeps the privilege half of the row
+    #: honest without archiving a fixture every other row depends on.
+    permitted: int | None = None
 
     def __str__(self) -> str:  # keeps pytest ids readable
         return f"{self.method} {self.path}"
@@ -100,6 +110,17 @@ ENDPOINTS = [
         {"display_name": "Renamed"},
     ),
     Endpoint("DELETE", "/v1/projects/{project}/agents/{agent}", MemberRole.ADMIN),
+    # Restoring is `admin` like archiving. The scenario's agent is live, so
+    # a permitted caller meets the 404 that restoring something never
+    # archived earns - which is what `permitted` is for: this row proves a
+    # member and a viewer are refused with 403 instead, and
+    # `test_restore.py` covers the successful restore.
+    Endpoint(
+        "POST",
+        "/v1/projects/{project}/agents/{agent}/restore",
+        MemberRole.ADMIN,
+        permitted=404,
+    ),
     # `member`, and sensitive: a test run spends money. It also creates and
     # publishes the agent's one-step harness on first use, so the roles for
     # `workflow.create`, `workflow.publish` and `workflow.run` have to admit
@@ -185,6 +206,12 @@ ENDPOINTS = [
     ),
     Endpoint("POST", "/v1/projects/{project}/workflows/{workflow}/validate", MemberRole.MEMBER),
     Endpoint("DELETE", "/v1/projects/{project}/workflows/{workflow}", MemberRole.ADMIN),
+    Endpoint(
+        "POST",
+        "/v1/projects/{project}/workflows/{workflow}/restore",
+        MemberRole.ADMIN,
+        permitted=404,
+    ),
     # ---- Phase 3 / T1 ------------------------------------------------------
     # Every credential route is `admin`, and the table is uniform on purpose:
     # there is no viewer row, no member row, and no row at any role that
@@ -456,10 +483,16 @@ def test_role_matrix(
     )
 
     if role.at_least(endpoint.minimum):
-        assert response.status_code < 400, (
-            f"{role.value} should be allowed to {endpoint}, got "
-            f"{response.status_code}: {response.text}"
-        )
+        if endpoint.permitted is not None:
+            assert response.status_code == endpoint.permitted, (
+                f"{role.value} should reach {endpoint} and meet "
+                f"{endpoint.permitted}, got {response.status_code}: {response.text}"
+            )
+        else:
+            assert response.status_code < 400, (
+                f"{role.value} should be allowed to {endpoint}, got "
+                f"{response.status_code}: {response.text}"
+            )
     else:
         # 403, specifically: the caller is a member, so the workspace's
         # existence is not a secret from them and a 404 would be misleading.

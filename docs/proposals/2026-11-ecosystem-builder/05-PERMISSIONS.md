@@ -297,6 +297,13 @@ of it.
 > endpoint had none to ask for and did not exist. It is distinct from
 > `workflow.update_draft` because renaming a workflow changes what it is called and
 > nothing about what it would do.
+>
+> **Implementation note, task 3 stage C.** The 80th and 81st are `agent.restore` and
+> `workflow.restore`, both at `admin`, mirroring the two archives. This document designed
+> archiving as one-way, and the gap showed up as two compiler remedies — "Restore the
+> agent, then test it" — naming an action no endpoint could perform. Restoring is `admin`
+> because a restored managed agent can be dispatched again, and separate per entity
+> because the two archives are. Workspace and project restoration remain unimplemented.
 
 Phase 1 already built the two mechanisms, and they generalise without change:
 

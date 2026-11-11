@@ -95,9 +95,14 @@ class WorkspaceRepository(GlobalRepository):
     async def slug_taken(self, slug: str) -> bool:
         """Whether the slug is in use, including by an archived workspace.
 
-        Archived rows still hold their slug: during the grace period the
-        workspace can be restored, and a slug reused in the meantime would
-        make that impossible.
+        Archived rows still hold their slug. **Workspace restoration is not
+        implemented**: there is no endpoint, service or repository method
+        for it, and an archived workspace's contents are unreachable anyway,
+        because every project-nested route resolves its workspace through a
+        lookup that excludes archived projects. Holding the slug is what
+        would make a restore possible if one is ever built - task 3 stage C
+        built the agent and workflow ones on exactly that property - and
+        until then it only means a slug cannot be reused.
         """
         found = (
             await self._session.execute(

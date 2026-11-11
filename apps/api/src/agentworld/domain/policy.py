@@ -72,6 +72,10 @@ class Action(StrEnum):
     AGENT_UPDATE = "agent.update"
     AGENT_CONFIGURE = "agent.configure"
     AGENT_ARCHIVE = "agent.archive"
+    #: The inverse of `agent.archive`, and `admin` for the same reason: a
+    #: restored managed agent can be dispatched again, so bringing one back
+    #: is as privileged as putting it away.
+    AGENT_RESTORE = "agent.restore"
     AGENT_PAUSE = "agent.pause"
     AGENT_TEST = "agent.test"
     AGENT_READ_RUNS = "agent.read_runs"
@@ -92,6 +96,7 @@ class Action(StrEnum):
     WORKFLOW_VALIDATE = "workflow.validate"
     WORKFLOW_PUBLISH = "workflow.publish"
     WORKFLOW_ARCHIVE = "workflow.archive"
+    WORKFLOW_RESTORE = "workflow.restore"
     WORKFLOW_RUN = "workflow.run"
 
     EXECUTION_READ = "execution.read"
@@ -185,6 +190,7 @@ MINIMUM_ROLE: dict[Action, MemberRole] = {
     # Model profile, overrides and dispatch: spends money and reaches out.
     Action.AGENT_CONFIGURE: MemberRole.ADMIN,
     Action.AGENT_ARCHIVE: MemberRole.ADMIN,
+    Action.AGENT_RESTORE: MemberRole.ADMIN,
     Action.AGENT_PAUSE: MemberRole.MEMBER,
     Action.AGENT_TEST: MemberRole.MEMBER,
     Action.AGENT_READ_RUNS: MemberRole.VIEWER,
@@ -203,6 +209,7 @@ MINIMUM_ROLE: dict[Action, MemberRole] = {
     # authorized separately. Running it *autonomously* is `trigger.enable`.
     Action.WORKFLOW_PUBLISH: MemberRole.MEMBER,
     Action.WORKFLOW_ARCHIVE: MemberRole.ADMIN,
+    Action.WORKFLOW_RESTORE: MemberRole.ADMIN,
     Action.WORKFLOW_RUN: MemberRole.MEMBER,
     Action.EXECUTION_READ: MemberRole.VIEWER,
     Action.EXECUTION_CANCEL: MemberRole.MEMBER,

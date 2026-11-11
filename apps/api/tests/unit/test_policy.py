@@ -352,8 +352,16 @@ def test_the_matrix_is_the_size_the_proposal_says_it_is() -> None:
     # stage B) for a workflow's name and description. The proposal designed
     # `PATCH /v1/workflows/{id}` in `03-API-AND-FRONTEND.md` but enumerated
     # no action for it, which is how the endpoint came to be missing.
-    added_after_the_proposal = {Action.DISPATCH_RESOLVE_REVIEW, Action.WORKFLOW_UPDATE}
-    assert len(Action) == 79
+    added_after_the_proposal = {
+        Action.DISPATCH_RESOLVE_REVIEW,
+        Action.WORKFLOW_UPDATE,
+        # Task 3 stage C. The proposal designed no restore at all: every
+        # archive in `05-PERMISSIONS.md` is one-way, and two compiler
+        # remedies told users to restore an agent that nothing could.
+        Action.AGENT_RESTORE,
+        Action.WORKFLOW_RESTORE,
+    }
+    assert len(Action) == 81
     assert len(Action) - len(phase_one) - len(added_after_the_proposal) == 62
 
 

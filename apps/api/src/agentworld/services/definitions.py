@@ -413,6 +413,52 @@ class AgentService:
             )
             return agent
 
+    async def restore(
+        self,
+        principal: UserPrincipal,
+        context: CallContext,
+        project_id: UUID,
+        agent_id: UUID,
+    ) -> Agent:
+        """Bring an archived agent back. `admin`, like archiving it.
+
+        What this fixes is not only the listing. An archived agent is absent
+        from `facts_and_effects`, so every published workflow naming it
+        fails at decision time with `unknown_agent`, and `agent.test`
+        refuses it with `agent_archived` - a refusal whose own remedy says
+        "Restore the agent, then test it", which until now named something
+        no endpoint could do. Restoring makes those workflows runnable
+        again; it does not run them.
+
+        Nothing derived is written, which is the whole of decision 3: the
+        agent comes back with the status and heartbeat it had, and a reader
+        judges staleness from `last_heartbeat_at` exactly as they must for
+        an agent that stopped reporting without being archived.
+        """
+        async with self._factory.begin(visible_workspaces=set(principal.memberships)) as work:
+            workspace_id = await _workspace_of(work, project_id)
+            authorize(principal, Action.AGENT_RESTORE, Resource(workspace_id))
+            scope = TenantScope(workspace_id, project_id)
+            agents = work.agents(scope)
+            if not await agents.restore(agent_id):
+                # Not archived, not in this project, or not there at all -
+                # one 404, because "restore this" about a live agent is a
+                # caller who believes something untrue either way.
+                raise NotFoundError("Agent not found", agent_id=str(agent_id))
+            agent = await agents.get(agent_id)
+            if agent is None:  # pragma: no cover - the update returned a row
+                raise NotFoundError("Agent not found", agent_id=str(agent_id))
+            await audit.record(
+                work,
+                principal,
+                context,
+                workspace_id=workspace_id,
+                action="agent.restore",
+                resource_type="agent",
+                resource_id=agent_id,
+            )
+            return agent
+
     async def archive(
         self,
         principal: UserPrincipal,
@@ -658,11 +704,19 @@ class WorkflowService:
     def __init__(self, factory: UnitOfWorkFactory) -> None:
         self._factory = factory
 
-    async def list_in(self, principal: UserPrincipal, project_id: UUID) -> Sequence[Workflow]:
+    async def list_in(
+        self,
+        principal: UserPrincipal,
+        project_id: UUID,
+        *,
+        include_archived: bool = False,
+    ) -> Sequence[Workflow]:
         async with self._factory.begin(visible_workspaces=set(principal.memberships)) as work:
             workspace_id = await _workspace_of(work, project_id)
             authorize(principal, Action.WORKFLOW_READ, Resource(workspace_id))
-            return await work.workflows(TenantScope(workspace_id, project_id)).list_all()
+            return await work.workflows(TenantScope(workspace_id, project_id)).list_all(
+                include_archived=include_archived
+            )
 
     async def get(self, principal: UserPrincipal, project_id: UUID, workflow_id: UUID) -> Workflow:
         """One workflow by id, archived ones included.
@@ -973,6 +1027,56 @@ class WorkflowService:
                 metadata={"version": draft.version},
             )
             return draft
+
+    async def restore(
+        self,
+        principal: UserPrincipal,
+        context: CallContext,
+        project_id: UUID,
+        workflow_id: UUID,
+    ) -> Workflow:
+        """Bring an archived workflow back. `admin`, like archiving it.
+
+        It returns runnable, because archiving never made it less so: the
+        pointer, the published versions and the open draft were untouched,
+        and only the row's visibility and its write verbs changed. Nothing
+        here publishes, advances or starts anything.
+
+        A harness is refused by name rather than by accident. One can never
+        be archived, so the repository's predicate would already decline it -
+        but as a 404, which would tell a client that the harness it can read
+        by id is not there. Read first, refuse with the 409 the other three
+        harness verbs give, and the sentence is the one already in use.
+        """
+        async with self._factory.begin(visible_workspaces=set(principal.memberships)) as work:
+            workspace_id = await _workspace_of(work, project_id)
+            authorize(principal, Action.WORKFLOW_RESTORE, Resource(workspace_id))
+            scope = TenantScope(workspace_id, project_id)
+            workflows = work.workflows(scope)
+
+            existing = await workflows.get(workflow_id, include_archived=True)
+            if existing is None:
+                raise NotFoundError("Workflow not found", workflow_id=str(workflow_id))
+            not_a_test_harness(existing, doing="restored")
+
+            if not await workflows.restore(workflow_id):
+                # Readable, not a harness, and not archived: "restore this"
+                # about a live workflow is the same 404 a second `archive`
+                # of an archived one gets.
+                raise NotFoundError("Workflow not found", workflow_id=str(workflow_id))
+            workflow = await workflows.get(workflow_id)
+            if workflow is None:  # pragma: no cover - the update returned a row
+                raise NotFoundError("Workflow not found", workflow_id=str(workflow_id))
+            await audit.record(
+                work,
+                principal,
+                context,
+                workspace_id=workspace_id,
+                action="workflow.restore",
+                resource_type="workflow",
+                resource_id=workflow_id,
+            )
+            return workflow
 
     async def archive(
         self,
