@@ -28,6 +28,7 @@ from agentworld.domain.entities import (
     ModelProfile,
     Workflow,
     WorkflowDraft,
+    WorkflowVersion,
 )
 from agentworld.domain.enums import AgentInteractionMode, ConnectionKind, SideEffect
 from agentworld.repositories import models as m
@@ -548,15 +549,30 @@ class WorkflowRepository(ScopedRepository):
         )
         return _to_workflow(workflow), draft
 
-    async def get(self, workflow_id: UUID) -> Workflow | None:
+    async def get(self, workflow_id: UUID, *, include_archived: bool = False) -> Workflow | None:
+        """One workflow by id, archived rows excluded by default.
+
+        The default is what every lifecycle verb wants. `save_draft`,
+        `publish`, `start`, `validate` and `archive` all read through here,
+        and an archived workflow is not something any of them may touch - so
+        the filter lives in one place rather than in five, and each of them
+        raises the 404 it already raised.
+
+        `include_archived=True` belongs to the read surface, and matches
+        `AgentRepository.get`'s own default-off switch: `GET
+        /workflows/{id}` answers with `archived_at` set rather than
+        pretending the row is gone, so a client can say "archived" instead
+        of "not found" about a workflow it can still see in an execution's
+        `workflow_id`.
+        """
+        conditions = [
+            m.Workflow.id == workflow_id,
+            m.Workflow.project_id == self.scope.require_project(),
+        ]
+        if not include_archived:
+            conditions.append(m.Workflow.archived_at.is_(None))
         row = (
-            await self._session.execute(
-                sa.select(m.Workflow).where(
-                    m.Workflow.id == workflow_id,
-                    m.Workflow.project_id == self.scope.require_project(),
-                    m.Workflow.archived_at.is_(None),
-                )
-            )
+            await self._session.execute(sa.select(m.Workflow).where(*conditions))
         ).scalar_one_or_none()
         return _to_workflow(row) if row is not None else None
 
@@ -883,6 +899,39 @@ class WorkflowRepository(ScopedRepository):
         ).scalar_one_or_none()
         return _to_draft(row) if row is not None else None
 
+    async def published_versions(self, workflow_id: UUID) -> Sequence[WorkflowVersion]:
+        """Every published version of this workflow, newest first.
+
+        `published_at IS NOT NULL` is the whole of "history", and it is also
+        why a draft cannot appear in one: every publish opens the next draft
+        behind itself, so a workflow that has been published even once
+        always has an unpublished row, and that row is the thing somebody is
+        still editing. Migration 0018 makes a published row immutable, so
+        what this returns cannot change afterwards - only grow.
+
+        Ordered by `version`, not by `published_at`. The number is unique
+        per workflow (`workflow_versions_number_key`), so it is a total
+        order and the sequence is the same on every call; two rows can share
+        a timestamp, and an order that left the tie to the planner would not
+        be stable.
+
+        Unbounded, unlike the execution listings. A version exists because
+        somebody pressed Publish, so the count is human-paced, and each row
+        here is four scalars rather than a graph - whereas a cap would
+        silently drop the *oldest* versions, which is the half of history a
+        reader cannot reconstruct from anywhere else.
+        """
+        rows = await self._session.execute(
+            sa.select(m.WorkflowVersion)
+            .where(
+                m.WorkflowVersion.workflow_id == workflow_id,
+                m.WorkflowVersion.project_id == self.scope.require_project(),
+                m.WorkflowVersion.published_at.is_not(None),
+            )
+            .order_by(m.WorkflowVersion.version.desc())
+        )
+        return [_to_version(row) for row in rows.scalars().all()]
+
     async def published_version_by_id(
         self, workflow_id: UUID, *, version_id: UUID
     ) -> WorkflowDraft | None:
@@ -1020,6 +1069,23 @@ def _to_workflow(row: m.Workflow) -> Workflow:
         test_for_agent_id=row.test_for_agent_id,
         created_at=row.created_at,
         archived_at=row.archived_at,
+    )
+
+
+def _to_version(row: m.WorkflowVersion) -> WorkflowVersion:
+    """A published version row, without its graph.
+
+    The assertion is the predicate `published_versions` selects on, restated
+    where the type demands it: a `WorkflowVersion` with no `published_at`
+    would be a draft wearing the wrong name.
+    """
+    assert row.published_at is not None, "only published rows become a WorkflowVersion"
+    return WorkflowVersion(
+        id=row.id,
+        workflow_id=row.workflow_id,
+        version=row.version,
+        published_at=row.published_at,
+        created_at=row.created_at,
     )
 
 

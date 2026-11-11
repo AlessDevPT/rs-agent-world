@@ -148,6 +148,12 @@ ENDPOINTS = [
         MemberRole.MEMBER,
         {"name": "Matrix Workflow"},
     ),
+    Endpoint("GET", "/v1/projects/{project}/workflows/{workflow}", MemberRole.VIEWER),
+    Endpoint("GET", "/v1/projects/{project}/workflows/{workflow}/versions", MemberRole.VIEWER),
+    # `workflow.read` *and* `execution.read`, both viewer. The row below
+    # proves the route asks for no more than a viewer has; which two it
+    # asks for is `test_workflow_reads.py`'s.
+    Endpoint("GET", "/v1/projects/{project}/workflows/{workflow}/executions", MemberRole.VIEWER),
     Endpoint("GET", "/v1/projects/{project}/workflows/{workflow}/draft", MemberRole.VIEWER),
     Endpoint(
         "PUT",

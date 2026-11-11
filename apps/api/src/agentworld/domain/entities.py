@@ -318,3 +318,29 @@ class WorkflowDraft:
     @property
     def is_published(self) -> bool:
         return self.published_at is not None
+
+
+@dataclass(frozen=True, slots=True)
+class WorkflowVersion:
+    """A published version read as history rather than as a graph to run.
+
+    The same row `WorkflowDraft` carries, minus the graph. A draft is read
+    for its `graph` because that is what the editor saves and what the
+    orchestrator folds; a version is read for what it says about the
+    workflow's past - which version, frozen when - and a list of whole
+    graphs would be a large answer to that small question. The one version
+    something actually executes is still read through
+    `published_version_by_id`, which returns the graph because it is about
+    to be run.
+
+    `published_at` is not optional here, unlike on the draft: the only query
+    that builds one of these filters on `published_at IS NOT NULL`, so the
+    type carries the predicate instead of leaving every reader to re-check
+    it.
+    """
+
+    id: UUID
+    workflow_id: UUID
+    version: int
+    published_at: datetime
+    created_at: datetime | None = None

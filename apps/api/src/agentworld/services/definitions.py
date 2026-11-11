@@ -30,6 +30,7 @@ from agentworld.domain.entities import (
     ModelProfile,
     Workflow,
     WorkflowDraft,
+    WorkflowVersion,
 )
 from agentworld.domain.enums import (
     AgentInteractionMode,
@@ -472,6 +473,53 @@ class WorkflowService:
             workspace_id = await _workspace_of(work, project_id)
             authorize(principal, Action.WORKFLOW_READ, Resource(workspace_id))
             return await work.workflows(TenantScope(workspace_id, project_id)).list_all()
+
+    async def get(self, principal: UserPrincipal, project_id: UUID, workflow_id: UUID) -> Workflow:
+        """One workflow by id, archived ones included.
+
+        `include_archived=True`, matching `AgentService.get`: the row is
+        readable, so the answer can say that it is archived rather than that
+        it is missing. The lifecycle verbs keep the repository's default and
+        still refuse an archived workflow with a 404 - this read is the only
+        caller that asks to see one.
+
+        A harness is readable here too, and says so. It is excluded from
+        `list_in` because nobody drew it, but an execution names it, and a
+        client holding that `workflow_id` has to be able to find out what it
+        is holding without provoking a 409.
+        """
+        async with self._factory.begin(visible_workspaces=set(principal.memberships)) as work:
+            workspace_id = await _workspace_of(work, project_id)
+            authorize(principal, Action.WORKFLOW_READ, Resource(workspace_id))
+            scope = TenantScope(workspace_id, project_id)
+            workflow = await work.workflows(scope).get(workflow_id, include_archived=True)
+            if workflow is None:
+                raise NotFoundError("Workflow not found", workflow_id=str(workflow_id))
+            return workflow
+
+    async def versions(
+        self, principal: UserPrincipal, project_id: UUID, workflow_id: UUID
+    ) -> tuple[Workflow, Sequence[WorkflowVersion]]:
+        """What this workflow has published, and the workflow that names one.
+
+        Both, from one transaction. "Is this the version a run would use" is
+        a fact about `workflows.current_version_id`, and reading the pointer
+        in a second transaction would let a publish land in between - after
+        which the answer could mark two versions current, or none.
+
+        The workflow is read first so that an unknown id is a 404 rather
+        than an empty history, which would say "this workflow has published
+        nothing" about a workflow that does not exist.
+        """
+        async with self._factory.begin(visible_workspaces=set(principal.memberships)) as work:
+            workspace_id = await _workspace_of(work, project_id)
+            authorize(principal, Action.WORKFLOW_READ, Resource(workspace_id))
+            scope = TenantScope(workspace_id, project_id)
+            workflows = work.workflows(scope)
+            workflow = await workflows.get(workflow_id, include_archived=True)
+            if workflow is None:
+                raise NotFoundError("Workflow not found", workflow_id=str(workflow_id))
+            return workflow, await workflows.published_versions(workflow_id)
 
     async def create(
         self,

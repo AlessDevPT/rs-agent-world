@@ -15,6 +15,7 @@ an endpoint whose only effect was to make the draft uneditable.
 
 from __future__ import annotations
 
+import datetime as dt
 from typing import Annotated, Any
 from uuid import UUID
 
@@ -27,7 +28,7 @@ from agentworld.api.deps import (
     CurrentUser,
     WorkflowServiceDep,
 )
-from agentworld.domain.entities import Connection, Workflow, WorkflowDraft
+from agentworld.domain.entities import Connection, Workflow, WorkflowDraft, WorkflowVersion
 from agentworld.domain.enums import ConnectionKind
 from agentworld.domain.orchestration import Code, Severity, ValidationReport
 
@@ -139,12 +140,31 @@ async def delete_connection(
 
 
 class WorkflowView(BaseModel):
+    """What a workflow is, including what kind of workflow it is.
+
+    `is_test_harness` and `test_for_agent_id` are the same fact twice on
+    purpose: the boolean is what a client switches on, and the id is the
+    link back to the agent whose test this runs. Without them a harness is
+    indistinguishable from something a person drew until the caller provokes
+    one of the four 409s, and an execution of one - which carries only a
+    `workflow_id` - cannot be labelled at all.
+
+    No `project_id` or `workspace_id`: both are in the path that returned
+    this, and the id of a tenant a caller is already inside is not news.
+    """
+
     id: UUID
     slug: str
     name: str
     description: str | None = None
     current_version_id: UUID | None = None
     enabled: bool = False
+    is_test_harness: bool = False
+    test_for_agent_id: UUID | None = None
+    created_at: dt.datetime | None = None
+    #: Set means archived: absent from the listing, refused by every
+    #: lifecycle verb, and still readable here so a client can say so.
+    archived_at: dt.datetime | None = None
 
     @classmethod
     def of(cls, workflow: Workflow) -> WorkflowView:
@@ -155,6 +175,40 @@ class WorkflowView(BaseModel):
             description=workflow.description,
             current_version_id=workflow.current_version_id,
             enabled=workflow.enabled,
+            is_test_harness=workflow.is_test_harness,
+            test_for_agent_id=workflow.test_for_agent_id,
+            created_at=workflow.created_at,
+            archived_at=workflow.archived_at,
+        )
+
+
+class VersionView(BaseModel):
+    """One published version, as history.
+
+    No graph, deliberately: the editor reads the open draft through `GET
+    …/draft`, a running execution is bound to its own frozen version, and
+    nothing a *history* answers needs every graph a workflow has ever had.
+
+    `is_current` is the field this list exists for. It marks the one version
+    `workflows.current_version_id` names, which is the version `POST /run`
+    would execute - the question "which of these is live" has no other
+    answer a client could compute from the rest of the row.
+    """
+
+    id: UUID
+    version: int
+    published_at: dt.datetime
+    created_at: dt.datetime | None = None
+    is_current: bool = False
+
+    @classmethod
+    def of(cls, version: WorkflowVersion, *, current_version_id: UUID | None) -> VersionView:
+        return cls(
+            id=version.id,
+            version=version.version,
+            published_at=version.published_at,
+            created_at=version.created_at,
+            is_current=version.id == current_version_id,
         )
 
 
@@ -264,6 +318,48 @@ async def create_workflow(
         graph=body.graph,
     )
     return WorkflowCreated(workflow=WorkflowView.of(workflow), draft=DraftView.of(draft))
+
+
+@workflows_router.get("/{workflow_id}", response_model=WorkflowView, summary="One workflow")
+async def get_workflow(
+    project_id: UUID,
+    workflow_id: UUID,
+    principal: CurrentUser,
+    service: WorkflowServiceDep,
+) -> WorkflowView:
+    """The workflow itself, which the collection listing could not answer for.
+
+    Readable for an archived workflow and for an agent's test harness, both
+    of which are absent from `GET /workflows` - the first because it is over
+    and the second because nobody drew it. An execution carries a
+    `workflow_id` and nothing else, so without this route a client could not
+    name the workflow its own run belongs to.
+    """
+    return WorkflowView.of(await service.get(principal, project_id, workflow_id))
+
+
+@workflows_router.get(
+    "/{workflow_id}/versions",
+    response_model=list[VersionView],
+    summary="What this workflow has published",
+)
+async def list_versions(
+    project_id: UUID,
+    workflow_id: UUID,
+    principal: CurrentUser,
+    service: WorkflowServiceDep,
+) -> list[VersionView]:
+    """Published versions, newest first, with the live one marked.
+
+    Drafts are not versions here: a workflow always has one open draft after
+    its first publish, and a history that listed it would be reporting
+    something still being edited as something that was frozen.
+    """
+    workflow, versions = await service.versions(principal, project_id, workflow_id)
+    return [
+        VersionView.of(version, current_version_id=workflow.current_version_id)
+        for version in versions
+    ]
 
 
 @workflows_router.get(

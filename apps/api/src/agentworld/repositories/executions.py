@@ -329,6 +329,35 @@ class ExecutionRepository(ScopedRepository):
         )
         return list(rows.scalars().all())
 
+    async def list_for_workflow(self, workflow_id: UUID, *, limit: int = 50) -> Sequence[Any]:
+        """One workflow's executions, newest first.
+
+        The same rows, the same shape and the same cap as
+        `list_in_project` - a caller reading a workflow's history should not
+        meet a second set of conventions - narrowed by `workflow_id` and
+        still scoped to the project, so the tenant predicate holds whatever
+        workflow id is passed in.
+
+        `id` breaks a tie on `created_at`, which the project-wide listing
+        does not need and this does: `now()` is the transaction's start
+        time, so executions created in one transaction share it exactly, and
+        an order that left them to the planner could return them differently
+        on two calls.
+        """
+        rows = await self._session.execute(
+            sa.select(m.WorkflowExecution)
+            .where(
+                m.WorkflowExecution.project_id == self.scope.require_project(),
+                m.WorkflowExecution.workflow_id == workflow_id,
+            )
+            .order_by(
+                m.WorkflowExecution.created_at.desc(),
+                m.WorkflowExecution.id.desc(),
+            )
+            .limit(limit)
+        )
+        return list(rows.scalars().all())
+
 
 class DispatchRepository(ScopedRepository):
     """The outbox. One method, and it is the only way work comes into being.

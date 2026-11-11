@@ -145,6 +145,32 @@ async def run_workflow(
     return ExecutionView.of(await service.get(principal, project_id, execution_id))
 
 
+@workflow_router.get(
+    "/{workflow_id}/executions",
+    response_model=list[ExecutionView],
+    summary="This workflow's executions",
+    description=(
+        "Newest first, capped like the project-wide listing. The same `ExecutionView`, so "
+        "a client has one shape for both; an unknown workflow is a 404 rather than an "
+        "empty list, which would claim the workflow has never run."
+    ),
+)
+async def list_workflow_executions(
+    project_id: UUID,
+    workflow_id: UUID,
+    principal: CurrentUser,
+    service: ExecutionServiceDep,
+) -> list[ExecutionView]:
+    """This workflow's runs, including an agent test harness's.
+
+    `GET /workflows/{id}` is how a caller finds out which it is looking at:
+    a harness reports `is_test_harness`, so the executions here can be
+    labelled as tests rather than as runs of a workflow nobody can find.
+    """
+    rows = await service.list_for_workflow(principal, project_id, workflow_id)
+    return [ExecutionView.of(row) for row in rows]
+
+
 @router.get(
     "",
     response_model=list[ExecutionView],

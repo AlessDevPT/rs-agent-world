@@ -637,6 +637,34 @@ class ExecutionService:
             authorize(principal, Action.EXECUTION_READ, Resource(workspace_id))
             return await work.executions(TenantScope(workspace_id, project_id)).list_in_project()
 
+    async def list_for_workflow(
+        self, principal: UserPrincipal, project_id: UUID, workflow_id: UUID
+    ) -> Sequence[Any]:
+        """One workflow's executions, newest first.
+
+        Two permissions, in this order, for the two things this reads. Both
+        are `viewer` today, so nobody is refused who could ask the two
+        questions separately; checking both is what keeps that true if
+        either ever stops being `viewer`, and it is the arrangement
+        `compile_delegation` uses for the same reason.
+
+        The workflow is resolved for its own sake rather than trusted as a
+        filter. A workflow id from another project would otherwise come back
+        as an empty list - "this has never run" - about a workflow the
+        caller may not read at all. Archived and harness workflows are
+        included: their runs happened, and a client reading history has more
+        reason to ask about them, not less.
+        """
+        async with self._factory.begin(visible_workspaces=set(principal.memberships)) as work:
+            workspace_id = await _workspace_of(work, project_id)
+            resource = Resource(workspace_id)
+            authorize(principal, Action.WORKFLOW_READ, resource)
+            authorize(principal, Action.EXECUTION_READ, resource)
+            scope = TenantScope(workspace_id, project_id)
+            if await work.workflows(scope).get(workflow_id, include_archived=True) is None:
+                raise NotFoundError("Workflow not found", workflow_id=str(workflow_id))
+            return await work.executions(scope).list_for_workflow(workflow_id)
+
 
 # ----------------------------------------------------------------- helpers ---
 
