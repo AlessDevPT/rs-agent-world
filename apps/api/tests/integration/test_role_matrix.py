@@ -149,6 +149,22 @@ ENDPOINTS = [
         {"name": "Matrix Workflow"},
     ),
     Endpoint("GET", "/v1/projects/{project}/workflows/{workflow}", MemberRole.VIEWER),
+    Endpoint(
+        "PATCH",
+        "/v1/projects/{project}/workflows/{workflow}",
+        MemberRole.MEMBER,
+        {"name": "Renamed by the matrix"},
+    ),
+    # `connection.update` is `member` here because the scenario's
+    # connection grants a read-only tool. The admin half of the rule -
+    # either side of the edit being consequential - is
+    # `test_workflows_api.py`'s, where the config can be chosen.
+    Endpoint(
+        "PATCH",
+        "/v1/projects/{project}/connections/{connection}",
+        MemberRole.MEMBER,
+        {"enabled": True},
+    ),
     Endpoint("GET", "/v1/projects/{project}/workflows/{workflow}/versions", MemberRole.VIEWER),
     # `workflow.read` *and* `execution.read`, both viewer. The row below
     # proves the route asks for no more than a viewer has; which two it

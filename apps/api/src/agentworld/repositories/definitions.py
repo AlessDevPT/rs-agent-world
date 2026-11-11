@@ -576,6 +576,36 @@ class WorkflowRepository(ScopedRepository):
         ).scalar_one_or_none()
         return _to_workflow(row) if row is not None else None
 
+    async def update(self, workflow_id: UUID, **fields: Any) -> Workflow | None:
+        """Change a workflow's metadata. Never its graph, never its pointer.
+
+        There is no parameter for `current_version_id`, `enabled`,
+        `test_for_agent_id` or `archived_at`, so no caller can write them
+        from here: the pointer is `publish`'s, the marker is
+        `find_or_create_test`'s, and `archived_at` is `archive`'s. What this
+        can change is what the workflow is *called*.
+
+        `archived_at IS NULL` in the statement, like `save_draft` and
+        `archive`: an archived workflow is not editable, and the service's
+        read has already turned that into a 404 rather than a silent no-op.
+        """
+        values = {name: value for name, value in fields.items() if value is not UNSET}
+        if not values:
+            return await self.get(workflow_id)
+        row = (
+            await self._session.execute(
+                sa.update(m.Workflow)
+                .where(
+                    m.Workflow.id == workflow_id,
+                    m.Workflow.project_id == self.scope.require_project(),
+                    m.Workflow.archived_at.is_(None),
+                )
+                .values(**values)
+                .returning(m.Workflow)
+            )
+        ).scalar_one_or_none()
+        return _to_workflow(row) if row is not None else None
+
     async def list_all(self) -> Sequence[Workflow]:
         """Every workflow somebody authored, newest last.
 

@@ -345,12 +345,15 @@ def test_the_matrix_is_the_size_the_proposal_says_it_is() -> None:
         if action.value.split(".", 1)[0] in {"workspace", "member", "project", "api_key"}
     }
     assert len(phase_one) == 15
-    # 77 in the proposal. `dispatch.resolve_review` is the 78th, added in
-    # T6b for the one state that needs a human: a dispatch whose outcome
-    # nobody knows. It is counted separately rather than folded into the
-    # Phase 2 total, so the number the documents quote stays checkable.
-    added_after_the_proposal = {Action.DISPATCH_RESOLVE_REVIEW}
-    assert len(Action) == 78
+    # 77 in the proposal. Two actions were added after it and are counted
+    # separately, so the number the documents quote stays checkable:
+    # `dispatch.resolve_review` (T6b) for the one state that needs a human -
+    # a dispatch whose outcome nobody knows - and `workflow.update` (task 3
+    # stage B) for a workflow's name and description. The proposal designed
+    # `PATCH /v1/workflows/{id}` in `03-API-AND-FRONTEND.md` but enumerated
+    # no action for it, which is how the endpoint came to be missing.
+    added_after_the_proposal = {Action.DISPATCH_RESOLVE_REVIEW, Action.WORKFLOW_UPDATE}
+    assert len(Action) == 79
     assert len(Action) - len(phase_one) - len(added_after_the_proposal) == 62
 
 

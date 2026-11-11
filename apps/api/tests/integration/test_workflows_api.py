@@ -167,6 +167,276 @@ async def test_an_unrecognised_side_effect_is_treated_as_consequential(
     assert response.status_code == 403
 
 
+def patch_connection(
+    client: TestClient, project: Project, actor: Actor, connection_id: str, body: Any
+) -> Any:
+    return client.patch(
+        f"/v1/projects/{project.id}/connections/{connection_id}",
+        json=body,
+        headers=actor.headers,
+    )
+
+
+def test_a_grant_can_be_switched_off_and_stops_counting(
+    client: TestClient, project: Project, actor: Actor
+) -> None:
+    """`enabled=false` takes effect on the next read, not on a restart.
+
+    Proved through `validate`, which is what the orchestrator's own grant
+    lookup answers: the tool was granted, the workflow validated cleanly,
+    and switching the grant off makes the same draft report
+    `tool_not_granted`.
+    """
+    agent = make_agent(client, project, actor, "writer")
+    connection = grant(client, project, actor, agent["id"], "send_slack_message", "write").json()
+    created = make_workflow(
+        client,
+        project,
+        actor,
+        {
+            "steps": [
+                {
+                    "step_key": "post",
+                    "kind": "agent_task",
+                    "agent_key": "writer",
+                    "tool_name": "send_slack_message",
+                }
+            ],
+            "edges": [],
+        },
+    )
+    workflow_id = created["workflow"]["id"]
+    assert not [
+        f
+        for f in validate(client, project, actor, workflow_id)["findings"]
+        if f["code"] == "tool_not_granted"
+    ]
+
+    response = patch_connection(client, project, actor, connection["id"], {"enabled": False})
+
+    assert response.status_code == 200, response.text
+    assert response.json()["enabled"] is False
+    assert any(
+        f["code"] == "tool_not_granted"
+        for f in validate(client, project, actor, workflow_id)["findings"]
+    )
+
+
+def test_the_ends_of_a_connection_are_refused_by_name(
+    client: TestClient, project: Project, actor: Actor
+) -> None:
+    """422: a connection with a different end is a different connection.
+
+    `kind`, `source_*` and `target_*` are together `connections_edge_key`,
+    so repointing a grant is a delete and a create - each with its own
+    authorization and its own audit row.
+    """
+    agent = make_agent(client, project, actor, "researcher")
+    connection = grant(client, project, actor, agent["id"], "web_search").json()
+
+    for body in (
+        {"kind": "delegate"},
+        {"source_id": str(uuid.uuid4())},
+        {"source_kind": "workflow"},
+        {"target_id": str(uuid.uuid4())},
+        {"target_kind": "agent"},
+    ):
+        response = patch_connection(client, project, actor, connection["id"], body)
+        assert response.status_code == 422, f"{body}: {response.text}"
+        assert next(iter(body)) in response.text
+
+
+def test_the_config_is_replaced_whole(client: TestClient, project: Project, actor: Actor) -> None:
+    """One decision, not two halves merged into a permission nobody chose."""
+    agent = make_agent(client, project, actor, "researcher")
+    connection = grant(client, project, actor, agent["id"], "web_search", "read").json()
+
+    updated = patch_connection(
+        client,
+        project,
+        actor,
+        connection["id"],
+        {"config": {"tool_name": "web_search"}, "requires_approval": True},
+    )
+
+    assert updated.status_code == 200, updated.text
+    assert updated.json()["config"] == {"tool_name": "web_search"}, "no leftover side_effect"
+    assert updated.json()["requires_approval"] is True
+    assert updated.json()["enabled"] is True, "absent means leave it alone"
+
+
+async def test_a_member_may_edit_a_harmless_grant(
+    client: TestClient,
+    project: Project,
+    actor: Actor,
+    make_actor: Any,
+    owner_database: Database,
+) -> None:
+    agent = make_agent(client, project, actor, "researcher")
+    connection = grant(client, project, actor, agent["id"], "web_search", "read").json()
+    member = make_actor("patch-member@example.com")
+    await _join(owner_database, project, member.user_id, member.email, "member")
+
+    response = patch_connection(client, project, member, connection["id"], {"enabled": False})
+
+    assert response.status_code == 200, response.text
+
+
+async def test_a_member_may_not_make_a_grant_consequential(
+    client: TestClient,
+    project: Project,
+    actor: Actor,
+    make_actor: Any,
+    owner_database: Database,
+) -> None:
+    """The incoming half of the elevation: granting is an admin act.
+
+    The same rule `connection.create` enforces, now on the verb that could
+    otherwise reach the same state in two steps.
+    """
+    agent = make_agent(client, project, actor, "writer")
+    connection = grant(client, project, actor, agent["id"], "web_search", "read").json()
+    member = make_actor("widen-member@example.com")
+    await _join(owner_database, project, member.user_id, member.email, "member")
+
+    refused = patch_connection(
+        client,
+        project,
+        member,
+        connection["id"],
+        {"config": {"tool_name": "send_slack_message", "side_effect": "consequential"}},
+    )
+
+    assert refused.status_code == 403, refused.text
+    assert "connection.update" in refused.json()["detail"]
+    listed = client.get(f"/v1/projects/{project.id}/connections", headers=actor.headers).json()
+    assert listed[0]["config"] == {"tool_name": "web_search", "side_effect": "read"}
+
+
+async def test_a_member_may_not_edit_a_grant_that_is_already_consequential(
+    client: TestClient,
+    project: Project,
+    actor: Actor,
+    make_actor: Any,
+    owner_database: Database,
+) -> None:
+    """The stored half, which is the direction a config rewrite would hide.
+
+    A member replacing a consequential grant's config with a harmless one is
+    still editing a capability they may not grant - the config is the whole
+    of what the grant permits, so "what it will be" cannot be the only thing
+    the check looks at.
+    """
+    agent = make_agent(client, project, actor, "writer")
+    connection = grant(
+        client, project, actor, agent["id"], "send_slack_message", "consequential"
+    ).json()
+    member = make_actor("narrow-member@example.com")
+    await _join(owner_database, project, member.user_id, member.email, "member")
+
+    for body in (
+        {"config": {"tool_name": "web_search", "side_effect": "read"}},
+        {"enabled": False},
+        {"requires_approval": False},
+    ):
+        refused = patch_connection(client, project, member, connection["id"], body)
+        assert refused.status_code == 403, f"{body}: {refused.text}"
+
+    listed = client.get(f"/v1/projects/{project.id}/connections", headers=actor.headers).json()
+    assert listed[0]["config"]["side_effect"] == "consequential"
+    assert listed[0]["enabled"] is True
+
+
+async def test_an_admin_may_edit_a_consequential_grant(
+    client: TestClient,
+    project: Project,
+    actor: Actor,
+    make_actor: Any,
+    owner_database: Database,
+) -> None:
+    """The other side of the same rule: refused for a member, allowed here."""
+    agent = make_agent(client, project, actor, "writer")
+    connection = grant(
+        client, project, actor, agent["id"], "send_slack_message", "consequential"
+    ).json()
+    admin = make_actor("patch-admin@example.com")
+    await _join(owner_database, project, admin.user_id, admin.email, "admin")
+
+    response = patch_connection(client, project, admin, connection["id"], {"enabled": False})
+
+    assert response.status_code == 200, response.text
+    assert response.json()["enabled"] is False
+
+
+def test_an_unknown_connection_is_a_404(client: TestClient, project: Project, actor: Actor) -> None:
+    assert (
+        patch_connection(client, project, actor, str(uuid.uuid4()), {"enabled": False}).status_code
+        == 404
+    )
+
+
+def test_another_projects_connection_cannot_be_edited(
+    client: TestClient, project: Project, actor: Actor
+) -> None:
+    """The repository's `project_id` predicate, from the outside."""
+    agent = make_agent(client, project, actor, "researcher")
+    connection = grant(client, project, actor, agent["id"], "web_search").json()
+    elsewhere = client.post(
+        f"/v1/workspaces/{project.workspace_id}/projects",
+        json={"name": "Other island"},
+        headers=actor.headers,
+    ).json()
+
+    response = client.patch(
+        f"/v1/projects/{elsewhere['id']}/connections/{connection['id']}",
+        json={"enabled": False},
+        headers=actor.headers,
+    )
+
+    assert response.status_code == 404, response.text
+    listed = client.get(f"/v1/projects/{project.id}/connections", headers=actor.headers).json()
+    assert listed[0]["enabled"] is True
+
+
+def test_a_stranger_cannot_edit_a_connection(
+    client: TestClient, project: Project, actor: Actor, make_actor: Any
+) -> None:
+    agent = make_agent(client, project, actor, "researcher")
+    connection = grant(client, project, actor, agent["id"], "web_search").json()
+    stranger = make_actor("connection-outsider@example.com")
+
+    response = patch_connection(client, project, stranger, connection["id"], {"enabled": False})
+
+    assert response.status_code == 404, response.text
+
+
+async def test_the_edit_records_one_row_naming_the_fields(
+    client: TestClient, project: Project, actor: Actor, owner_database: Database
+) -> None:
+    """`connection.update`, with `consequential` saying why it needed what it
+    needed."""
+    agent = make_agent(client, project, actor, "writer")
+    connection = grant(
+        client, project, actor, agent["id"], "send_slack_message", "consequential"
+    ).json()
+    patch_connection(client, project, actor, connection["id"], {"enabled": False})
+
+    async with owner_database.session() as session:
+        rows = (
+            await session.execute(
+                text(
+                    "SELECT resource_id, metadata FROM audit_log "
+                    "WHERE workspace_id = :w AND action = 'connection.update'"
+                ),
+                {"w": uuid.UUID(project.workspace_id)},
+            )
+        ).all()
+
+    assert len(rows) == 1
+    assert str(rows[0].resource_id) == connection["id"]
+    assert rows[0].metadata == {"fields": ["enabled"], "consequential": True}
+
+
 def test_a_connection_can_be_revoked(client: TestClient, project: Project, actor: Actor) -> None:
     agent = make_agent(client, project, actor, "researcher")
     created = grant(client, project, actor, agent["id"], "web_search").json()

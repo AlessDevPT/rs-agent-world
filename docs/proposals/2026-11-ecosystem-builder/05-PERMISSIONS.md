@@ -283,13 +283,20 @@ of it.
 
 ## 6. What keeps 77 rules honest
 
-> **Implementation note, T6b.** The matrix is **78** actions in the code. The 78th,
+> **Implementation note, T6b.** The matrix is **79** actions in the code. The 78th,
 > `dispatch.resolve_review` at `admin`, was not in this document: T6 created a state that
 > only a person can leave — a dispatch whose outbound call may or may not have happened —
 > and that needed an action of its own rather than a reuse of `execution.retry_step`,
 > which is `member`. Every "77" below counts what this proposal designed, and
 > `test_the_matrix_is_the_size_the_proposal_says_it_is` asserts both numbers separately so
 > the two cannot drift apart silently.
+>
+> **Implementation note, task 3 stage B.** The 79th is `workflow.update` at `member`: a
+> workflow's name and description. `03-API-AND-FRONTEND.md` designed
+> `PATCH /v1/workflows/{id}` and the table above enumerated no action for it, so the
+> endpoint had none to ask for and did not exist. It is distinct from
+> `workflow.update_draft` because renaming a workflow changes what it is called and
+> nothing about what it would do.
 
 Phase 1 already built the two mechanisms, and they generalise without change:
 

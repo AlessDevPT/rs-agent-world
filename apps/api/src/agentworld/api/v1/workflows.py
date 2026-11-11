@@ -20,7 +20,7 @@ from typing import Annotated, Any
 from uuid import UUID
 
 from fastapi import APIRouter, status
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from agentworld.api.deps import (
     CallContextDep,
@@ -31,6 +31,7 @@ from agentworld.api.deps import (
 from agentworld.domain.entities import Connection, Workflow, WorkflowDraft, WorkflowVersion
 from agentworld.domain.enums import ConnectionKind
 from agentworld.domain.orchestration import Code, Severity, ValidationReport
+from agentworld.repositories.definitions import UNSET
 
 connections_router = APIRouter(prefix="/v1/projects/{project_id}/connections", tags=["connections"])
 workflows_router = APIRouter(prefix="/v1/projects/{project_id}/workflows", tags=["workflows"])
@@ -84,6 +85,42 @@ class ConnectionCreate(BaseModel):
     enabled: bool = True
 
 
+class ConnectionUpdate(BaseModel):
+    """What a grant permits, not where it points.
+
+    `extra="forbid"`: `kind`, `source_*` and `target_*` are the connection's
+    identity, and a client that sends one is asking for a different
+    connection rather than an edit - being told so beats having it ignored.
+
+    Absent means leave it alone; `config` sent at all replaces the mapping
+    whole, the way the draft editor replaces a graph, because a grant's
+    config is one decision and merging two halves of it would produce a
+    permission nobody chose.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    config: dict[str, Any] | None = Field(
+        default=None,
+        description=(
+            "Replaced whole. A `consequential` side effect makes this an admin action - "
+            "and so does editing a grant that is already consequential."
+        ),
+    )
+    requires_approval: bool | None = None
+    enabled: bool | None = Field(
+        default=None,
+        description="A disabled grant stops counting on the next dispatch, not on restart.",
+    )
+
+    def sent(self) -> dict[str, Any]:
+        """Only the fields the caller actually included."""
+        return {
+            name: (UNSET if name not in self.model_fields_set else value)
+            for name, value in self.model_dump().items()
+        }
+
+
 @connections_router.get("", response_model=list[ConnectionView], summary="Connections in a project")
 async def list_connections(
     project_id: UUID, principal: CurrentUser, service: ConnectionServiceDep
@@ -118,6 +155,29 @@ async def create_connection(
         requires_approval=body.requires_approval,
         enabled=body.enabled,
     )
+    return ConnectionView.of(connection)
+
+
+@connections_router.patch(
+    "/{connection_id}",
+    response_model=ConnectionView,
+    summary="Change a grant",
+)
+async def update_connection(
+    project_id: UUID,
+    connection_id: UUID,
+    body: ConnectionUpdate,
+    principal: CurrentUser,
+    context: CallContextDep,
+    service: ConnectionServiceDep,
+) -> ConnectionView:
+    """`member`, unless either side of the edit grants a consequential tool.
+
+    Both sides: a grant that is already consequential needs an `admin` to
+    edit, whatever the new config says. Where it points cannot change -
+    repointing a grant is a delete and a create.
+    """
+    connection = await service.update(principal, context, project_id, connection_id, **body.sent())
     return ConnectionView.of(connection)
 
 
@@ -251,6 +311,35 @@ class WorkflowCreate(BaseModel):
     )
 
 
+class WorkflowUpdate(BaseModel):
+    """What a workflow is called, and nothing about what it does.
+
+    `extra="forbid"`, so `slug` and `graph` are refused by name rather than
+    ignored: the slug is identity, like `agent_key`, and the graph is `PUT
+    …/draft`'s - a client that sent one here would otherwise believe it had
+    changed what the workflow runs.
+
+    Absent means leave it alone; an explicit `null` clears the description.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: Name | None = None
+    description: str | None = None
+
+    def sent(self) -> dict[str, Any]:
+        """Only the fields the caller actually included.
+
+        `exclude_unset` is what makes "clear the description" and "leave the
+        description" different requests rather than the same one, exactly as
+        in `AgentUpdate`.
+        """
+        return {
+            name: (UNSET if name not in self.model_fields_set else value)
+            for name, value in self.model_dump().items()
+        }
+
+
 class DraftSave(BaseModel):
     graph: dict[str, Any]
 
@@ -318,6 +407,34 @@ async def create_workflow(
         graph=body.graph,
     )
     return WorkflowCreated(workflow=WorkflowView.of(workflow), draft=DraftView.of(draft))
+
+
+@workflows_router.patch(
+    "/{workflow_id}",
+    response_model=WorkflowView,
+    summary="Rename or re-describe a workflow",
+    description=(
+        "Metadata only. The graph is `PUT .../draft`, which is a separate permission; "
+        "this cannot change a published version or what a running execution means. An "
+        "agent's test harness is refused with a 409."
+    ),
+)
+async def update_workflow(
+    project_id: UUID,
+    workflow_id: UUID,
+    body: WorkflowUpdate,
+    principal: CurrentUser,
+    context: CallContextDep,
+    service: WorkflowServiceDep,
+) -> WorkflowView:
+    """`member`: `workflow.update`, which is not `workflow.update_draft`.
+
+    Renaming a workflow changes what it is called and nothing about what it
+    would do, so it is not the permission that edits a graph - even though
+    both are `member` today.
+    """
+    workflow = await service.update(principal, context, project_id, workflow_id, **body.sent())
+    return WorkflowView.of(workflow)
 
 
 @workflows_router.get("/{workflow_id}", response_model=WorkflowView, summary="One workflow")

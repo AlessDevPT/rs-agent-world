@@ -401,11 +401,13 @@ include the Phase 4 builder tests passing unmodified.
 
 **Now:** this document's first draft said "approximately 45 new authorization rules".
 
-**Change:** a worked matrix of 62 new actions (77 total; **78 implemented** — T6b added
-`dispatch.resolve_review`, see `17-T6B-REVIEW-API.md`) with scope, required role and a
-sensitivity flag per action — plus, more usefully, the nine actions that deliberately **do
-not exist**, the three whose required role is conditional, and the five that are `admin`
-rather than `member` with the reason for each. In `05-PERMISSIONS.md`.
+**Change:** a worked matrix of 62 new actions (77 total; **79 implemented** — T6b added
+`dispatch.resolve_review`, see `17-T6B-REVIEW-API.md`, and task 3 stage B added
+`workflow.update`, which this proposal's endpoint table needed and its action table
+omitted) with scope, required role and a sensitivity flag per action — plus, more
+usefully, the nine actions that deliberately **do not exist**, the three whose required
+role is conditional, and the five that are `admin` rather than `member` with the reason
+for each. In `05-PERMISSIONS.md`.
 
 **Why:** the count went *up* because least privilege means splitting actions rather than
 merging them. `integration.read` is a `member`; `integration.read_config`, which exposes

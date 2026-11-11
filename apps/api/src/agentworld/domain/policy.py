@@ -83,6 +83,11 @@ class Action(StrEnum):
 
     WORKFLOW_READ = "workflow.read"
     WORKFLOW_CREATE = "workflow.create"
+    #: The name and description. Distinct from `WORKFLOW_UPDATE_DRAFT`, which
+    #: is about the graph: renaming a workflow changes what it is called and
+    #: nothing about what it would do, so the two are not one permission even
+    #: though both are `member`.
+    WORKFLOW_UPDATE = "workflow.update"
     WORKFLOW_UPDATE_DRAFT = "workflow.update_draft"
     WORKFLOW_VALIDATE = "workflow.validate"
     WORKFLOW_PUBLISH = "workflow.publish"
@@ -190,6 +195,7 @@ MINIMUM_ROLE: dict[Action, MemberRole] = {
     Action.MODEL_PROFILE_DELETE: MemberRole.ADMIN,
     Action.WORKFLOW_READ: MemberRole.VIEWER,
     Action.WORKFLOW_CREATE: MemberRole.MEMBER,
+    Action.WORKFLOW_UPDATE: MemberRole.MEMBER,
     Action.WORKFLOW_UPDATE_DRAFT: MemberRole.MEMBER,
     Action.WORKFLOW_VALIDATE: MemberRole.MEMBER,
     # Publishing and running are `member` because a workflow is only as

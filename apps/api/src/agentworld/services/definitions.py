@@ -431,6 +431,81 @@ class ConnectionService:
             )
             return connection
 
+    async def update(
+        self,
+        principal: UserPrincipal,
+        context: CallContext,
+        project_id: UUID,
+        connection_id: UUID,
+        **fields: Any,
+    ) -> Connection:
+        """Change what a grant permits, how it is gated, or whether it is on.
+
+        **Not where it points.** `kind`, `source_*` and `target_*` are
+        together `connections_edge_key`, so a connection with a different
+        end is a different connection - repointing one is a delete and a
+        create, each with its own authorization and its own audit row.
+
+        **The elevation holds in both directions.** `_elevation_for` is
+        applied to the incoming config *and* to the stored one, and the
+        higher of the two decides: granting a consequential tool is an
+        `admin` act, and so is editing a grant that already is one. A member
+        who could turn a consequential grant into a harmless-looking one by
+        rewriting its config would be editing a capability they may not
+        grant - the config is the whole of what the grant permits.
+
+        Authorized twice, both times before any write. The first check uses
+        only what the caller sent, so a caller who may not touch
+        connections here learns nothing about which ones exist; the second
+        runs once the row is read, and only when the stored grant raises the
+        bar. `AgentService.update` checks its two permissions the same way
+        and for the same reason.
+        """
+        sent = {name: value for name, value in fields.items() if value is not UNSET}
+        incoming = _elevation_for(ConnectionKind.GRANT_TOOL, sent.get("config"))
+
+        async with self._factory.begin(visible_workspaces=set(principal.memberships)) as work:
+            workspace_id = await _workspace_of(work, project_id)
+            resource = Resource(workspace_id, conditions=incoming)
+            authorize(principal, Action.CONNECTION_UPDATE, resource)
+
+            scope = TenantScope(workspace_id, project_id)
+            connections = work.connections(scope)
+            existing = await connections.get(connection_id)
+            if existing is None:
+                raise NotFoundError("Connection not found", connection_id=str(connection_id))
+
+            stored = _elevation_for(existing.kind, existing.config)
+            conditions = incoming | stored
+            if conditions != incoming:
+                authorize(
+                    principal,
+                    Action.CONNECTION_UPDATE,
+                    Resource(workspace_id, conditions=conditions),
+                )
+
+            connection = await connections.update(connection_id, **sent)
+            if connection is None:  # pragma: no cover - the row was read above
+                raise NotFoundError("Connection not found", connection_id=str(connection_id))
+
+            await audit.record(
+                work,
+                principal,
+                context,
+                workspace_id=workspace_id,
+                action="connection.update",
+                resource_type="connection",
+                resource_id=connection_id,
+                metadata={
+                    "fields": sorted(sent),
+                    # True when either side of the edit is consequential,
+                    # which is what the authorization used - so a reader of
+                    # this row can tell why it needed an admin.
+                    "consequential": bool(conditions),
+                },
+            )
+            return connection
+
     async def delete(
         self,
         principal: UserPrincipal,
@@ -562,6 +637,63 @@ class WorkflowService:
                 metadata={"slug": resolved},
             )
             return workflow, draft
+
+    async def update(
+        self,
+        principal: UserPrincipal,
+        context: CallContext,
+        project_id: UUID,
+        workflow_id: UUID,
+        **fields: Any,
+    ) -> Workflow:
+        """Rename or re-describe a workflow. The graph is `save_draft`'s.
+
+        `workflow.update`, not `workflow.update_draft`: this writes the
+        `workflows` row and nothing else, so no published version changes
+        and no running execution's definition moves - the frozen tables are
+        not reachable from here, and 0018's triggers remain the backstop if
+        that ever stops being true.
+
+        The slug is not editable and the request model has no field for it.
+        It is half of `(project_id, slug)` and of a URL, and `agent_key` -
+        the same kind of identity - is absent from `AgentUpdate` for the
+        same reason.
+
+        A harness is refused with the same 409 the draft editor gives: its
+        name came from the compiler, and a renamed harness would be a
+        workflow claiming to be something `agent.test` did not compile.
+        """
+        sent = {name: value for name, value in fields.items() if value is not UNSET}
+
+        async with self._factory.begin(visible_workspaces=set(principal.memberships)) as work:
+            workspace_id = await _workspace_of(work, project_id)
+            authorize(principal, Action.WORKFLOW_UPDATE, Resource(workspace_id))
+            scope = TenantScope(workspace_id, project_id)
+            workflows = work.workflows(scope)
+
+            existing = await workflows.get(workflow_id)
+            if existing is None:
+                raise NotFoundError("Workflow not found", workflow_id=str(workflow_id))
+            not_a_test_harness(existing, doing="edited")
+
+            workflow = await workflows.update(workflow_id, **sent)
+            if workflow is None:  # pragma: no cover - the row was read above
+                raise NotFoundError("Workflow not found", workflow_id=str(workflow_id))
+
+            await audit.record(
+                work,
+                principal,
+                context,
+                workspace_id=workspace_id,
+                action="workflow.update",
+                resource_type="workflow",
+                resource_id=workflow_id,
+                # Field names, not values: a description can be long, and the
+                # audit log answers "who changed what" rather than "what did
+                # it say". `agent.update` records the same shape.
+                metadata={"fields": sorted(sent)},
+            )
+            return workflow
 
     async def compile_delegation(
         self,
