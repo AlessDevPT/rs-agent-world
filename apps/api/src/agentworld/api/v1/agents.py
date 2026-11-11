@@ -199,6 +199,39 @@ class AgentTestRequest(BaseModel):
     )
 
 
+class ModelProfileUpdate(BaseModel):
+    """What a profile points at. Every field optional, absent means leave it.
+
+    `extra="forbid"`: there is nothing else on a profile a caller may set,
+    and a client that sends `workspace_id` or `created_at` has misunderstood
+    which of the two of us owns the row.
+
+    An explicit `null` is not the same request as an absent field. Only
+    `credential_id` is nullable - clearing it detaches the key and leaves a
+    profile a managed agent cannot run on, which is a state `create` can
+    produce too - and `null` for any of the others is a 422 naming the
+    field rather than an integrity error dressed up as a conflict.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: Name | None = None
+    provider_slug: Name | None = None
+    model_id: Name | None = None
+    parameters: dict[str, Any] | None = None
+    credential_id: UUID | None = Field(
+        default=None, description="`null` detaches the credential. Omit to leave it alone."
+    )
+    is_default: bool | None = None
+
+    def sent(self) -> dict[str, Any]:
+        """Only the fields the caller actually included."""
+        return {
+            name: (UNSET if name not in self.model_fields_set else value)
+            for name, value in self.model_dump().items()
+        }
+
+
 class ModelProfileCreate(BaseModel):
     name: Name
     provider_slug: Name
@@ -375,6 +408,33 @@ async def create_model_profile(
         credential_id=body.credential_id,
         is_default=body.is_default,
     )
+    return ModelProfileView.of(profile)
+
+
+@profiles_router.patch(
+    "/{profile_id}",
+    response_model=ModelProfileView,
+    summary="Edit a model profile",
+    description=(
+        "`admin`. A `credential_id` is resolved in this workspace before it is stored, so "
+        "an id from somewhere else is a 422 rather than a profile that fails at dispatch. "
+        "No endpoint at any role returns credential material."
+    ),
+)
+async def update_model_profile(
+    workspace_id: UUID,
+    profile_id: UUID,
+    body: ModelProfileUpdate,
+    principal: CurrentUser,
+    context: CallContextDep,
+    service: ModelProfileServiceDep,
+) -> ModelProfileView:
+    """`admin`: a profile names a credential and a spend ceiling.
+
+    The same permission `create` asks for, unchanged - this endpoint adds a
+    verb, not a rule.
+    """
+    profile = await service.update(principal, context, workspace_id, profile_id, **body.sent())
     return ModelProfileView.of(profile)
 
 

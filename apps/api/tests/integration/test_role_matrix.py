@@ -117,6 +117,12 @@ ENDPOINTS = [
         MemberRole.ADMIN,
         {"name": "Matrix Profile", "provider_slug": "anthropic", "model_id": "claude-opus-5"},
     ),
+    Endpoint(
+        "PATCH",
+        "/v1/workspaces/{workspace}/model-profiles/{profile}",
+        MemberRole.ADMIN,
+        {"name": "Renamed by the matrix"},
+    ),
     Endpoint("DELETE", "/v1/workspaces/{workspace}/model-profiles/{profile}", MemberRole.ADMIN),
     Endpoint("GET", "/v1/projects/{project}/connections", MemberRole.VIEWER),
     # A read-only grant, so this row tests the baseline role. The elevation

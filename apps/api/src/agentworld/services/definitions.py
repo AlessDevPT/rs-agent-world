@@ -131,6 +131,106 @@ class ModelProfileService:
             )
             return profile
 
+    async def update(
+        self,
+        principal: UserPrincipal,
+        context: CallContext,
+        workspace_id: UUID,
+        profile_id: UUID,
+        **fields: Any,
+    ) -> ModelProfile:
+        """Re-point a profile: its name, its model, its key, its default-ness.
+
+        `admin` and sensitive, for the reason `create` is: a profile names a
+        credential and the model every managed agent using it will call.
+        Changing the provider is how an operator migrates a workspace rather
+        than a mistake to prevent, so it is editable - and the audit row
+        names the fields, which is what makes such a migration reviewable
+        afterwards.
+
+        **The credential is resolved, never trusted.** A `credential_id` the
+        caller sends is read back through this workspace's own credential
+        repository, which filters on `workspace_id` and excludes deleted
+        rows - so an id from another workspace, or one whose material has
+        been destroyed, is a 422 naming the field rather than a pointer that
+        fails at dispatch with "has no credential". A revoked credential is
+        accepted, because the repository still returns one and an operator
+        mid-rotation legitimately points at it; the runtime is where a
+        revoked key stops working. Nothing here reads, decrypts or logs
+        material: `Credential` has no field for it.
+
+        **Provider and credential are not checked against each other.**
+        `create` does not check it either, and validating here alone would
+        make the two paths disagree about the same profile. That pairing is
+        Stage E's, with the create path, in one change.
+
+        One transaction, so `clear_default` and the write that follows it
+        cannot be separated: the partial unique index
+        `one_default_model_profile` remains the backstop for two callers
+        racing, and a loser gets the 409 the integrity handler already
+        produces rather than a second default.
+        """
+        authorize(principal, Action.MODEL_PROFILE_UPDATE, Resource(workspace_id))
+
+        sent = {name: value for name, value in fields.items() if value is not UNSET}
+        _not_null(sent, "name", "provider_slug", "model_id", "parameters", "is_default")
+
+        async with self._factory.begin(visible_workspaces={workspace_id}) as work:
+            scope = TenantScope(workspace_id)
+            profiles = work.model_profiles(scope)
+            existing = await profiles.get(profile_id)
+            if existing is None:
+                raise NotFoundError("Model profile not found", profile_id=str(profile_id))
+
+            name = sent.get("name")
+            if name is not None and await profiles.name_taken(name, excluding=profile_id):
+                # `excluding`, so renaming a profile to the name it already
+                # has is not a conflict with itself.
+                raise ConflictError(
+                    f"This workspace already has a model profile called '{name}'", name=name
+                )
+
+            credential_id = sent.get("credential_id")
+            if (
+                credential_id is not None
+                and await work.credentials(scope).get(credential_id) is None
+            ):
+                raise ValidationFailedError(
+                    "This workspace has no such credential",
+                    field="credential_id",
+                    credential_id=str(credential_id),
+                )
+
+            if sent.get("is_default"):
+                # Before the write, as `create` does: the unique index means
+                # there is no moment at which two may exist.
+                await profiles.clear_default()
+
+            profile = await profiles.update(profile_id, **sent)
+            if profile is None:  # pragma: no cover - the row was read above
+                raise NotFoundError("Model profile not found", profile_id=str(profile_id))
+
+            await audit.record(
+                work,
+                principal,
+                context,
+                workspace_id=workspace_id,
+                action="model_profile.update",
+                resource_type="model_profile",
+                resource_id=profile_id,
+                # Field names, and - when they changed - the provider and
+                # model, which `create` also records and which are what an
+                # incident asks about. Never `parameters`, whose values are
+                # operator configuration, and never anything about the
+                # credential beyond the fact that it was repointed.
+                metadata={
+                    "fields": sorted(sent),
+                    **({"provider": profile.provider_slug} if "provider_slug" in sent else {}),
+                    **({"model": profile.model_id} if "model_id" in sent else {}),
+                },
+            )
+            return profile
+
     async def delete(
         self,
         principal: UserPrincipal,
@@ -342,6 +442,21 @@ class AgentService:
                 resource_type="agent",
                 resource_id=agent_id,
             )
+
+
+def _not_null(sent: Mapping[str, Any], *names: str) -> None:
+    """Refuse an explicit `null` for a column that has none.
+
+    An absent field means "leave it alone" and is already gone by the time
+    this runs; a `null` the caller actually sent is a different request, and
+    for `NOT NULL` columns it is one the database would refuse. Refused here
+    instead, as a 422 naming the field, because a caller who asked to clear
+    a model id deserves a sentence rather than the 409 an integrity error
+    would turn into.
+    """
+    for name in names:
+        if name in sent and sent[name] is None:
+            raise ValidationFailedError(f"'{name}' cannot be null", field=name)
 
 
 def _check_model_mode(mode: AgentInteractionMode, model_profile_id: UUID | None) -> None:
