@@ -143,18 +143,28 @@ def _agent(envelope: EventEnvelope) -> tuple[Mutation, ...]:
     if status := _agent_status_for(name, envelope.payload):
         reason = _text(envelope.payload.get("reason"))
         return (
+            # **The append comes first, and the order is the whole of
+            # `from_status`.** The history row records the transition itself,
+            # and targets a different table, so it takes its own selector;
+            # `from_status` is left to the repository, which is the only
+            # layer that can read what the status was a moment ago. It can
+            # only read that *before* the patch below overwrites it - which
+            # is why these two are in this order and not the other, and why
+            # stage D1.1 exists: for as long as the patch came first, every
+            # history row said it came from where it went.
+            Append(
+                AgentStatusRef(agent_key=envelope.subject.ref),
+                {"to_status": status, "reason": reason, "changed_at": envelope.occurred_at},
+                not_before=fresh,
+            ),
+            # The same guard, deliberately the same object: a late event
+            # must either move the status and record the move, or do
+            # neither. One of the two alone would be a history that disagrees
+            # with the agent.
             Patch(
                 selector,
                 {**seen, "status": status, "status_reason": reason},
                 not_before=fresh,
-            ),
-            # The history row records the transition itself, and targets a
-            # different table, so it takes its own selector. `from_status` is
-            # left to the repository, which is the only layer that can read
-            # what the status was a moment ago.
-            Append(
-                AgentStatusRef(agent_key=envelope.subject.ref),
-                {"to_status": status, "reason": reason, "changed_at": envelope.occurred_at},
             ),
         )
 

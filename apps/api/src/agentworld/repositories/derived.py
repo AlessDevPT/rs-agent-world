@@ -127,10 +127,33 @@ class DerivedStateRepository(ScopedRepository):
         the column out. Reading it here as part of the INSERT - rather than in
         a separate SELECT - means no window in which another transaction could
         change it between the two.
+
+        **This runs before the patch that moves the status**, which `fold`
+        guarantees by emitting the append first. Until stage D1.1 it ran
+        after, so `m.Agent.status` was already the new value and every row
+        recorded the status it had moved to as the one it came from.
+
+        `not_before` is applied to the select, so a stale event inserts
+        nothing: `INSERT … FROM SELECT` writes a row only if the select
+        returns one, and the condition is the same one the patch carries.
+        An event therefore moves the status and records the move, or does
+        neither.
         """
         selector = mutation.selector
         assert isinstance(selector, AgentStatusRef)
         project_id = self.scope.require_project()
+
+        conditions = [
+            m.Agent.project_id == project_id,
+            m.Agent.agent_key == selector.agent_key,
+        ]
+        if mutation.not_before is not None:
+            column_name, when = mutation.not_before
+            column = getattr(m.Agent, column_name)
+            # Null means nothing has been recorded yet, so anything is newer -
+            # the wording and the comparison are `_patch`'s, because the two
+            # have to agree for the pair to be all-or-nothing.
+            conditions.append(sa.or_(column.is_(None), column <= when))
 
         source = (
             sa.select(
@@ -143,7 +166,7 @@ class DerivedStateRepository(ScopedRepository):
                 sa.literal(event_id),
                 sa.literal(mutation.fields["changed_at"]),
             )
-            .where(m.Agent.project_id == project_id, m.Agent.agent_key == selector.agent_key)
+            .where(*conditions)
             .limit(1)
         )
         return await self._rows(

@@ -243,10 +243,26 @@ def test_an_absurd_heartbeat_ttl_is_ignored() -> None:
     assert "heartbeat_ttl_seconds" not in mutations[0].fields
 
 
-def test_a_status_change_patches_and_appends_history() -> None:
-    """The history row is what makes "when did it break?" answerable."""
+def test_a_status_change_appends_history_then_patches_the_status() -> None:
+    """The history row is what makes "when did it break?" answerable.
+
+    **The append comes first, and the order is load-bearing.** The repository
+    fills `from_status` by reading the agent's current status, which is the
+    status being left only while the patch below has not yet run. Stage D1.1
+    swapped these two: for as long as the patch came first, every history row
+    recorded the status it had moved to as the one it came from.
+    """
     mutations = folded("agent.paused", "agent", "researcher", {"reason": "operator stopped it"})
     assert mutations == (
+        Append(
+            AgentStatusRef("researcher"),
+            {
+                "to_status": AgentStatus.PAUSED,
+                "reason": "operator stopped it",
+                "changed_at": WHEN,
+            },
+            not_before=("last_event_at", WHEN),
+        ),
         Patch(
             AgentRef("researcher"),
             {
@@ -256,22 +272,42 @@ def test_a_status_change_patches_and_appends_history() -> None:
             },
             not_before=("last_event_at", WHEN),
         ),
-        Append(
-            AgentStatusRef("researcher"),
-            {
-                "to_status": AgentStatus.PAUSED,
-                "reason": "operator stopped it",
-                "changed_at": WHEN,
-            },
-        ),
     )
 
 
 def test_the_history_append_leaves_from_status_to_the_repository() -> None:
     """It is the only layer that can read what the status was a moment ago."""
-    append = folded("agent.deregistered", "agent", "researcher")[1]
+    append = folded("agent.deregistered", "agent", "researcher")[0]
     assert append.target is MutationTarget.AGENT_STATUS_HISTORY
     assert "from_status" not in append.fields
+
+
+def test_a_history_append_carries_the_same_guard_as_its_status_patch() -> None:
+    """All or nothing, for every event that moves a status.
+
+    A late event has its patch skipped - a newer one already decided what the
+    agent looks like - and a history row appended anyway would record a
+    transition the agent never made. The two mutations therefore carry the
+    same `not_before`, and this asserts it for every status event rather than
+    for the one above.
+    """
+    unpaired: list[str] = []
+    for event_type in KNOWN_EVENTS:
+        if not event_type.startswith("agent."):
+            continue
+        mutations = folded(event_type, "agent", "researcher", {"status": "working"})
+        appends = [m for m in mutations if isinstance(m, Append)]
+        patches = [m for m in mutations if isinstance(m, Patch)]
+        if not appends:
+            continue
+        if len(appends) != 1 or len(patches) != 1:
+            unpaired.append(f"{event_type}: {len(appends)} appends, {len(patches)} patches")
+        elif appends[0].not_before != patches[0].not_before:
+            unpaired.append(f"{event_type}: {appends[0].not_before} != {patches[0].not_before}")
+        elif mutations.index(appends[0]) > mutations.index(patches[0]):
+            unpaired.append(f"{event_type}: the patch runs before the append")
+
+    assert unpaired == [], f"these history appends are not paired with their patch: {unpaired}"
 
 
 # ------------------------------------------------------------------- the task ---

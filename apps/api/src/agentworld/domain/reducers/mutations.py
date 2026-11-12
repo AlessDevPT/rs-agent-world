@@ -208,6 +208,19 @@ class Append:
 
     selector: Selector
     fields: Mapping[str, Any]
+    #: The same freshness guard `Patch` carries, and travelling with it.
+    #:
+    #: A status event that arrives late has its patch skipped - a newer
+    #: event already decided what the agent looks like - and a history row
+    #: appended anyway would record a transition the agent never made. So
+    #: the append carries the condition the patch carries, and the two
+    #: apply or are skipped together.
+    #:
+    #: Compared with `<=` on the named column, exactly as
+    #: `Patch.not_before` is. `None` for the appends that need no guard:
+    #: `run_steps` rows are keyed by `(run, seq)` and are their own
+    #: identity, so a late one cannot overwrite a newer anything.
+    not_before: tuple[str, dt.datetime] | None = None
 
     @property
     def target(self) -> MutationTarget:

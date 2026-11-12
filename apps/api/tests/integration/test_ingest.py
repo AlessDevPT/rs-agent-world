@@ -776,9 +776,16 @@ async def test_a_stale_event_does_not_overwrite_a_newer_one(
         ).one()
 
     assert status == "working", "a 30-minute-old event overwrote a newer one"
-    # The history still records both transitions: what the agent *is* is
-    # guarded, what happened is not rewritten.
-    assert history == 2
+    # **One row, not two, since stage D1.1.** This asserted two, with the
+    # reasoning that what the agent *is* is guarded while what happened is
+    # not rewritten - a defensible reading of a log. D1.1 took the other
+    # one: a status event's history append now carries the same
+    # `not_before` as its patch, so a late event records nothing because it
+    # changed nothing. A row for it would say the agent moved to `paused`
+    # while the agent is `working`, which is a transition that did not
+    # happen - and `GET .../status-history` publishes that timeline now,
+    # where before this table had no reader at all.
+    assert history == 1
 
 
 async def test_delivery_order_does_not_change_the_final_state(

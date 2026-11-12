@@ -108,10 +108,11 @@ class StatusChangeView(BaseModel):
     from_status: AgentStatus | None = Field(
         default=None,
         description=(
-            "The status being left, and **currently a repeat of `to_status`**: the status "
-            "patch is folded before the history row is written, so the row reads the value "
-            "it is moving to. A defect stage D1 found and deliberately did not fix, because "
-            "the fix changes how events fold. Read `to_status` and the order of the list."
+            "The status being left. Rows recorded before stage D1.1 repeat `to_status` "
+            "instead: the status patch was folded before the history row was written, so "
+            "the row read the value it was moving to. Those rows were left as they are - "
+            "the status each one came from cannot be recovered for the oldest transition "
+            "of an agent, and guessing the rest would be fabricating history."
         ),
     )
     to_status: AgentStatus

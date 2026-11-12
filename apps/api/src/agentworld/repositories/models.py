@@ -1398,7 +1398,12 @@ class AgentStatusHistory(Base):
         sa.ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False
     )
     project_id: Mapped[UUID] = mapped_column(sa.Uuid, nullable=False)
-    #: NULL for the first transition, out of nothing.
+    #: The status being left. Nullable, and in practice never NULL: an agent
+    #: row always has a status - `provisioning` from the moment it is created
+    #: - so a transition folded from an event always knows what it came
+    #: from. The column stays nullable because a row no reducer wrote has no
+    #: honest value to put here, and because narrowing it would need a
+    #: migration to prove no such row exists.
     from_status: Mapped[enums.AgentStatus | None] = mapped_column(
         pg_enum(enums.AgentStatus, "agent_status")
     )

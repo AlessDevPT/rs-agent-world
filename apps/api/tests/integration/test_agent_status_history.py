@@ -138,9 +138,10 @@ def test_transitions_come_back_newest_first(
 ) -> None:
     """Three events, three rows, newest first, each naming its event.
 
-    The `to_status` sequence is the timeline a reader came for, and `reason`
-    travels from the event payload. What `from_status` currently holds is the
-    next test's subject, and not a happy story.
+    The `to_status` sequence is the timeline a reader came for, `from_status`
+    chains each row to the one below it, and `reason` travels from the event
+    payload. The chain is what stage D1.1 made true: before it, every row
+    recorded the status it had moved to as the one it came from.
     """
     sent = post(
         client,
@@ -156,6 +157,7 @@ def test_transitions_come_back_newest_first(
     assert response.status_code == 200, response.text
     rows = response.json()
     assert [row["to_status"] for row in rows] == ["paused", "blocked", "working"]
+    assert [row["from_status"] for row in rows] == ["blocked", "working", "provisioning"]
     assert rows[0]["reason"] == "operator"
     assert rows[2]["reason"] == "picked up a task"
     assert all(row["changed_at"] for row in rows)
@@ -163,32 +165,116 @@ def test_transitions_come_back_newest_first(
     assert rows[0]["changed_at"] >= rows[-1]["changed_at"]
 
 
-def test_from_status_currently_repeats_to_status_which_is_a_defect(
+def test_the_first_transition_records_the_status_it_left(
     client: TestClient, ingest: Fixture, actor: Actor, agent: Any
 ) -> None:
-    """A characterisation test: this asserts a bug, deliberately.
+    """`provisioning`, which is where every agent starts.
 
-    `agent_status_history.from_status` is documented as the status being left
-    - NULL for the first transition - and `derived._append_status` reads it
-    inside the INSERT precisely so that no window exists in which it could
-    change. But `fold` returns `(Patch(status=new), Append(history))` in that
-    order, and `ingest` applies mutations in order, so the agent row already
-    carries the new status when the history row reads it. Every row therefore
-    says it came from where it went.
-
-    Stage D1 found this because D1 is the first code ever to read the
-    column, and D1's brief forbids changing status folding - so the defect is
-    recorded here rather than fixed. The fix is to emit the `Append` before
-    the `Patch`; when that happens, this test must be inverted and the
-    chain asserted properly (`["blocked", "working", None]` for the stream
-    in the test above).
+    Not NULL: an agent row has a status from the moment it is created, so
+    the first transition knows what it came from. This is the test that
+    would have caught the stage D1 defect - the row said `idle` to `idle`,
+    because the status patch had already run.
     """
     post(client, ingest, status_event("idle"))
 
     [row] = history(client, ingest, actor, agent["id"]).json()
 
-    assert row["to_status"] == "idle"
-    assert row["from_status"] == "idle", "the defect: 'provisioning' is the honest answer"
+    assert (row["from_status"], row["to_status"]) == ("provisioning", "idle")
+
+
+def test_the_same_status_twice_records_two_honest_rows(
+    client: TestClient, ingest: Fixture, actor: Actor, agent: Any
+) -> None:
+    """A repeat is a transition from a status to itself, and is recorded.
+
+    The reducer does not deduplicate: an agent that reports `working` twice
+    moved from `working` to `working` the second time, which is what the
+    second row says. The table is a log of what was reported, not a
+    compression of it.
+    """
+    post(client, ingest, status_event("working"), status_event("working", "still at it"))
+
+    rows = history(client, ingest, actor, agent["id"]).json()
+
+    assert [(row["from_status"], row["to_status"]) for row in rows] == [
+        ("working", "working"),
+        ("provisioning", "working"),
+    ]
+    assert rows[0]["reason"] == "still at it"
+
+
+def test_the_agent_keeps_the_status_the_last_event_gave_it(
+    client: TestClient, ingest: Fixture, actor: Actor, agent: Any
+) -> None:
+    """The patch still lands, and lands last.
+
+    Reordering the two mutations moved the history row ahead of the status
+    write; it did not change which status the agent ends up with. Read from
+    the agent itself rather than from the history, because that is the field
+    the island draws.
+    """
+    post(client, ingest, status_event("working"), status_event("blocked", "waiting on input"))
+
+    read = client.get(
+        f"/v1/projects/{ingest.project_id}/agents/{agent['id']}", headers=actor.headers
+    ).json()
+
+    assert read["status"] == "blocked"
+    assert read["status_reason"] == "waiting on input"
+    assert [row["to_status"] for row in history(client, ingest, actor, agent["id"]).json()] == [
+        "blocked",
+        "working",
+    ]
+
+
+def test_a_late_event_moves_neither_the_status_nor_the_history(
+    client: TestClient, ingest: Fixture, actor: Actor, agent: Any
+) -> None:
+    """All or nothing, which is why the append carries the patch's guard.
+
+    A backlog flushed by a worker that was offline arrives in send order, so
+    an older event can follow a newer one. `not_before` skips its patch -
+    the newer event already decided what the agent looks like - and before
+    stage D1.1 the append had no such guard, so a history row was written
+    for a transition the agent never made.
+    """
+    now = dt.datetime.now(dt.UTC)
+    earlier = (now - dt.timedelta(hours=1)).isoformat()
+    post(client, ingest, status_event("blocked", occurred_at=now.isoformat()))
+    post(client, ingest, status_event("working", occurred_at=earlier))
+
+    rows = history(client, ingest, actor, agent["id"]).json()
+    read = client.get(
+        f"/v1/projects/{ingest.project_id}/agents/{agent['id']}", headers=actor.headers
+    ).json()
+
+    assert [(row["from_status"], row["to_status"]) for row in rows] == [
+        ("provisioning", "blocked")
+    ], "the late event recorded nothing"
+    assert read["status"] == "blocked", "and moved nothing"
+
+
+def test_a_refused_batch_leaves_no_history_behind(
+    client: TestClient, ingest: Fixture, actor: Actor, agent: Any
+) -> None:
+    """One batch, one transaction: a refusal writes neither event nor row.
+
+    The clock check is the cheapest way to make the API refuse a whole batch
+    without fabricating an internal fault, and it refuses before anything is
+    written. A genuine mid-transaction rollback would need an induced
+    failure, which this file does not invent.
+    """
+    ahead = (dt.datetime.now(dt.UTC) + dt.timedelta(hours=2)).isoformat()
+
+    refused = post(
+        client,
+        ingest,
+        status_event("working"),
+        status_event("blocked", occurred_at=ahead),
+    )
+
+    assert refused.status_code == 422, refused.text
+    assert history(client, ingest, actor, agent["id"]).json() == []
 
 
 def test_a_managed_agent_that_reports_nothing_has_no_history(
