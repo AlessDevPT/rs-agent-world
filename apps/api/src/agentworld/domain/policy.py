@@ -79,6 +79,12 @@ class Action(StrEnum):
     AGENT_PAUSE = "agent.pause"
     AGENT_TEST = "agent.test"
     AGENT_READ_RUNS = "agent.read_runs"
+    #: Status transitions, which are not runs. Separate from
+    #: `agent.read_runs` because they are a different table with a different
+    #: producer: history is folded from what an agent says about itself,
+    #: while runs carry what it did. One action for both would mean nobody
+    #: could be granted one without the other.
+    AGENT_READ_HISTORY = "agent.read_history"
 
     MODEL_PROFILE_READ = "model_profile.read"
     MODEL_PROFILE_CREATE = "model_profile.create"
@@ -194,6 +200,7 @@ MINIMUM_ROLE: dict[Action, MemberRole] = {
     Action.AGENT_PAUSE: MemberRole.MEMBER,
     Action.AGENT_TEST: MemberRole.MEMBER,
     Action.AGENT_READ_RUNS: MemberRole.VIEWER,
+    Action.AGENT_READ_HISTORY: MemberRole.VIEWER,
     Action.MODEL_PROFILE_READ: MemberRole.VIEWER,
     # A model profile names a credential and a spend ceiling.
     Action.MODEL_PROFILE_CREATE: MemberRole.ADMIN,

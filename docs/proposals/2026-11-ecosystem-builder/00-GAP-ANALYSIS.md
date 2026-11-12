@@ -404,8 +404,9 @@ include the Phase 4 builder tests passing unmodified.
 **Change:** a worked matrix of 62 new actions (77 total; **81 implemented** — T6b added
 `dispatch.resolve_review`, see `17-T6B-REVIEW-API.md`; task 3 stage B added
 `workflow.update`, which this proposal's endpoint table needed and its action table
-omitted; and task 3 stage C added `agent.restore` and `workflow.restore`, which it
-designed no counterpart for at all) with scope, required role and a sensitivity flag per action — plus, more
+omitted; task 3 stage C added `agent.restore` and `workflow.restore`, which it
+designed no counterpart for at all; and task 3 stage D added `agent.read_history`,
+splitting status history from `agent.read_runs`) with scope, required role and a sensitivity flag per action — plus, more
 usefully, the nine actions that deliberately **do not exist**, the three whose required
 role is conditional, and the five that are `admin` rather than `member` with the reason
 for each. In `05-PERMISSIONS.md`.

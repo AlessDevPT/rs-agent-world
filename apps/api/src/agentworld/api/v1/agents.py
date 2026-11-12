@@ -32,7 +32,7 @@ from agentworld.api.deps import (
     ModelProfileServiceDep,
 )
 from agentworld.api.v1.executions import ExecutionView
-from agentworld.domain.entities import Agent, ModelProfile
+from agentworld.domain.entities import Agent, AgentStatusChange, ModelProfile
 from agentworld.domain.enums import AgentInteractionMode, AgentStatus
 from agentworld.repositories.definitions import UNSET
 
@@ -94,6 +94,45 @@ class AgentView(BaseModel):
             current_task_id=agent.current_task_id,
             last_heartbeat_at=agent.last_heartbeat_at,
             archived_at=agent.archived_at,
+        )
+
+
+class StatusChangeView(BaseModel):
+    """One transition, as the island's timeline reads it.
+
+    Derived from the event log and never written by a request - there is no
+    field here a client could send back, and no endpoint that would take
+    one.
+    """
+
+    from_status: AgentStatus | None = Field(
+        default=None,
+        description=(
+            "The status being left, and **currently a repeat of `to_status`**: the status "
+            "patch is folded before the history row is written, so the row reads the value "
+            "it is moving to. A defect stage D1 found and deliberately did not fix, because "
+            "the fix changes how events fold. Read `to_status` and the order of the list."
+        ),
+    )
+    to_status: AgentStatus
+    changed_at: dt.datetime
+    reason: str | None = None
+    event_id: UUID | None = Field(
+        default=None,
+        description=(
+            "The event this was folded from. A correlation handle for a support "
+            "question; no endpoint reads an event by id yet."
+        ),
+    )
+
+    @classmethod
+    def of(cls, change: AgentStatusChange) -> StatusChangeView:
+        return cls(
+            from_status=change.from_status,
+            to_status=change.to_status,
+            changed_at=change.changed_at,
+            reason=change.reason,
+            event_id=change.event_id,
         )
 
 
@@ -301,6 +340,35 @@ async def get_agent(
     rest for no reason a caller could see.
     """
     return AgentView.of(await service.get(principal, project_id, agent_id))
+
+
+@project_router.get(
+    "/{agent_id}/status-history",
+    response_model=list[StatusChangeView],
+    summary="When this agent's status changed",
+    description=(
+        "Newest first, folded from the events the agent sent. **An agent AgentWorld runs "
+        "itself has none**: a managed agent reports nothing, and its work appears under "
+        "`GET /v1/projects/{project_id}/executions` instead - so an empty list here is an "
+        "answer about where to look rather than a missing record. Readable for an "
+        "archived agent, because what it did before it was archived is the question."
+    ),
+)
+async def agent_status_history(
+    project_id: UUID,
+    agent_id: UUID,
+    principal: CurrentUser,
+    service: AgentServiceDep,
+    limit: Annotated[int, Query(ge=1, le=200)] = 50,
+) -> list[StatusChangeView]:
+    """`viewer`, through `agent.read_history`.
+
+    `limit` is the first one in this API, and status history is why: it grows
+    with every transition an agent ever reports, where the other listings are
+    bounded by something a person did deliberately.
+    """
+    changes = await service.status_history(principal, project_id, agent_id, limit=limit)
+    return [StatusChangeView.of(change) for change in changes]
 
 
 @project_router.patch("/{agent_id}", response_model=AgentView, summary="Edit or configure an agent")

@@ -360,8 +360,12 @@ def test_the_matrix_is_the_size_the_proposal_says_it_is() -> None:
         # remedies told users to restore an agent that nothing could.
         Action.AGENT_RESTORE,
         Action.WORKFLOW_RESTORE,
+        # Task 3 stage D. `agent.read_runs` was designed; status history was
+        # not given an action of its own, and it is a different table with a
+        # different producer.
+        Action.AGENT_READ_HISTORY,
     }
-    assert len(Action) == 81
+    assert len(Action) == 82
     assert len(Action) - len(phase_one) - len(added_after_the_proposal) == 62
 
 

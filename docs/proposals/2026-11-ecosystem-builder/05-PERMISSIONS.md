@@ -304,6 +304,13 @@ of it.
 > agent, then test it" — naming an action no endpoint could perform. Restoring is `admin`
 > because a restored managed agent can be dispatched again, and separate per entity
 > because the two archives are. Workspace and project restoration remain unimplemented.
+>
+> **Implementation note, task 3 stage D.** The 82nd is `agent.read_history` at `viewer`:
+> an agent's status transitions. This document designed `agent.read_runs` for
+> `GET /v1/agents/{id}/status-history` and `…/runs` together, and the two are different
+> tables with different producers - history is folded from what an agent says about
+> itself, runs carry what it did - so one action for both would mean nobody could be
+> granted one without the other.
 
 Phase 1 already built the two mechanisms, and they generalise without change:
 

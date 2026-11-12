@@ -26,6 +26,7 @@ from uuid import UUID
 
 from agentworld.domain.entities import (
     Agent,
+    AgentStatusChange,
     Connection,
     ModelProfile,
     Workflow,
@@ -291,6 +292,44 @@ class AgentService:
             if agent is None:
                 raise NotFoundError("Agent not found", agent_id=str(agent_id))
             return agent
+
+    async def status_history(
+        self,
+        principal: UserPrincipal,
+        project_id: UUID,
+        agent_id: UUID,
+        *,
+        limit: int = 50,
+    ) -> Sequence[AgentStatusChange]:
+        """When this agent's status changed, and what it changed from.
+
+        `agent.read_history`, not `agent.read_runs`: a transition is not a
+        run, and the two tables have different producers - history is folded
+        from what an agent says about itself, runs carry what it did. One
+        action for both would mean nobody could be granted one without the
+        other.
+
+        The agent is resolved first, for its own sake. An unknown id, or one
+        from another project, would otherwise come back as an empty list -
+        "this agent has never changed status" - which is a different and
+        wrong answer. Archived agents are included, as `get` includes them:
+        this is a read, and what an agent did before it was archived is
+        exactly what a reader is asking about.
+
+        **An agent AgentWorld runs itself has no history, and that is
+        correct.** Transitions are folded from ingested events, and a managed
+        agent sends none - its work is in `workflow_executions`. An empty
+        list here is an honest answer about where to look, and no row is
+        invented to fill it.
+        """
+        async with self._factory.begin(visible_workspaces=set(principal.memberships)) as work:
+            workspace_id = await _workspace_of(work, project_id)
+            authorize(principal, Action.AGENT_READ_HISTORY, Resource(workspace_id))
+            scope = TenantScope(workspace_id, project_id)
+            agents = work.agents(scope)
+            if await agents.get(agent_id, include_archived=True) is None:
+                raise NotFoundError("Agent not found", agent_id=str(agent_id))
+            return await agents.status_history(agent_id, limit=limit)
 
     async def create(
         self,

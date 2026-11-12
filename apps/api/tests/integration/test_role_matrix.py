@@ -100,6 +100,7 @@ ENDPOINTS = [
         {"display_name": "Matrix Agent", "interaction_mode": "managed"},
     ),
     Endpoint("GET", "/v1/projects/{project}/agents/{agent}", MemberRole.VIEWER),
+    Endpoint("GET", "/v1/projects/{project}/agents/{agent}/status-history", MemberRole.VIEWER),
     # Editing is `member`; the configuration half is `admin` and is covered
     # by its own test in `test_agents_api.py`, because the role it needs
     # depends on which fields the body carries rather than on the route.

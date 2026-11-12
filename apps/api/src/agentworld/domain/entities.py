@@ -253,6 +253,30 @@ class Agent:
 
 
 @dataclass(frozen=True, slots=True)
+class AgentStatusChange:
+    """One transition in an agent's status, as `agent_status_history` holds it.
+
+    Derived, like the status column itself: a row exists because an event was
+    folded, and nothing in the application writes one directly. `from_status`
+    is NULL for the first transition - there was no status to leave - and
+    `reason` and `event_id` are NULL when the event carried neither.
+
+    No `id`. The table's primary key is a bigint sequence, which tells a
+    reader about volume and ordering they cannot use; if this ever needs a
+    cursor it is `(changed_at, id)` and can be added then.
+    """
+
+    from_status: AgentStatus | None
+    to_status: AgentStatus
+    changed_at: datetime
+    reason: str | None = None
+    #: The event this transition was folded from, as a correlation handle.
+    #: There is no route that reads an event yet, so it is a value to quote
+    #: in a support question rather than one to follow.
+    event_id: UUID | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class Connection:
     """A standing grant or route between components.
 

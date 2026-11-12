@@ -24,6 +24,7 @@ from sqlalchemy.engine import CursorResult
 
 from agentworld.domain.entities import (
     Agent,
+    AgentStatusChange,
     Connection,
     ModelProfile,
     Workflow,
@@ -235,6 +236,41 @@ class AgentRepository(ScopedRepository):
         rows = await self._session.execute(query.order_by(m.Agent.registered_at))
         return [_to_agent(row) for row in rows.scalars().all()]
 
+    async def status_history(
+        self, agent_id: UUID, *, limit: int = 50
+    ) -> Sequence[AgentStatusChange]:
+        """This agent's status transitions, newest first.
+
+        Read-only, and the only reader of a table three years of events
+        could fill: `agent_status_history` is written by the reducer, one row
+        per transition, and nothing has ever read it back until now.
+
+        `project_id` as well as `agent_id`, like every other read in this
+        class: the tenant predicate does not weaken because the caller
+        happens to know an id, and RLS sits behind it rather than instead of
+        it.
+
+        Ordered by `changed_at` and then by `id`. The timestamp defaults to
+        `now()`, which is the transaction's start time, so every transition
+        folded from one ingest batch shares it exactly - and an order that
+        left those to the planner would not be stable between calls. The
+        index on `(agent_id, changed_at DESC)` still serves the leading
+        columns.
+        """
+        rows = await self._session.execute(
+            sa.select(m.AgentStatusHistory)
+            .where(
+                m.AgentStatusHistory.agent_id == agent_id,
+                m.AgentStatusHistory.project_id == self.scope.require_project(),
+            )
+            .order_by(
+                m.AgentStatusHistory.changed_at.desc(),
+                m.AgentStatusHistory.id.desc(),
+            )
+            .limit(limit)
+        )
+        return [_to_status_change(row) for row in rows.scalars().all()]
+
     async def key_taken(self, agent_key: str) -> bool:
         found = (
             await self._session.execute(
@@ -363,6 +399,16 @@ def _to_profile(row: m.ModelProfile) -> ModelProfile:
         credential_id=row.credential_id,
         is_default=row.is_default,
         created_at=row.created_at,
+    )
+
+
+def _to_status_change(row: m.AgentStatusHistory) -> AgentStatusChange:
+    return AgentStatusChange(
+        from_status=row.from_status,
+        to_status=row.to_status,
+        changed_at=row.changed_at,
+        reason=row.reason,
+        event_id=row.event_id,
     )
 
 
