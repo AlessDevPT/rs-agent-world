@@ -1016,6 +1016,17 @@ class ExecutionStep(Base):
             "status",
             postgresql_where=sa.text("status IN ('pending', 'ready', 'dispatched', 'running')"),
         ),
+        # "Which executions involved this agent", which is the whole of
+        # `GET .../agents/{id}/executions`. `execution_id` is the second
+        # column so that question is answered from the index alone - the
+        # step rows are never needed - and the index is partial because a
+        # step naming no agent is not an answer to it. Migration 0024.
+        sa.Index(
+            "execution_steps_agent_idx",
+            "agent_id",
+            "execution_id",
+            postgresql_where=sa.text("agent_id IS NOT NULL"),
+        ),
     )
 
 

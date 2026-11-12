@@ -32,8 +32,8 @@ from agentworld.api.deps import (
     ModelProfileServiceDep,
 )
 from agentworld.api.v1.executions import ExecutionView
-from agentworld.domain.entities import Agent, AgentStatusChange, ModelProfile
-from agentworld.domain.enums import AgentInteractionMode, AgentStatus
+from agentworld.domain.entities import Agent, AgentStatusChange, ModelProfile, Run
+from agentworld.domain.enums import AgentInteractionMode, AgentStatus, RunStatus
 from agentworld.repositories.definitions import UNSET
 
 project_router = APIRouter(prefix="/v1/projects/{project_id}/agents", tags=["agents"])
@@ -135,6 +135,102 @@ class StatusChangeView(BaseModel):
             reason=change.reason,
             event_id=change.event_id,
         )
+
+
+class RunView(BaseModel):
+    """One attempt an external agent reported making at something.
+
+    Not an execution. A run is the agent's own account of work it did
+    wherever it lives, folded from the events it sent; an execution is
+    AgentWorld's record of work it drove itself. They are different tables
+    with different producers, and this API keeps them apart rather than
+    merging them into a common "activity" record neither one is.
+
+    No `agent_id`: it is in the path that returned this. No counters a
+    client could write back, and no endpoint that would take one - every
+    field here is derived, like `StatusChangeView` above.
+    """
+
+    id: UUID
+    run_ref: str | None = Field(
+        default=None, description="The agent's own identifier for this attempt."
+    )
+    status: RunStatus
+    task_id: UUID | None = Field(
+        default=None, description="The task this run was working on, when it was working on one."
+    )
+    execution_step_id: UUID | None = Field(
+        default=None,
+        description=(
+            "Set when this run was one step of a workflow execution rather than the agent "
+            "acting on its own."
+        ),
+    )
+    step_count: int = 0
+    tool_call_count: int = Field(
+        default=0,
+        description=(
+            "Tool calls this run made, refused ones included: a blocked agent is not an idle one."
+        ),
+    )
+    error: dict[str, Any] | None = None
+    started_at: dt.datetime
+    finished_at: dt.datetime | None = None
+    duration_ms: int | None = Field(
+        default=None,
+        description="Computed by the database from the two timestamps. Null while in flight.",
+    )
+
+    @classmethod
+    def of(cls, run: Run) -> RunView:
+        return cls(
+            id=run.id,
+            run_ref=run.run_ref,
+            status=run.status,
+            task_id=run.task_id,
+            execution_step_id=run.execution_step_id,
+            step_count=run.step_count,
+            tool_call_count=run.tool_call_count,
+            error=dict(run.error) if run.error is not None else None,
+            started_at=run.started_at,
+            finished_at=run.finished_at,
+            duration_ms=run.duration_ms,
+        )
+
+
+class AgentExecutionView(ExecutionView):
+    """An execution, plus the one thing an agent's own listing has to say.
+
+    The shared `ExecutionView` everywhere else, with `is_test_harness`
+    added here and nowhere else. An agent's executions are mostly its own
+    tests - `agent.test` is how a managed agent runs at all before anyone
+    has drawn a workflow around it - so a reader of *this* list needs the
+    distinction to make sense of it, while a reader of a project's or a
+    workflow's list already knows which workflow they asked about.
+
+    Subclassed rather than copied, so the common fields cannot drift, and
+    additive, so a client parsing `ExecutionView` parses this too.
+    """
+
+    is_test_harness: bool = Field(
+        default=False,
+        description=(
+            "True when this execution ran the agent's `agent.test` harness rather than a "
+            "workflow somebody drew. The same fact `GET /v1/projects/{project_id}/"
+            "workflows/{workflow_id}` reports, resolved here so a client needs no second "
+            "call per row."
+        ),
+    )
+
+    @classmethod
+    def of_execution(cls, row: Any, *, is_test_harness: bool) -> AgentExecutionView:
+        """`ExecutionView.of`, plus the flag this listing adds.
+
+        The parent is called explicitly rather than through `cls`, so the
+        shared mapping stays the one place that knows how an execution row
+        becomes a view.
+        """
+        return cls(**ExecutionView.of(row).model_dump(), is_test_harness=is_test_harness)
 
 
 class ModelProfileView(BaseModel):
@@ -370,6 +466,68 @@ async def agent_status_history(
     """
     changes = await service.status_history(principal, project_id, agent_id, limit=limit)
     return [StatusChangeView.of(change) for change in changes]
+
+
+@project_router.get(
+    "/{agent_id}/runs",
+    response_model=list[RunView],
+    summary="What this agent reported doing",
+    description=(
+        "Newest first, folded from the events the agent sent about its own work. "
+        "**Empty for every agent in this release**: the reducers fold a run, but nothing "
+        "yet creates one, so there is no row to return - and an agent AgentWorld runs "
+        "itself would have none of these in any case. Its work is under "
+        "`GET /v1/projects/{project_id}/agents/{agent_id}/executions`. Readable for an "
+        "archived agent, because what it did before it was archived is the question."
+    ),
+)
+async def agent_runs(
+    project_id: UUID,
+    agent_id: UUID,
+    principal: CurrentUser,
+    service: AgentServiceDep,
+    limit: Annotated[int, Query(ge=1, le=200)] = 50,
+) -> list[RunView]:
+    """`viewer`, through `agent.read_runs`.
+
+    The action the permission matrix has carried unused since it was
+    written; this is the first route to ask for it. Separate from
+    `agent.read_history` because the two tables have different producers,
+    which is the argument the history route makes in the other direction.
+    """
+    runs = await service.runs(principal, project_id, agent_id, limit=limit)
+    return [RunView.of(run) for run in runs]
+
+
+@project_router.get(
+    "/{agent_id}/executions",
+    response_model=list[AgentExecutionView],
+    summary="Executions this agent took part in",
+    description=(
+        "Newest first. An agent reaches an execution through the step rows bound to it, "
+        "so an execution it appears in several times - a long graph, or a retried step - "
+        "is listed once. Test harness runs are included and marked with "
+        "`is_test_harness` rather than filtered out: for most agents they are the only "
+        "executions there are. Readable for an archived agent."
+    ),
+)
+async def agent_executions(
+    project_id: UUID,
+    agent_id: UUID,
+    principal: CurrentUser,
+    executions: ExecutionServiceDep,
+    limit: Annotated[int, Query(ge=1, le=200)] = 50,
+) -> list[AgentExecutionView]:
+    """`viewer`, through `agent.read` and `execution.read`, in that order.
+
+    Not `agent.read_runs`: these are AgentWorld's own records of work it
+    drove, and reading them is the same act as reading any other execution.
+    """
+    found = await executions.list_for_agent(principal, project_id, agent_id, limit=limit)
+    return [
+        AgentExecutionView.of_execution(row, is_test_harness=found.is_harness(row.id))
+        for row in found.rows
+    ]
 
 
 @project_router.patch("/{agent_id}", response_model=AgentView, summary="Edit or configure an agent")

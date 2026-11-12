@@ -101,6 +101,12 @@ ENDPOINTS = [
     ),
     Endpoint("GET", "/v1/projects/{project}/agents/{agent}", MemberRole.VIEWER),
     Endpoint("GET", "/v1/projects/{project}/agents/{agent}/status-history", MemberRole.VIEWER),
+    # `agent.read_runs` and, for the second, `agent.read` with
+    # `execution.read`. Three actions, one floor: watching is not operating,
+    # and a viewer who may read an execution through the project-wide
+    # listing may read the same row reached through its agent.
+    Endpoint("GET", "/v1/projects/{project}/agents/{agent}/runs", MemberRole.VIEWER),
+    Endpoint("GET", "/v1/projects/{project}/agents/{agent}/executions", MemberRole.VIEWER),
     # Editing is `member`; the configuration half is `admin` and is covered
     # by its own test in `test_agents_api.py`, because the role it needs
     # depends on which fields the body carries rather than on the route.

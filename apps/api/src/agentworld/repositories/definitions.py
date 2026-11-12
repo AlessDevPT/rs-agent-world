@@ -27,6 +27,7 @@ from agentworld.domain.entities import (
     AgentStatusChange,
     Connection,
     ModelProfile,
+    Run,
     Workflow,
     WorkflowDraft,
     WorkflowVersion,
@@ -271,6 +272,37 @@ class AgentRepository(ScopedRepository):
         )
         return [_to_status_change(row) for row in rows.scalars().all()]
 
+    async def runs(self, agent_id: UUID, *, limit: int = 50) -> Sequence[Run]:
+        """This agent's own runs, newest first.
+
+        The second reader of a derived table, and the same shape as
+        `status_history` deliberately: one question, one agent, a bounded
+        list, the tenant predicate stated here rather than left to RLS.
+
+        **This returns nothing in production today, and that is honest
+        rather than broken.** `runs` is folded by the reducers but created
+        by nothing - `DerivedStateRepository` patches a run and appends its
+        steps, and no statement anywhere inserts one - so until a producer
+        exists the table is empty for every agent. An empty list is then a
+        true answer about a real table, which is the only answer available
+        without inventing rows.
+
+        Ordered by `started_at` and then by `id`. `runs_agent_idx` is
+        `(agent_id, started_at DESC)`, so the leading columns are served by
+        it; `id` is the tiebreak, because `started_at` defaults to `now()`
+        and every run folded from one ingest batch shares it exactly.
+        """
+        rows = await self._session.execute(
+            sa.select(m.Run)
+            .where(
+                m.Run.agent_id == agent_id,
+                m.Run.project_id == self.scope.require_project(),
+            )
+            .order_by(m.Run.started_at.desc(), m.Run.id.desc())
+            .limit(limit)
+        )
+        return [_to_run(row) for row in rows.scalars().all()]
+
     async def key_taken(self, agent_key: str) -> bool:
         found = (
             await self._session.execute(
@@ -399,6 +431,22 @@ def _to_profile(row: m.ModelProfile) -> ModelProfile:
         credential_id=row.credential_id,
         is_default=row.is_default,
         created_at=row.created_at,
+    )
+
+
+def _to_run(row: m.Run) -> Run:
+    return Run(
+        id=row.id,
+        status=row.status,
+        started_at=row.started_at,
+        run_ref=row.run_ref,
+        task_id=row.task_id,
+        execution_step_id=row.execution_step_id,
+        step_count=row.step_count,
+        tool_call_count=row.tool_call_count,
+        error=dict(row.error) if row.error is not None else None,
+        finished_at=row.finished_at,
+        duration_ms=row.duration_ms,
     )
 
 

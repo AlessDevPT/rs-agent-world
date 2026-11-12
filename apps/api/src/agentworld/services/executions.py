@@ -106,6 +106,27 @@ class Applied:
 
 
 @dataclass(frozen=True, slots=True)
+class AgentExecutions:
+    """One agent's executions, and which of them are its test harness.
+
+    Two values rather than a flag per row, because the harness fact is one
+    query for the whole page and attaching it row by row would either mean
+    a second query per row or a joined shape every other execution reader
+    would then have to ignore.
+
+    `harness_ids` is a subset of the ids in `rows`. An execution absent from
+    it is not a harness run, which is the right default: `test_for_agent_id`
+    being NULL is what "a person drew this workflow" looks like.
+    """
+
+    rows: Sequence[Any]
+    harness_ids: frozenset[UUID]
+
+    def is_harness(self, execution_id: UUID) -> bool:
+        return execution_id in self.harness_ids
+
+
+@dataclass(frozen=True, slots=True)
 class Cancellation:
     """What cancelling an execution stopped, and what it could not stop."""
 
@@ -672,6 +693,52 @@ class ExecutionService:
             if await work.workflows(scope).get(workflow_id, include_archived=True) is None:
                 raise NotFoundError("Workflow not found", workflow_id=str(workflow_id))
             return await work.executions(scope).list_for_workflow(workflow_id)
+
+    async def list_for_agent(
+        self, principal: UserPrincipal, project_id: UUID, agent_id: UUID, *, limit: int = 50
+    ) -> AgentExecutions:
+        """The executions this agent took part in, newest first.
+
+        Two permissions, in this order, for the two things this reads -
+        `agent.read` to name the agent and `execution.read` to see what it
+        did. Both are `viewer` today, so nobody is refused who could ask the
+        two questions separately; checking both is what keeps that true if
+        either ever stops being `viewer`, and it is the arrangement
+        `list_for_workflow` and `compile_delegation` use for the same
+        reason.
+
+        Not `agent.read_runs`. These are AgentWorld's own records of work it
+        drove, not the agent's report of work it did elsewhere, and reading
+        them is the same act as reading any other execution - which is why
+        the permission is the one that already governs that, rather than a
+        new action for the same rows reached by a different path.
+
+        The agent is resolved for its own sake rather than trusted as a
+        filter, as the workflow is in `list_for_workflow`: an id from
+        another project would otherwise come back as an empty list about an
+        agent the caller may not read at all. Archived agents are included,
+        because an archived agent's executions are exactly what someone
+        asking about an archived agent wants.
+
+        Harness executions are included and labelled, not filtered. An
+        agent's executions are mostly its tests, so leaving them out would
+        empty the list for most agents and leaving them unmarked would
+        present a test as production work; the label is read from
+        `workflows.test_for_agent_id`, which is the same fact
+        `WorkflowView.is_test_harness` reports.
+        """
+        async with self._factory.begin(visible_workspaces=set(principal.memberships)) as work:
+            workspace_id = await _workspace_of(work, project_id)
+            resource = Resource(workspace_id)
+            authorize(principal, Action.AGENT_READ, resource)
+            authorize(principal, Action.EXECUTION_READ, resource)
+            scope = TenantScope(workspace_id, project_id)
+            if await work.agents(scope).get(agent_id, include_archived=True) is None:
+                raise NotFoundError("Agent not found", agent_id=str(agent_id))
+            executions = work.executions(scope)
+            rows = await executions.list_for_agent(agent_id, limit=limit)
+            harness_ids = await executions.harness_executions([row.id for row in rows])
+            return AgentExecutions(rows=rows, harness_ids=harness_ids)
 
 
 # ----------------------------------------------------------------- helpers ---

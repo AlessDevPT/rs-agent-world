@@ -358,6 +358,97 @@ class ExecutionRepository(ScopedRepository):
         )
         return list(rows.scalars().all())
 
+    async def list_for_agent(self, agent_id: UUID, *, limit: int = 50) -> Sequence[Any]:
+        """The executions this agent took part in, newest first.
+
+        An agent reaches an execution through `execution_steps.agent_id`,
+        which is copied from the frozen graph when the steps are seeded. A
+        long graph gives one row per step and a retry gives another per
+        attempt, so the join is written as an `EXISTS` rather than a join
+        with `DISTINCT`: the question is "is this agent in it at all", one
+        execution is one answer whatever the step count, and the planner can
+        stop at the first matching step instead of collecting them all to
+        throw duplicates away.
+
+        The subquery carries the project predicate too. `execution_steps` is
+        under forced row-level security like everything else, and the
+        predicate is stated here for the same reason it is stated in the
+        outer query: RLS sits behind the tenant check rather than instead of
+        it. A step row from another project could not match an execution in
+        this one anyway - the composite key makes that unstorable - which is
+        what makes the predicate cheap rather than redundant.
+
+        `agent_id IS NOT NULL` is implied by the equality and stated anyway,
+        because `execution_steps_agent_idx` is partial on exactly that and a
+        predicate the planner can match literally is what lets it use the
+        index.
+
+        The same order and the same cap as `list_for_workflow`: a caller
+        reading an agent's history should not meet a third set of
+        conventions.
+        """
+        involved = (
+            sa.select(sa.literal(1))
+            .select_from(m.ExecutionStep)
+            .where(
+                m.ExecutionStep.execution_id == m.WorkflowExecution.id,
+                m.ExecutionStep.project_id == self.scope.require_project(),
+                m.ExecutionStep.agent_id.is_not(None),
+                m.ExecutionStep.agent_id == agent_id,
+            )
+        )
+        rows = await self._session.execute(
+            sa.select(m.WorkflowExecution)
+            .where(
+                m.WorkflowExecution.project_id == self.scope.require_project(),
+                involved.exists(),
+            )
+            .order_by(
+                m.WorkflowExecution.created_at.desc(),
+                m.WorkflowExecution.id.desc(),
+            )
+            .limit(limit)
+        )
+        return list(rows.scalars().all())
+
+    async def harness_executions(self, execution_ids: Sequence[UUID]) -> frozenset[UUID]:
+        """Which of these executions ran an agent test harness.
+
+        One query for a list, like `step_keys`, rather than one per row.
+        The fact is `workflows.test_for_agent_id IS NOT NULL` - the same
+        column `WorkflowView.is_test_harness` reports - read through the
+        execution's `workflow_id`.
+
+        Returned as a set of ids rather than a flag per row, so the caller
+        labels the rows it already has instead of this returning a second
+        copy of them. An execution missing from the set is not a harness,
+        which is the right default: the column being NULL is what "a person
+        drew this" looks like.
+
+        **Both tables carry the project predicate, and the joined one needs
+        it most.** `workflow_executions.workflow_id` is a single-column key
+        to `workflows (id)` - it says the workflow exists, not that it
+        belongs to the execution's project, which is the gap 0012 and 0023
+        closed elsewhere and left open here. Nothing writes a mismatched
+        pair today, and a mismatch could only mislabel a boolean rather than
+        return a row from another tenant, since the ids come from a listing
+        already scoped to this project. Stating the predicate costs nothing
+        and means this read does not depend on that being true.
+        """
+        if not execution_ids:
+            return frozenset()
+        rows = await self._session.execute(
+            sa.select(m.WorkflowExecution.id)
+            .join(m.Workflow, m.Workflow.id == m.WorkflowExecution.workflow_id)
+            .where(
+                m.WorkflowExecution.id.in_(list(execution_ids)),
+                m.WorkflowExecution.project_id == self.scope.require_project(),
+                m.Workflow.project_id == self.scope.require_project(),
+                m.Workflow.test_for_agent_id.is_not(None),
+            )
+        )
+        return frozenset(row[0] for row in rows.all())
+
 
 class DispatchRepository(ScopedRepository):
     """The outbox. One method, and it is the only way work comes into being.

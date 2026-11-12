@@ -29,6 +29,7 @@ from agentworld.domain.entities import (
     AgentStatusChange,
     Connection,
     ModelProfile,
+    Run,
     Workflow,
     WorkflowDraft,
     WorkflowVersion,
@@ -330,6 +331,46 @@ class AgentService:
             if await agents.get(agent_id, include_archived=True) is None:
                 raise NotFoundError("Agent not found", agent_id=str(agent_id))
             return await agents.status_history(agent_id, limit=limit)
+
+    async def runs(
+        self,
+        principal: UserPrincipal,
+        project_id: UUID,
+        agent_id: UUID,
+        *,
+        limit: int = 50,
+    ) -> Sequence[Run]:
+        """What this agent did, as it reported it.
+
+        `agent.read_runs`, which has existed unused since the permission
+        matrix was written and this is the first thing to ask for it. Not
+        `agent.read_history`: a run is work, a transition is a status, and
+        the two tables have different producers - which is the argument
+        `status_history` makes in the other direction.
+
+        The agent is resolved first, for its own sake, exactly as
+        `status_history` does: an unknown id or one from another project
+        would otherwise come back as an empty list - "this agent has never
+        run" - which is a different and wrong answer. Archived agents are
+        included, because what an agent did before it was archived is the
+        question being asked.
+
+        **An agent AgentWorld runs itself has no runs, and neither has any
+        other agent yet.** `runs` is folded from events an external agent
+        sends about itself, and nothing in this release creates the row that
+        folding needs - so this is an empty list for every agent until a
+        producer exists. `executions` is where a managed agent's work is,
+        and the route's description says so rather than leaving a reader to
+        conclude the record was lost.
+        """
+        async with self._factory.begin(visible_workspaces=set(principal.memberships)) as work:
+            workspace_id = await _workspace_of(work, project_id)
+            authorize(principal, Action.AGENT_READ_RUNS, Resource(workspace_id))
+            scope = TenantScope(workspace_id, project_id)
+            agents = work.agents(scope)
+            if await agents.get(agent_id, include_archived=True) is None:
+                raise NotFoundError("Agent not found", agent_id=str(agent_id))
+            return await agents.runs(agent_id, limit=limit)
 
     async def create(
         self,
