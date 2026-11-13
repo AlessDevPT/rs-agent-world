@@ -22,6 +22,7 @@ from uuid import UUID
 
 from agentworld.domain.enums import (
     AgentInteractionMode,
+    AgentLiveness,
     AgentStatus,
     ApiKeyScope,
     ConnectionKind,
@@ -251,6 +252,51 @@ class Agent:
     @property
     def is_archived(self) -> bool:
         return self.archived_at is not None
+
+    def seconds_since_heartbeat(self, now: datetime) -> int | None:
+        """Whole seconds since the last heartbeat, or None if there was none.
+
+        `now` is a parameter rather than a clock read here, for the reason
+        no reducer reads one either: a value that depends on when it was
+        computed cannot be tested against anything, and a caller that
+        renders a page should judge every agent on it against one instant
+        rather than against however long the page took to build.
+
+        Floored, and never negative. A heartbeat posted through
+        `/v1/ingest/events` carries the producer's own `occurred_at`, which
+        may legitimately sit a little ahead of this server's clock - ingest
+        bounds that skew rather than correcting it - and "last seen -4
+        seconds ago" reads as a bug in whatever printed it.
+        """
+        if self.last_heartbeat_at is None:
+            return None
+        return max(0, int((now - self.last_heartbeat_at).total_seconds()))
+
+    def liveness(self, now: datetime) -> AgentLiveness:
+        """Whether this agent's heartbeat is current. Nothing more.
+
+        The threshold is this agent's own `heartbeat_ttl_seconds` - the
+        interval it declared at registration or an operator set on it - and
+        not a project or global default. Two of those exist in the codebase
+        and neither has ever had a reader; choosing between them is a
+        product decision about where thresholds belong, and a method that
+        compares a column to a clock is not the place to make it.
+
+        Measured in the same floored seconds `seconds_since_heartbeat`
+        returns, so the number shown and the verdict beside it can never
+        disagree. The comparison is `>` rather than `>=`: an agent heard
+        from exactly its TTL ago has kept its promise, and the effective
+        cut-off is therefore "more than `heartbeat_ttl_seconds` whole
+        seconds of silence".
+        """
+        if self.interaction_mode is AgentInteractionMode.MANAGED:
+            return AgentLiveness.NOT_APPLICABLE
+        elapsed = self.seconds_since_heartbeat(now)
+        if elapsed is None:
+            return AgentLiveness.NEVER_REPORTED
+        if elapsed > self.heartbeat_ttl_seconds:
+            return AgentLiveness.STALE
+        return AgentLiveness.FRESH
 
 
 @dataclass(frozen=True, slots=True)

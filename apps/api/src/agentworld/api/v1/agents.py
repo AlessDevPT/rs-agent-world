@@ -33,7 +33,7 @@ from agentworld.api.deps import (
 )
 from agentworld.api.v1.executions import ExecutionView
 from agentworld.domain.entities import Agent, AgentStatusChange, ModelProfile, Run
-from agentworld.domain.enums import AgentInteractionMode, AgentStatus, RunStatus
+from agentworld.domain.enums import AgentInteractionMode, AgentLiveness, AgentStatus, RunStatus
 from agentworld.repositories.definitions import UNSET
 
 project_router = APIRouter(prefix="/v1/projects/{project_id}/agents", tags=["agents"])
@@ -71,8 +71,40 @@ class AgentView(BaseModel):
     last_heartbeat_at: dt.datetime | None = None
     archived_at: dt.datetime | None = None
 
+    #: Derived at read time rather than folded, so these two are not in the
+    #: block above: there is no column behind either, and the answer depends
+    #: on the clock at the moment of the request.
+    liveness: AgentLiveness = Field(
+        description=(
+            "Whether this agent's heartbeat is current, judged against its own "
+            "`heartbeat_ttl_seconds`. **A claim about the heartbeat and nothing else.** "
+            "`stale` does not mean dead or stuck: an agent's beats and its work are "
+            "different events, so one that reports runs without heartbeating is `stale` "
+            "here while working - see `GET /v1/projects/{project_id}/agents/{agent_id}/runs` "
+            "for what it is actually doing. `not_applicable` for a `managed` agent, whose "
+            "loop AgentWorld runs itself, and `never_reported` for one that has not "
+            "heartbeated at all."
+        ),
+    )
+    seconds_since_heartbeat: int | None = Field(
+        default=None,
+        description=(
+            "Whole seconds of silence, or null if this agent has never heartbeated. "
+            "Floored and never negative, and measured against the same instant as "
+            "`liveness`, so the two cannot disagree."
+        ),
+    )
+
     @classmethod
-    def of(cls, agent: Agent) -> AgentView:
+    def of(cls, agent: Agent, *, now: dt.datetime) -> AgentView:
+        """`now` is passed in rather than read here.
+
+        Keyword-only and without a default, so a new call site has to say
+        which instant it is judging against instead of silently picking the
+        moment this line happened to run. A listing judges every row on it
+        against one clock, the way the reconciler computes its cut-off once
+        for a whole pass.
+        """
         return cls(
             id=agent.id,
             project_id=agent.project_id,
@@ -94,6 +126,8 @@ class AgentView(BaseModel):
             current_task_id=agent.current_task_id,
             last_heartbeat_at=agent.last_heartbeat_at,
             archived_at=agent.archived_at,
+            liveness=agent.liveness(now),
+            seconds_since_heartbeat=agent.seconds_since_heartbeat(now),
         )
 
 
@@ -388,7 +422,11 @@ async def list_agents(
     include_archived: Annotated[bool, Query()] = False,
 ) -> list[AgentView]:
     agents = await service.list_in(principal, project_id, include_archived=include_archived)
-    return [AgentView.of(agent) for agent in agents]
+    # One clock for the whole page: two agents that last reported at the same
+    # instant must not come back with different ages because the list was
+    # long.
+    now = dt.datetime.now(dt.UTC)
+    return [AgentView.of(agent, now=now) for agent in agents]
 
 
 @project_router.post(
@@ -420,7 +458,7 @@ async def create_agent(
         model_overrides=body.model_overrides,
         dispatch=body.dispatch,
     )
-    return AgentView.of(agent)
+    return AgentView.of(agent, now=dt.datetime.now(dt.UTC))
 
 
 @project_router.get("/{agent_id}", response_model=AgentView, summary="One agent")
@@ -436,7 +474,9 @@ async def get_agent(
     query parameter, which made one route in the group shaped unlike the
     rest for no reason a caller could see.
     """
-    return AgentView.of(await service.get(principal, project_id, agent_id))
+    return AgentView.of(
+        await service.get(principal, project_id, agent_id), now=dt.datetime.now(dt.UTC)
+    )
 
 
 @project_router.get(
@@ -546,7 +586,7 @@ async def update_agent(
     the name and may not change the model profile changes neither.
     """
     agent = await service.update(principal, context, project_id, agent_id, **body.sent())
-    return AgentView.of(agent)
+    return AgentView.of(agent, now=dt.datetime.now(dt.UTC))
 
 
 @project_router.delete(
@@ -592,7 +632,10 @@ async def restore_agent(
     `AgentUpdate` has no `archived_at` for the same reason it has no
     `status`: the lifecycle is verbs, not columns a client can assign.
     """
-    return AgentView.of(await service.restore(principal, context, project_id, agent_id))
+    return AgentView.of(
+        await service.restore(principal, context, project_id, agent_id),
+        now=dt.datetime.now(dt.UTC),
+    )
 
 
 @project_router.post(

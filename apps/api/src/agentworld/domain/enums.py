@@ -376,6 +376,48 @@ class WorldRouteKind(StrEnum):
     WORKFLOW_EDGE = "workflow_edge"
 
 
+# ------------------------------------------------- derived at read time ---
+# The first enum here with no native PostgreSQL type, and the comment is the
+# point: nothing persists one of these, so it is absent from `PG_ENUMS` and
+# the drift test has nothing to check it against. A column would be the
+# wrong shape for it anyway - the answer depends on the clock at the moment
+# of the question, so a stored copy would start aging the instant it was
+# written.
+
+
+class AgentLiveness(StrEnum):
+    """Whether an agent's heartbeat is current. **Nothing more than that.**
+
+    Four outcomes rather than a boolean, because three of them are not
+    "stale" and collapsing them would publish a claim the data does not
+    support.
+
+    What this deliberately does *not* say: that a `stale` agent is dead,
+    disconnected, or unable to make progress. An agent's heartbeat and its
+    work are reported by different event types and folded into different
+    columns - `agent.heartbeat` moves `agents.last_heartbeat_at`, while
+    `run.*` events never touch the agent row at all - so an agent can be
+    mid-run, reporting steps every second, and still be `stale` here because
+    it never sends the beat. That is a true statement about its heartbeat
+    and not a statement about its health. `GET .../agents/{id}/runs` is
+    where the work is.
+    """
+
+    #: A `managed` agent, whose loop AgentWorld runs itself. There is no
+    #: external worker to hear from, so there is no silence to measure -
+    #: and calling every managed agent `stale` for ever would be noise
+    #: rather than information.
+    NOT_APPLICABLE = "not_applicable"
+    #: No heartbeat has ever been folded. An agent that was never seen is
+    #: not an agent that went quiet, and `AgentStatus.PROVISIONING` already
+    #: means "registered, never seen" - this must not contradict it.
+    NEVER_REPORTED = "never_reported"
+    #: Heard from within its own `heartbeat_ttl_seconds`.
+    FRESH = "fresh"
+    #: Silent for longer than its own `heartbeat_ttl_seconds`.
+    STALE = "stale"
+
+
 #: Every enum that has a native PostgreSQL type, keyed by that type's name.
 #: The migration and the drift test both read this, so adding an enum in one
 #: place adds it in both.
