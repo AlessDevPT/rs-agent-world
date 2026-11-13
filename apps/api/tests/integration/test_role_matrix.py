@@ -45,6 +45,16 @@ class Endpoint:
     #: the usual `< 400`; setting it keeps the privilege half of the row
     #: honest without archiving a fixture every other row depends on.
     permitted: int | None = None
+    #: Query parameters, for a route that has a required one.
+    #:
+    #: `GET .../runs` is the case: `quiet_for_seconds` has no default, so
+    #: without it FastAPI answers 422 before the handler runs and both
+    #: halves of the row become a validation error instead of a permission
+    #: decision. Kept out of `path` deliberately - the coverage guard below
+    #: compares `path` against the OpenAPI schema, which carries no query
+    #: string, so a parameter spelled there would report the route as
+    #: uncovered.
+    query: dict[str, str] | None = None
 
     def __str__(self) -> str:  # keeps pytest ids readable
         return f"{self.method} {self.path}"
@@ -107,6 +117,14 @@ ENDPOINTS = [
     # listing may read the same row reached through its agent.
     Endpoint("GET", "/v1/projects/{project}/agents/{agent}/runs", MemberRole.VIEWER),
     Endpoint("GET", "/v1/projects/{project}/agents/{agent}/executions", MemberRole.VIEWER),
+    # The project-level read of the same table, on the same action. Its
+    # threshold is required, so the row carries one - see `Endpoint.query`.
+    Endpoint(
+        "GET",
+        "/v1/projects/{project}/runs",
+        MemberRole.VIEWER,
+        query={"quiet_for_seconds": "60"},
+    ),
     # Editing is `member`; the configuration half is `admin` and is covered
     # by its own test in `test_agents_api.py`, because the role it needs
     # depends on which fields the body carries rather than on the route.
@@ -485,6 +503,7 @@ def test_role_matrix(
     response = client.request(
         endpoint.method,
         scenario.url(endpoint.path),
+        params=endpoint.query,
         json=scenario.body(endpoint.body),
         headers=actor.headers,
     )

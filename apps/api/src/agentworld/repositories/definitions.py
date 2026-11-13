@@ -28,11 +28,17 @@ from agentworld.domain.entities import (
     Connection,
     ModelProfile,
     Run,
+    RunActivity,
     Workflow,
     WorkflowDraft,
     WorkflowVersion,
 )
-from agentworld.domain.enums import AgentInteractionMode, ConnectionKind, SideEffect
+from agentworld.domain.enums import (
+    AgentInteractionMode,
+    ConnectionKind,
+    RunStatus,
+    SideEffect,
+)
 from agentworld.repositories import models as m
 from agentworld.repositories.base import ScopedRepository
 
@@ -485,6 +491,92 @@ def _to_agent(row: m.Agent) -> Agent:
         last_event_at=row.last_event_at,
         registered_at=row.registered_at,
         archived_at=row.archived_at,
+    )
+
+
+class RunRepository(ScopedRepository):
+    """Reads across a project's runs, rather than one agent's.
+
+    `AgentRepository.runs` answers "what did this agent do". This answers
+    "what in this project has gone quiet", which is a different question
+    with a different access path and no agent in the route. Both read
+    `runs`, which is why they are neighbours.
+    """
+
+    async def quiet_in_project(
+        self, *, quiet_before: dt.datetime, limit: int
+    ) -> Sequence[RunActivity]:
+        """Running runs whose newest evidence is older than `quiet_before`.
+
+        **The activity clock is not `runs.last_event_at`.** That column is
+        moved by `run.started`, `run.finished` and `run.failed` and by
+        nothing else, so a run that has been reporting steps for an hour
+        still carries the timestamp it opened with. Filtering on it alone
+        flags every run open longer than the threshold: measured at 290
+        candidates out of 300 running runs of which 5 were genuinely quiet.
+        The lateral below takes the newest of the run's own clock and its
+        trace's, which brought the same case to 10 - the residue being runs
+        whose only activity was tool calls, which carry no timestamp
+        anywhere. `RunActivity.has_untimed_activity` is how those are
+        disclosed rather than hidden.
+
+        `GREATEST` ignores NULLs in PostgreSQL, so a run with no steps
+        needs no special case; the `COALESCE` to `started_at` is for a row
+        with no clock at all, which only a direct INSERT can produce.
+
+        Settled runs are excluded by status. `running` is the only member of
+        `RunStatus` outside `_SETTLED_RUNS`, and a unit test pins that
+        equivalence, so a status added later fails a test rather than
+        quietly joining this listing.
+
+        The project predicate is stated here rather than left to row-level
+        security, like every other read in this file.
+        `runs_project_ref_key` leads with `project_id` and serves as the
+        access path; the lateral is an index probe per candidate through
+        `run_steps_seq_key`. Neither needed a migration, which was checked
+        with `EXPLAIN` rather than assumed.
+
+        Quietest first, so the longest-silent run is on the first page, with
+        `id` as the tiebreak because runs folded from one batch share their
+        timestamps exactly. One honest limitation: the sort key is computed,
+        so `limit` bounds the page and not the work - this costs a pass over
+        the project's running runs whatever the limit. The thing to measure
+        before a project holds thousands at once.
+        """
+        trace = (
+            sa.select(sa.func.max(m.RunStep.last_event_at).label("latest"))
+            .where(m.RunStep.run_id == m.Run.id)
+            .lateral("trace")
+        )
+        activity = sa.func.coalesce(
+            sa.func.greatest(m.Run.last_event_at, trace.c.latest), m.Run.started_at
+        )
+        rows = await self._session.execute(
+            sa.select(m.Run, trace.c.latest)
+            .select_from(m.Run)
+            .outerjoin(trace, sa.true())
+            .where(
+                m.Run.project_id == self.scope.require_project(),
+                m.Run.status == RunStatus.RUNNING,
+                activity < quiet_before,
+            )
+            .order_by(activity.asc(), m.Run.id.asc())
+            .limit(limit)
+        )
+        return [_to_run_activity(row.Run, latest=row.latest) for row in rows.all()]
+
+
+def _to_run_activity(row: m.Run, *, latest: dt.datetime | None) -> RunActivity:
+    return RunActivity(
+        id=row.id,
+        agent_id=row.agent_id,
+        status=row.status,
+        started_at=row.started_at,
+        run_ref=row.run_ref,
+        step_count=row.step_count,
+        tool_call_count=row.tool_call_count,
+        last_event_at=row.last_event_at,
+        last_step_event_at=latest,
     )
 
 

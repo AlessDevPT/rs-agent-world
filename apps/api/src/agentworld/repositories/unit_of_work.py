@@ -33,6 +33,7 @@ from agentworld.repositories.definitions import (
     AgentRepository,
     ConnectionRepository,
     ModelProfileRepository,
+    RunRepository,
     WorkflowRepository,
 )
 from agentworld.repositories.derived import DerivedStateRepository
@@ -113,6 +114,10 @@ class UnitOfWork:
     def agents(self, scope: TenantScope) -> AgentRepository:
         """Definition, not derived state - see `repositories.definitions`."""
         return AgentRepository(self._session, scope)
+
+    def runs(self, scope: TenantScope) -> RunRepository:
+        """Across a project's runs, where `agents` reads one agent's."""
+        return RunRepository(self._session, scope)
 
     def model_profiles(self, scope: TenantScope) -> ModelProfileRepository:
         return ModelProfileRepository(self._session, scope)

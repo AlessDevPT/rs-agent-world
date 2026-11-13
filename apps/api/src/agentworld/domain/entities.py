@@ -21,6 +21,7 @@ from typing import Any
 from uuid import UUID
 
 from agentworld.domain.enums import (
+    ActivityEvidence,
     AgentInteractionMode,
     AgentLiveness,
     AgentStatus,
@@ -368,6 +369,114 @@ class Run:
     #: Computed by the database, so no writer can disagree with it. NULL
     #: until the run finishes.
     duration_ms: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class RunActivity:
+    """A running run, and the newest evidence that anything happened to it.
+
+    A separate projection rather than fields on `Run`, for two reasons.
+    `Run` has no `agent_id` - a run is read through the agent it belongs
+    to, so the id would repeat the question - and a project-level listing
+    has to report it. And this carries two clocks where `Run` carries
+    none: the run row's own, and the newest of its steps'.
+
+    **Nothing here says a run failed, and nothing may.** AgentWorld never
+    observes an external agent directly, so a run that has gone quiet is an
+    absence of evidence rather than a failure, and the difference is not
+    cosmetic: `_SETTLED_RUNS` makes a settled status permanent, so a run
+    marked failed on inference could never be corrected by the agent's own
+    later report. These fields say what was last heard and when, and leave
+    the conclusion to a person.
+    """
+
+    id: UUID
+    agent_id: UUID
+    status: RunStatus
+    started_at: datetime
+    #: The agent's own identifier for this attempt.
+    run_ref: str | None = None
+    #: Completed steps: `run.step_finished` increments it. A run with a step
+    #: in flight reports 0 here while its trace clock has already moved.
+    step_count: int = 0
+    #: `tool.invoked` increments it. `tool.returned`, `tool.failed` and
+    #: `tool.denied` are stored as events and fold into nothing, so an agent
+    #: whose every call was refused reports no tool activity here.
+    tool_call_count: int = 0
+    #: `runs.last_event_at`: moved by `run.started`, `run.finished` and
+    #: `run.failed`, and by nothing else - not by steps, not by tool calls.
+    last_event_at: datetime | None = None
+    #: `max(run_steps.last_event_at)`: moved by both step events. NULL when
+    #: the run has no steps, which is not the same as having had no activity.
+    last_step_event_at: datetime | None = None
+
+    @property
+    def trace_is_newer(self) -> bool:
+        """Whether a step's clock is *strictly* ahead of the run's own.
+
+        Strictly, and the tie is the ordinary case rather than a curiosity:
+        a `run.started` and the first `run.step_started` posted in one
+        batch share one `occurred_at`. Resolving a tie to the run's own
+        clock is what makes `TRACE_STEP` mean "the trace knows something
+        the run row does not".
+        """
+        if self.last_step_event_at is None:
+            return False
+        return self.last_event_at is None or self.last_step_event_at > self.last_event_at
+
+    @property
+    def activity_evidence(self) -> ActivityEvidence:
+        """Which clock produced `last_activity_at`."""
+        if self.trace_is_newer:
+            return ActivityEvidence.TRACE_STEP
+        if self.last_event_at is not None:
+            return ActivityEvidence.RUN_EVENT
+        return ActivityEvidence.NONE
+
+    @property
+    def last_activity_at(self) -> datetime:
+        """The newest timestamp there is, falling back to the start.
+
+        Exactly `COALESCE(GREATEST(last_event_at, last_step_event_at),
+        started_at)`, which is what the repository filters and orders on -
+        so the rows a query selects and the ages reported for them cannot
+        disagree about which runs are quiet.
+        """
+        if self.trace_is_newer:
+            assert self.last_step_event_at is not None  # trace_is_newer proved it
+            return self.last_step_event_at
+        if self.last_event_at is not None:
+            return self.last_event_at
+        return self.started_at
+
+    @property
+    def has_untimed_activity(self) -> bool:
+        """Tool calls were counted, and nothing dated is newer.
+
+        `tool.invoked` increments `tool_call_count` and moves no clock, so
+        counted tool work can never produce `TRACE_STEP` and a busy run can
+        read as silent. This is the flag that says so, and it exists
+        because `activity_evidence` cannot: three values describe which
+        clock won, not what else is known.
+
+        **It is not "this run made tool calls"** - `tool_call_count` says
+        that, and conflating the two is the misreading this field exists to
+        prevent. It does not mean a call is running now, or that the agent
+        is still working. False does not mean no calls were made: only that
+        something dated is newer. The counter may describe work from before
+        `last_activity_at`; nothing here can tell.
+        """
+        return self.tool_call_count > 0 and not self.trace_is_newer
+
+    def seconds_since_activity(self, now: datetime) -> int:
+        """Whole seconds since the newest evidence. Never negative.
+
+        Floored and clamped for the reason `Agent.seconds_since_heartbeat`
+        is: `occurred_at` is the producer's clock, ingest bounds its forward
+        skew rather than correcting it, and a negative age reads as a bug in
+        whatever printed it.
+        """
+        return max(0, int((now - self.last_activity_at).total_seconds()))
 
 
 @dataclass(frozen=True, slots=True)

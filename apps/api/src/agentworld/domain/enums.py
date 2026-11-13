@@ -418,6 +418,32 @@ class AgentLiveness(StrEnum):
     STALE = "stale"
 
 
+class ActivityEvidence(StrEnum):
+    """Which timestamp an external run's newest activity came from.
+
+    **Provenance, not health.** It says which clock is newest and nothing
+    else: not whether the run has steps, not whether the agent is working,
+    and never that a run has failed.
+    """
+
+    #: The run row's own `last_event_at` is newest. That column is moved by
+    #: `run.started`, `run.finished` and `run.failed` and by nothing else -
+    #: so this is also the answer when a step's timestamp ties with it, and
+    #: when a late step's is older. It does **not** mean "no steps", and it
+    #: is not evidence that no tool calls were made: tool calls move no
+    #: clock at all, so they can never produce `TRACE_STEP`.
+    RUN_EVENT = "run_event"
+    #: A step's `last_event_at` is *strictly* newer than the run row's, so
+    #: the trace knows something the run row does not.
+    TRACE_STEP = "trace_step"
+    #: Neither clock is set and `started_at` is all there is. No ingested
+    #: event can produce this - `DerivedStateRepository._append_run` writes
+    #: `last_event_at` in the same INSERT that creates the row - so it
+    #: survives for rows written directly: a seeded fixture, or a run from
+    #: before the producer existed.
+    NONE = "none"
+
+
 #: Every enum that has a native PostgreSQL type, keyed by that type's name.
 #: The migration and the drift test both read this, so adding an enum in one
 #: place adds it in both.

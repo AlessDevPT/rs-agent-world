@@ -20,6 +20,7 @@ response to discover which half landed.
 
 from __future__ import annotations
 
+import datetime as dt
 from collections.abc import Mapping, Sequence
 from typing import Any
 from uuid import UUID
@@ -30,6 +31,7 @@ from agentworld.domain.entities import (
     Connection,
     ModelProfile,
     Run,
+    RunActivity,
     Workflow,
     WorkflowDraft,
     WorkflowVersion,
@@ -370,6 +372,42 @@ class AgentService:
             if await agents.get(agent_id, include_archived=True) is None:
                 raise NotFoundError("Agent not found", agent_id=str(agent_id))
             return await agents.runs(agent_id, limit=limit)
+
+    async def quiet_runs(
+        self,
+        principal: UserPrincipal,
+        project_id: UUID,
+        *,
+        quiet_for_seconds: int,
+        now: dt.datetime,
+        limit: int = 50,
+    ) -> Sequence[RunActivity]:
+        """Runs still `running` that have reported nothing for a while.
+
+        `agent.read_runs`, the same action the per-agent listing uses: this
+        is the same data asked about differently, and a reader who may see
+        one agent's runs may see the project's.
+
+        **Detection, and nothing else.** No status is written, no event is
+        emitted, no audit row is kept - there is nothing to record, because
+        AgentWorld never observes an external agent directly and a quiet run
+        is an absence of evidence rather than a failure. Marking one failed
+        would also be unrecoverable: `_SETTLED_RUNS` makes a settled status
+        permanent, so the agent's own later `run.finished` would be refused.
+        That is the argument for this being a read.
+
+        `now` is passed in rather than read here, so the cut-off and every
+        age in the response come from one instant. The threshold has no
+        default on purpose: `agents.heartbeat_ttl_seconds` is a heartbeat
+        interval rather than a patience, and where a run's belongs has not
+        been decided.
+        """
+        async with self._factory.begin(visible_workspaces=set(principal.memberships)) as work:
+            workspace_id = await _workspace_of(work, project_id)
+            authorize(principal, Action.AGENT_READ_RUNS, Resource(workspace_id))
+            scope = TenantScope(workspace_id, project_id)
+            quiet_before = now - dt.timedelta(seconds=quiet_for_seconds)
+            return await work.runs(scope).quiet_in_project(quiet_before=quiet_before, limit=limit)
 
     async def create(
         self,

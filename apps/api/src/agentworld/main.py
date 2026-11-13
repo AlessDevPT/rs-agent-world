@@ -146,6 +146,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(ingest.router)
     app.include_router(agents.project_router)
     app.include_router(agents.profiles_router)
+    app.include_router(agents.runs_router)
     app.include_router(workflows.connections_router)
     app.include_router(workflows.workflows_router)
     app.include_router(credentials.router)

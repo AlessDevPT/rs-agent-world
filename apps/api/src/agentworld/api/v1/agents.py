@@ -32,12 +32,27 @@ from agentworld.api.deps import (
     ModelProfileServiceDep,
 )
 from agentworld.api.v1.executions import ExecutionView
-from agentworld.domain.entities import Agent, AgentStatusChange, ModelProfile, Run
-from agentworld.domain.enums import AgentInteractionMode, AgentLiveness, AgentStatus, RunStatus
+from agentworld.domain.entities import (
+    Agent,
+    AgentStatusChange,
+    ModelProfile,
+    Run,
+    RunActivity,
+)
+from agentworld.domain.enums import (
+    ActivityEvidence,
+    AgentInteractionMode,
+    AgentLiveness,
+    AgentStatus,
+    RunStatus,
+)
 from agentworld.repositories.definitions import UNSET
 
 project_router = APIRouter(prefix="/v1/projects/{project_id}/agents", tags=["agents"])
 profiles_router = APIRouter(prefix="/v1/workspaces/{workspace_id}/model-profiles", tags=["agents"])
+#: Project-level rather than nested under an agent, because "what in this
+#: project has gone quiet" is not a question about one agent.
+runs_router = APIRouter(prefix="/v1/projects/{project_id}/runs", tags=["agents"])
 
 Name = Annotated[str, Field(min_length=1, max_length=200)]
 
@@ -204,7 +219,9 @@ class RunView(BaseModel):
     tool_call_count: int = Field(
         default=0,
         description=(
-            "Tool calls this run made, refused ones included: a blocked agent is not an idle one."
+            "Tool calls this run *invoked*. Refused ones are **not** counted: `tool.denied` "
+            "is recorded in the event log and folds into nothing, so an agent whose every "
+            "call was blocked reports zero here. The event feed is where those refusals are."
         ),
     )
     error: dict[str, Any] | None = None
@@ -229,6 +246,98 @@ class RunView(BaseModel):
             started_at=run.started_at,
             finished_at=run.finished_at,
             duration_ms=run.duration_ms,
+        )
+
+
+class RunActivityView(BaseModel):
+    """A run that has reported nothing recently, and what is known about it.
+
+    **Not a verdict, and deliberately not shaped like one.** There is no
+    field here that says failed, dead, abandoned or stuck, because nothing
+    in this system can know any of those about an agent it does not run. A
+    row is an absence of evidence with timestamps attached.
+    """
+
+    id: UUID
+    run_ref: str | None = Field(
+        default=None, description="The agent's own identifier for this attempt."
+    )
+    agent_id: UUID = Field(description="The agent that reported this run.")
+    status: RunStatus
+    started_at: dt.datetime
+    last_activity_at: dt.datetime = Field(
+        description=(
+            "The newest timestamp known for this run: its own `run.*` clock, or its "
+            "newest step's, whichever is later - falling back to `started_at` when "
+            "neither is set. `activity_evidence` says which one it was."
+        ),
+    )
+    seconds_since_activity: int = Field(
+        description=(
+            "Whole seconds since `last_activity_at`, floored and never negative, measured "
+            "against one instant shared by every row in this response."
+        ),
+    )
+    step_count: int = Field(
+        default=0,
+        description=(
+            "Steps *completed*: `run.step_finished` increments it. A run with a step in "
+            "flight reports 0 here while `activity_evidence` is already `trace_step`, "
+            "because the trace clock moves on `run.step_started` too. Not a contradiction, "
+            "and not a count of steps attempted."
+        ),
+    )
+    tool_call_count: int = Field(
+        default=0,
+        description=(
+            "Tool calls *invoked*. Refused ones are not counted - `tool.denied` folds into "
+            "nothing - so an agent whose every call was blocked reports zero here and this "
+            "endpoint shows it as entirely silent."
+        ),
+    )
+    activity_evidence: ActivityEvidence = Field(
+        description=(
+            "**Which timestamp `last_activity_at` came from, and nothing else.** "
+            "`trace_step` means a step's timestamp is *strictly* newer than the run-level "
+            "one. `run_event` means it is not - which includes a tie, and includes a run "
+            "whose steps are older than its own clock - so this field does **not** tell "
+            "you whether the run has steps. `none` means neither clock is set, which no "
+            "ingested event can produce; it survives for rows written directly. "
+            "**`run_event` is not evidence that no tool activity occurred**: tool calls "
+            "move no clock, so they can never produce `trace_step`. Read "
+            "`has_untimed_activity` for that."
+        ),
+    )
+    has_untimed_activity: bool = Field(
+        description=(
+            "True when tool calls have been counted and no step timestamp is newer than "
+            "the run-level one. It means only that this response holds counted tool "
+            "activity it cannot date. **It does not mean a tool call is running now, and "
+            "it does not mean the agent is still working** - and False does not mean no "
+            "calls were made, only that something dated is newer."
+        ),
+    )
+
+    @classmethod
+    def of(cls, run: RunActivity, *, now: dt.datetime) -> RunActivityView:
+        """`now` is passed in rather than read here.
+
+        Keyword-only and without a default, as `AgentView.of` is: one
+        instant decides the cut-off that selected these rows and the age
+        reported for each of them, so a long page cannot age as it is built.
+        """
+        return cls(
+            id=run.id,
+            run_ref=run.run_ref,
+            agent_id=run.agent_id,
+            status=run.status,
+            started_at=run.started_at,
+            last_activity_at=run.last_activity_at,
+            seconds_since_activity=run.seconds_since_activity(now),
+            step_count=run.step_count,
+            tool_call_count=run.tool_call_count,
+            activity_evidence=run.activity_evidence,
+            has_untimed_activity=run.has_untimed_activity,
         )
 
 
@@ -538,6 +647,54 @@ async def agent_runs(
     """
     runs = await service.runs(principal, project_id, agent_id, limit=limit)
     return [RunView.of(run) for run in runs]
+
+
+@runs_router.get(
+    "",
+    response_model=list[RunActivityView],
+    summary="Runs that have reported nothing recently",
+    description=(
+        "Runs still marked `running` whose newest timestamped evidence is older than "
+        "`quiet_for_seconds`. **This is not a list of failed runs, and reading it changes "
+        "nothing.** A run appears because nothing has been reported about it recently, "
+        "which may mean the agent stopped, or that it is still thinking, or that the work "
+        "it is doing leaves no timestamped trace. AgentWorld does not run these agents and "
+        "cannot tell those apart.\n\n"
+        "Check `has_untimed_activity` before concluding a run is idle: tool calls are "
+        "counted and carry no timestamp, so a run doing tool work can look old on every "
+        "clock here. A run whose tool calls were all *denied* reports no tool activity at "
+        "all, so this endpoint can show a blocked agent as silent - the event feed is "
+        "where those refusals are.\n\n"
+        "Quietest first. Settled runs are never listed. `quiet_for_seconds` is required: "
+        "there is no default patience, and an agent's heartbeat interval is not one."
+    ),
+)
+async def quiet_runs(
+    project_id: UUID,
+    quiet_for_seconds: Annotated[
+        int,
+        Query(
+            ge=1,
+            le=2_592_000,
+            description="How long a run must have been silent to be listed. Required.",
+        ),
+    ],
+    principal: CurrentUser,
+    service: AgentServiceDep,
+    limit: Annotated[int, Query(ge=1, le=200)] = 50,
+) -> list[RunActivityView]:
+    """`viewer`, through `agent.read_runs` - the same action as the per-agent read.
+
+    One clock for the whole response: `now` decides the cut-off that selects
+    the rows and the age reported for each of them, so the two cannot
+    disagree and a long page does not age while it is built. The reconciler
+    computes its cut-off once per pass for the same reason.
+    """
+    now = dt.datetime.now(dt.UTC)
+    quiet = await service.quiet_runs(
+        principal, project_id, quiet_for_seconds=quiet_for_seconds, now=now, limit=limit
+    )
+    return [RunActivityView.of(run, now=now) for run in quiet]
 
 
 @project_router.get(
