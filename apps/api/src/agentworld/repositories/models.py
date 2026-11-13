@@ -1331,7 +1331,23 @@ class Run(Base):
     #: As of when we know this row's state, for the staleness guard in
     #: `repositories.derived`. Null means nothing has been folded yet,
     #: so any event is newer - hence no default.
+    #:
+    #: **Only `run.started`, `run.finished` and `run.failed` may move it.**
+    #: `_patch` compares this column with `<=` against the incoming
+    #: `occurred_at` on the same column it writes, so a step event that
+    #: advanced it could make a `run.finished` with an earlier timestamp
+    #: fail its own guard and leave the run running for ever. That is the
+    #: whole reason the column below exists separately.
     last_event_at: Mapped[dt.datetime | None]
+    #: As of when we last heard anything *about* this run, as opposed to
+    #: anything that changed its state: a step started or finished, a tool
+    #: invoked, returned, failed or denied. Guarded on itself by the
+    #: reducers, so it only ever moves forwards.
+    #:
+    #: Null means nothing has been heard since the run opened - true of a
+    #: quiet new run, and of every row written before migration 0025, which
+    #: backfilled nothing. Readers coalesce rather than assuming.
+    last_activity_at: Mapped[dt.datetime | None]
     #: Computed by PostgreSQL, so no writer can disagree with it.
     duration_ms: Mapped[int | None] = mapped_column(
         sa.Integer, sa.Computed(DURATION_MS, persisted=True)

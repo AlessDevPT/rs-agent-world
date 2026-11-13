@@ -341,6 +341,16 @@ def _run(envelope: EventEnvelope) -> tuple[Mutation, ...]:
         # A trace step with no sequence cannot be placed in the trace.
         return _NOTHING
     step = RunStepRef(run_ref=envelope.subject.ref, seq=seq)
+    # Heard-from, which is not the same as state-changed. `last_event_at` is
+    # the guard the run-state patches above compare against, and only
+    # `run.started`, `run.finished` and `run.failed` may move it: a step
+    # event that advanced it could make a `run.finished` with an earlier
+    # `occurred_at` fail its own guard and leave the run running for ever.
+    # So this is a second column, guarded on itself - monotonic, and inert
+    # to everything else on the row, including a settled status. A late
+    # event about a finished run is still a true fact about when we heard
+    # it, and the status the patches above protect is untouched by it.
+    stirred = _stirred(run, envelope)
 
     if name == "step_started":
         return (
@@ -355,6 +365,7 @@ def _run(envelope: EventEnvelope) -> tuple[Mutation, ...]:
                     **seen,
                 },
             ),
+            stirred,
         )
     if name == "step_finished":
         failed = bool(payload.get("error"))
@@ -375,28 +386,76 @@ def _run(envelope: EventEnvelope) -> tuple[Mutation, ...]:
             # island reads it per frame and counting rows per agent per frame
             # is the kind of query that looks free until there are a thousand.
             Increment(run, {"step_count": 1}),
+            stirred,
         )
     return _NOTHING
+
+
+def _stirred(run: RunRef, envelope: EventEnvelope) -> Patch:
+    """Something was heard about this run, and nothing more than that.
+
+    One shape, built in two places, because the two have to agree: a step
+    event and a tool event are the same kind of evidence and must move the
+    same column by the same rule. Guarded on the column it writes, so a
+    backlog flushed out of order leaves the newest timestamp standing
+    rather than the last one delivered.
+    """
+    return Patch(
+        run,
+        {"last_activity_at": envelope.occurred_at},
+        not_before=("last_activity_at", envelope.occurred_at),
+    )
 
 
 # --------------------------------------------------------------------- tool ---
 
 
-def _tool(envelope: EventEnvelope) -> tuple[Mutation, ...]:
-    """Tool calls count against the run that made them.
+#: The four tool events this release knows. Spelled out rather than "the
+#: whole namespace", because an unknown type must still fold into nothing -
+#: the protocol stores what it does not understand and changes nothing from
+#: it, and a clock is a change like any other.
+_TOOL_EVENTS: Final[frozenset[str]] = frozenset(
+    {"tool.invoked", "tool.returned", "tool.failed", "tool.denied"}
+)
 
-    `tool.denied` counts too, deliberately. A refused call is work the agent
-    tried to do, and leaving it out of the count would make a blocked agent
-    look like an idle one - the same reason the event type exists at all.
+
+def _tool(envelope: EventEnvelope) -> tuple[Mutation, ...]:
+    """What an agent reached for, and the fact that it reached at all.
+
+    **All four move the activity clock; only `tool.invoked` moves the
+    counter.** They are different questions. A clock asks "did anything
+    happen", and a call that returned, failed or was refused answers yes as
+    loudly as one that was made. A counter asks "how many calls", and
+    `tool.returned` and `tool.failed` describe a call `tool.invoked` has
+    already counted - counting them would count one call two or three
+    times.
+
+    `tool.denied` is the one worth naming. A refused call is work the agent
+    tried to do, which is why the event type exists at all: silence would
+    make a blocked agent look like an idle one. The clock is where that
+    argument finally holds - a wholly blocked run stops reading as quiet.
+    It is still not a tool call. `tool_call_count` names calls that were
+    made and a denied call never ran, so counting it would change what a
+    published number means; this docstring claimed it already did, and it
+    never has. Whether denials deserve a counter of their own is a separate
+    decision with its own migration.
+
+    A tool event that names no run folds into nothing, as it always has:
+    `correlation.run_ref`, or the subject when the subject is the run.
     """
+    if envelope.type not in _TOOL_EVENTS:
+        return _NOTHING
     run_ref = envelope.correlation.run_ref or (
         envelope.subject.ref if envelope.subject.kind == "run" else None
     )
     if not run_ref:
         return _NOTHING
+
+    run = RunRef(run_ref=run_ref)
+    stirred = _stirred(run, envelope)
     if envelope.type == "tool.invoked":
-        return (Increment(RunRef(run_ref=run_ref), {"tool_call_count": 1}),)
-    return _NOTHING
+        return (Increment(run, {"tool_call_count": 1}), stirred)
+    return (stirred,)
 
 
 # ----------------------------------------------------------------- workflow ---

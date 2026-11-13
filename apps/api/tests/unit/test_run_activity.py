@@ -283,38 +283,45 @@ def test_running_is_the_only_status_the_listing_may_include() -> None:
 
 
 def test_a_denied_tool_call_is_not_counted_and_the_api_says_so() -> None:
-    """**A recorded gap, not an endorsement.**
+    """**A recorded gap, and half of it is now closed.**
 
     `domain/protocol/taxonomy.py` argues that `tool.denied` earns its place
     because "a tool call refused by a grant or a policy is information the
     island should show, and silence would make a blocked agent look like an
-    idle one". The reducer disagrees: only `tool.invoked` increments
-    `tool_call_count`, so an agent whose every call was refused reports no
-    tool activity and this endpoint shows it as silent.
+    idle one". When D4.2a pinned this, the reducer disagreed in both halves:
+    a denied call folded into nothing at all, so it neither counted nor
+    registered as activity, and `RunView.tool_call_count` claimed otherwise
+    in the published contract.
 
-    Fixing that is a reducer change D4.2a excludes. What this stage does is
-    stop the API claiming otherwise - `RunView.tool_call_count` used to say
-    "refused ones included" - and pin the behaviour here, so the fix cannot
-    land without this test and those descriptions being corrected together.
+    Stage D4.3 A1 closed the half the data supports. All four tool events
+    now move `runs.last_activity_at`, so a wholly blocked run stops reading
+    as quiet - which is the island's complaint answered. The counter is
+    unchanged and deliberately so: `tool_call_count` names calls that were
+    made, and a denied call never ran. This test now pins **the counter**
+    rather than the whole fold, which is what it always meant.
     """
     from agentworld.domain.protocol import parse_envelope
-    from agentworld.domain.reducers import fold
+    from agentworld.domain.reducers import Increment, fold
 
-    def mutations(event_type: str) -> tuple[object, ...]:
-        return fold(
-            parse_envelope(
-                {
-                    "dedup_key": "d",
-                    "type": event_type,
-                    "protocol_version": "1.0",
-                    "occurred_at": NOW.isoformat(),
-                    "subject": {"kind": "tool_call", "ref": "run-1:t1"},
-                    "correlation": {"run_ref": "run-1"},
-                }
+    def counted(event_type: str) -> list[int]:
+        return [
+            mutation.deltas["tool_call_count"]
+            for mutation in fold(
+                parse_envelope(
+                    {
+                        "dedup_key": "d",
+                        "type": event_type,
+                        "protocol_version": "1.0",
+                        "occurred_at": NOW.isoformat(),
+                        "subject": {"kind": "tool_call", "ref": "run-1:t1"},
+                        "correlation": {"run_ref": "run-1"},
+                    }
+                )
             )
-        )
+            if isinstance(mutation, Increment) and "tool_call_count" in mutation.deltas
+        ]
 
-    assert len(mutations("tool.invoked")) == 1, "the only tool event that counts"
-    assert mutations("tool.denied") == (), "recorded as an event, folded into nothing"
-    assert mutations("tool.failed") == ()
-    assert mutations("tool.returned") == ()
+    assert counted("tool.invoked") == [1], "the only tool event that counts"
+    assert counted("tool.denied") == [], "a refused call never ran, so it is not a call"
+    assert counted("tool.failed") == [], "the same call `invoked` already counted"
+    assert counted("tool.returned") == []

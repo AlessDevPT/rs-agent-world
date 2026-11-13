@@ -13,6 +13,7 @@ determinism test and fail this one.
 
 from __future__ import annotations
 
+import ast
 import datetime as dt
 import uuid
 from typing import Any
@@ -400,6 +401,14 @@ async def test_refolding_the_stored_log_reproduces_the_state(
     # nothing and would pass. R1 is what made these non-empty.
     assert before["runs"], "the fixture should have produced a run"
     assert before["run_steps"], "the fixture should have produced a trace step"
+    # And the activity clock stage A1 added, for the same reason: a replay
+    # that agreed about NULL would agree about nothing. The trace in this
+    # stream is what moves it.
+    # `_snapshot` stringifies the decoded jsonb, so the row is a Python
+    # mapping repr rather than JSON text.
+    assert ast.literal_eval(before["runs"][0])["last_activity_at"] is not None, (
+        "the trace should have moved the run's activity clock"
+    )
 
     # Throw the derived state away - everything except the agent rows, which
     # are configuration and were never derived from the log.

@@ -50,6 +50,16 @@ from agentworld.domain.reducers.fold import (
 AT = "2026-11-04T07:00:11.204Z"
 WHEN = dt.datetime(2026, 11, 4, 7, 0, 11, 204000, tzinfo=dt.UTC)
 
+#: The one mutation stage A1 added, which six event types now carry.
+#: Guarded on the column it writes, so a late event cannot move it back,
+#: and deliberately not `last_event_at` - see `test_the_activity_clock_
+#: is_not_the_state_clock` below for what that separation protects.
+STIRRED = Patch(
+    RunRef("run-1"),
+    {"last_activity_at": WHEN},
+    not_before=("last_activity_at", WHEN),
+)
+
 
 def folded(
     event_type: str,
@@ -415,6 +425,7 @@ def test_a_trace_step_appends_then_patches_and_counts() -> None:
                 "last_event_at": WHEN,
             },
         ),
+        STIRRED,
     )
 
     finished = folded("run.step_finished", "run", "run-1", {"seq": 1, "output": {"tokens": 240}})
@@ -446,21 +457,117 @@ def test_a_failed_run_records_when_and_why() -> None:
 # ------------------------------------------------------------------- the tool ---
 
 
-def test_a_denied_tool_call_counts_as_an_attempt() -> None:
-    """Leaving it out would make a blocked agent look like an idle one - which
-    is the same reason `tool.denied` exists at all."""
+def test_an_invoked_tool_call_counts_and_moves_the_clock() -> None:
     assert folded("tool.invoked", "tool_call", "run-1:tool-1", run_ref="run-1") == (
         Increment(RunRef("run-1"), {"tool_call_count": 1}),
+        STIRRED,
     )
 
 
+def test_a_denied_tool_call_moves_the_clock_and_not_the_counter() -> None:
+    """**The gap this test used to hide.**
+
+    It was called `test_a_denied_tool_call_counts_as_an_attempt` and its
+    body folded `tool.invoked` - so it asserted nothing at all about
+    `tool.denied`, while its docstring repeated the claim `_tool`'s own
+    docstring made: that leaving denials out of the count would make a
+    blocked agent look like an idle one. The count never included them.
+
+    Stage A1 makes that argument true by the clock rather than the
+    counter, which is the honest half of it. A refused call is evidence
+    the run is alive, so it moves `last_activity_at` and a wholly blocked
+    run stops reading as quiet. It is still not a tool call - a denied
+    call never ran - so `tool_call_count` is untouched, and whether
+    denials deserve a counter of their own is a separate decision.
+    """
+    assert folded("tool.denied", "tool_call", "run-1:tool-1", run_ref="run-1") == (STIRRED,)
+
+
 def test_a_tool_return_does_not_count_a_second_time() -> None:
-    """`invoked` and `returned` are two events about one call."""
-    assert folded("tool.returned", "tool_call", "run-1:tool-1", run_ref="run-1") == ()
+    """`invoked` and `returned` are two events about one call.
+
+    One call, one count - and two moments, both of which are evidence the
+    run was alive, so both move the clock.
+    """
+    assert folded("tool.returned", "tool_call", "run-1:tool-1", run_ref="run-1") == (STIRRED,)
+    assert folded("tool.failed", "tool_call", "run-1:tool-1", run_ref="run-1") == (STIRRED,)
 
 
 def test_a_tool_call_with_no_run_folds_to_nothing() -> None:
     assert folded("tool.invoked", "tool_call", "tool-1") == ()
+
+
+def test_a_tool_type_this_release_does_not_know_folds_to_nothing() -> None:
+    """Including the clock. Storing what we do not understand is the promise;
+    changing state from it is not, and a timestamp is state."""
+    assert folded("tool.rate_limited", "tool_call", "run-1:tool-1", run_ref="run-1") == ()
+
+
+def test_the_activity_clock_is_not_the_state_clock() -> None:
+    """**The regression test for the obvious wrong implementation.**
+
+    A1 could have been built by advancing `runs.last_event_at` on these
+    six events instead of adding a column, and everything would have
+    looked right until a run could not be closed: `_patch` compares
+    `last_event_at` with `<=` against the incoming `occurred_at` on the
+    same column it writes, so a step dated after a `run.finished` would
+    make the finish fail its own guard and leave the run running for ever.
+
+    So no mutation any of the six produces may name `last_event_at` on the
+    run, and the three run-state events must still name it. Asserted over
+    the fields rather than by eye, because this is exactly the kind of
+    thing a later edit reintroduces.
+    """
+    activity = [
+        folded("run.step_started", "run", "run-1", {"seq": 1}),
+        folded("run.step_finished", "run", "run-1", {"seq": 1}),
+        *(
+            folded(f"tool.{name}", "tool_call", "run-1:tool-1", run_ref="run-1")
+            for name in ("invoked", "returned", "failed", "denied")
+        ),
+    ]
+    assert len(activity) == 6
+    for mutations in activity:
+        on_the_run = [m for m in mutations if m.selector == RunRef("run-1")]
+        assert on_the_run, "each of the six says something about the run"
+        for mutation in on_the_run:
+            fields = (
+                mutation.deltas if isinstance(mutation, Increment) else mutation.fields
+            ).keys()
+            assert "last_event_at" not in fields, (
+                f"{mutation} moved the state clock, which is the bug this test exists for"
+            )
+
+    for event_type, payload in (
+        ("run.started", {}),
+        ("run.finished", {}),
+        ("run.failed", {}),
+    ):
+        state = folded(event_type, "run", "run-1", payload)
+        assert all("last_event_at" in m.fields for m in state), (
+            f"{event_type} still moves the state clock, and must"
+        )
+        assert all("last_activity_at" not in m.fields for m in state), (
+            f"{event_type} is a state change, not an activity report"
+        )
+
+
+def test_the_activity_clock_is_guarded_on_itself() -> None:
+    """Monotonic by construction: a backlog cannot move it backwards.
+
+    `not_before` on the column being written means a late event's patch
+    matches no row, so the newest timestamp stands rather than the last one
+    delivered. `unless` is deliberately absent - a late event about a
+    settled run is still a true fact about when we heard it, and the status
+    it must not touch is on a different patch entirely.
+    """
+    for mutations in (
+        folded("run.step_started", "run", "run-1", {"seq": 1}),
+        folded("tool.denied", "tool_call", "run-1:tool-1", run_ref="run-1"),
+    ):
+        (clock,) = [m for m in mutations if getattr(m, "fields", {}).get("last_activity_at")]
+        assert clock.not_before == ("last_activity_at", WHEN)
+        assert clock.unless is None
 
 
 # --------------------------------------------------------------- the workflow ---
@@ -648,7 +755,16 @@ def test_the_proposals_eleven_event_trace_folds_as_documented() -> None:
     assert last_for(ExecutionRef("exec-9f2a")).fields["status"] is ExecutionStatus.COMPLETED
     assert last_for(StepRef("exec-9f2a", "research")).fields["status"] is StepStatus.SUCCEEDED
     assert last_for(StepRef("exec-9f2a", "post")).fields["status"] is StepStatus.SUCCEEDED
-    assert last_for(RunRef("run-3f9a")) == Increment(RunRef("run-3f9a"), {"step_count": 1})
+    run_mutations = [m for m in everything if m.selector == RunRef("run-3f9a")]
+    assert Increment(RunRef("run-3f9a"), {"step_count": 1}) in run_mutations
+    # Since A1 the trace's last word about the run is the activity clock:
+    # `tool.returned` moves it and counts nothing, which is the whole of
+    # that event's contribution.
+    assert last_for(RunRef("run-3f9a")) == Patch(
+        RunRef("run-3f9a"),
+        {"last_activity_at": WHEN},
+        not_before=("last_activity_at", WHEN),
+    )
 
     # The approval really gated: before it was granted, the `post` step was
     # waiting, and nothing had readied it.
@@ -702,9 +818,11 @@ def test_every_folding_event_type_produces_something_for_a_plausible_event() -> 
         ):
             missing.append(event_type)
 
-    # `tool.returned`, `failed` and `denied` declare `runs` because they are
-    # about a run, while only `tool.invoked` changes its counter.
-    assert missing == ["tool.returned", "tool.failed", "tool.denied"]
+    # Empty since A1. These three declared `runs` in the taxonomy and folded
+    # into nothing, which this assertion recorded rather than fixed: only
+    # `tool.invoked` changed the counter and nothing else about the run. They
+    # now move the activity clock, so every type that says it folds does.
+    assert missing == []
 
 
 def test_every_patch_that_moves_current_state_is_guarded() -> None:
