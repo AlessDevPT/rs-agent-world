@@ -11,12 +11,14 @@ brief for this stage said not to merge the two into a common "activity"
 record, and these are two endpoints for that reason: a reader who cannot tell
 a self-report from a first-hand record cannot tell which one to trust.
 
-**`runs` has no producer in this release, and these tests say so out loud.**
-The reducers patch a run and append its steps, but nothing anywhere inserts
-one - `test_a_run_event_creates_nothing_to_read` pins exactly that, over
-HTTP, through real ingest. So the rows the read tests need are seeded
-directly, as `test_agent_work.py` already seeds this table. That makes the
-read falsifiable without pretending the write exists.
+**The read tests seed `runs` directly, and that is still deliberate.** R1
+gave the table a producer - `run.started` creates a row, and
+`test_run_producer.py` covers it end to end - but these tests are about the
+read: its order, its limit, its refusals and its isolation. Seeding is how
+they get a dozen runs with unambiguous timestamps without a dozen ingest
+round trips, exactly as `test_agent_work.py` already does for this table.
+One test here does go through ingest, because the thing R1 changed is that
+this endpoint returns rows at all.
 """
 
 from __future__ import annotations
@@ -323,22 +325,21 @@ def test_an_agent_from_another_project_is_a_404(scenario: Scenario) -> None:
     assert runs(scenario, elsewhere).status_code == 404
 
 
-async def test_a_run_event_creates_nothing_to_read(
+async def test_a_run_event_creates_something_to_read(
     client: TestClient, actor: Actor, owner_database: Database
 ) -> None:
-    """The producer gap, pinned over HTTP so it cannot be rediscovered later.
+    """The inverse of the test this replaces, and why D2's read exists.
 
-    A `run.started` is accepted - 202, the event is durable - and folds into
-    an UPDATE that matches no row, because no statement in this system
-    inserts a run. So the read is empty, and will be for every agent until a
-    producer exists. This test is the one that will fail when that changes,
-    which is the point of writing it.
+    Until R1 this file carried `test_a_run_event_creates_nothing_to_read`:
+    a `run.started` was accepted, the event was durable, and the fold
+    produced an UPDATE that matched no row because no statement in this
+    system inserted a run. It was written to fail the day a producer landed,
+    and this is that day.
 
-    **The events carry everything a producer would need**, which is what
-    makes this a gap rather than an incomplete fixture: the correlation
-    names the agent, so `runs.agent_id` - the one NOT NULL column a reducer
-    cannot supply from a run-subject event alone - is there for the taking.
-    Nothing takes it.
+    The events carry what the producer needs and nothing more - the
+    correlation names the agent, which is where `runs.agent_id` comes from.
+    `test_run_producer.py` is where the producer itself is tested; this one
+    stays here because it is D2's read that had to start returning rows.
     """
     ingest = Fixture(client, actor)
     agent = client.post(
@@ -377,14 +378,17 @@ async def test_a_run_event_creates_nothing_to_read(
                 {"p": ingest.project_id},
             )
         ).scalar_one()
-    assert stored == 0, "no statement in this system inserts a run"
+    assert stored == 1, "`run.started` creates the run it is about"
 
     listed = client.get(
         f"/v1/projects/{ingest.project_id}/agents/{agent.json()['id']}/runs",
         headers=actor.headers,
     )
     assert listed.status_code == 200
-    assert listed.json() == []
+    body = listed.json()
+    assert [row["run_ref"] for row in body] == ["run-1"]
+    assert body[0]["status"] == "running"
+    assert body[0]["step_count"] == 0, "the step started and has not finished"
 
 
 # ----------------------------------------------------------- the executions ---

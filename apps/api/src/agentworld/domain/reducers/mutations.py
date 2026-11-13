@@ -200,10 +200,19 @@ class Patch:
 
 @dataclass(frozen=True, slots=True)
 class Append:
-    """Add a row. Used for the two tables that are logs of their own.
+    """Add a row.
 
-    `agent_status_history` and `run_steps` accumulate rather than being
-    overwritten, so an append is the only honest shape for them.
+    Two of its three targets are logs of their own: `agent_status_history`
+    and `run_steps` accumulate rather than being overwritten, so an append
+    is the only honest shape for them.
+
+    `runs` is the third and is not a log. A run row is appended once, by
+    `run.started`, and patched from then on - because an external agent's
+    run exists only in what that agent reports, and until R1 nothing
+    created one at all: the reducers patched a row no statement in this
+    system ever inserted. Appending it here rather than giving the
+    repository a second verb keeps the vocabulary at three, and "add a row"
+    is what this already meant.
     """
 
     selector: Selector

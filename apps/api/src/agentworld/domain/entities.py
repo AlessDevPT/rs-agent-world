@@ -286,12 +286,10 @@ class Run:
     difference between this and `WorkflowExecution` - that one AgentWorld
     creates and drives, this one is a report of work that happened elsewhere.
 
-    **No row is created by anything in this release.** The reducers patch
-    runs and append their steps, but the INSERT that would bring a run into
-    being does not exist yet, so this entity describes a table that is empty
-    in production. The read exists ahead of its writer deliberately: the
-    shape is what a producer has to fill, and agreeing it now is cheaper
-    than agreeing it afterwards.
+    Created by exactly one event. `run.started` appends the row and every
+    later `run.*` and `tool.*` event patches it, which is why a run that was
+    never announced has no record here even if its steps were reported: the
+    producer will not invent a `started_at` it was not told.
 
     `run_ref` is the agent's own name for the attempt and the key every event
     about it carries; it is nullable in the schema, so it is optional here.

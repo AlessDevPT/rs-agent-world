@@ -288,13 +288,29 @@ def _run(envelope: EventEnvelope) -> tuple[Mutation, ...]:
     fresh = ("last_event_at", envelope.occurred_at)
 
     if name == "started":
+        opened = {"status": RunStatus.RUNNING, "started_at": envelope.occurred_at, **seen}
         return (
-            Patch(
-                run,
-                {"status": RunStatus.RUNNING, "started_at": envelope.occurred_at, **seen},
-                not_before=fresh,
-                unless=_SETTLED_RUNS,
-            ),
+            # **The one event that creates a run.** Append first, as the
+            # status history does, because the patch below can only change a
+            # row that is already there - and for a run reported by an
+            # external agent, nothing else ever puts one there.
+            #
+            # No `not_before` on the append, and the asymmetry with
+            # `agent.status_changed` is deliberate. A history row records a
+            # transition that may turn out to be stale, so appending one a
+            # late event did not earn would be a lie. A run either happened
+            # or it did not, and this event is the only evidence either way:
+            # creating it late is recording something true late, not
+            # recording something false.
+            #
+            # Every value is read from the event. `runs.started_at` defaults
+            # to `now()`, which would make a replay disagree with the live
+            # fold about when the run began - the same reason no reducer may
+            # read a clock.
+            Append(run, opened),
+            # Unchanged, and still needed: a second `run.started` for a run
+            # that already exists is a patch, guarded exactly as before.
+            Patch(run, opened, not_before=fresh, unless=_SETTLED_RUNS),
         )
     if name == "finished":
         return (

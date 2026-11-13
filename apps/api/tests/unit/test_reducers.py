@@ -351,6 +351,56 @@ def test_a_string_error_is_wrapped_rather_than_dropped() -> None:
 # -------------------------------------------------------------------- the run ---
 
 
+def test_a_run_is_created_then_patched_by_the_event_that_starts_it() -> None:
+    """R1. `run.started` is the only event that brings a run into being.
+
+    The append comes first, as the status history's does, because the patch
+    can only change a row that already exists - and for a run reported by an
+    external agent, nothing else ever creates one. Both carry the same
+    values, read from the event: `runs.started_at` defaults to `now()`, so
+    leaving it out would make a replay disagree with the live fold about when
+    the run began.
+    """
+    opened = {"status": RunStatus.RUNNING, "started_at": WHEN, "last_event_at": WHEN}
+
+    assert folded("run.started", "run", "run-1", {}, agent_key="researcher") == (
+        Append(RunRef("run-1"), opened),
+        Patch(RunRef("run-1"), opened, not_before=("last_event_at", WHEN), unless=_SETTLED_RUNS),
+    )
+
+
+def test_a_run_append_is_deliberately_unguarded() -> None:
+    """The one place an append does *not* share its patch's guard.
+
+    A history row records a transition that may turn out to be stale, so
+    appending one a late event did not earn would record something false -
+    which is why D1.1 paired the two. A run either happened or it did not,
+    and `run.started` is the only evidence either way: creating it late
+    records something true late. The patch keeps both guards regardless, so
+    a stale event still cannot move a settled run's status.
+    """
+    append, patch = folded("run.started", "run", "run-1", {}, agent_key="researcher")
+
+    assert isinstance(append, Append)
+    assert append.not_before is None, "a run that started did start"
+    assert isinstance(patch, Patch)
+    assert patch.not_before == ("last_event_at", WHEN)
+    assert patch.unless == _SETTLED_RUNS
+
+
+def test_the_agent_that_owns_a_run_is_not_in_the_mutation() -> None:
+    """`agent_id` is the repository's to fill, like `from_status` before it.
+
+    A reducer sees `agent_key="researcher"` and never a uuid - it has no way
+    to resolve one - so the owner reaches the row through the refs the ingest
+    transaction already resolved. Nothing here names the agent at all.
+    """
+    append = folded("run.started", "run", "run-1", {}, agent_key="researcher")[0]
+
+    assert "agent_id" not in append.fields
+    assert "agent_key" not in append.fields
+
+
 def test_a_trace_step_appends_then_patches_and_counts() -> None:
     started = folded("run.step_started", "run", "run-1", {"seq": 1, "kind": "llm"})
     assert started == (

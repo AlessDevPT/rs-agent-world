@@ -309,13 +309,18 @@ async def test_folding_a_workflow_trace_creates_no_dispatches(
 # ------------------------------------------------------- replay equivalence ---
 
 
-#: The two tables whose rows folding *creates* rather than updates. Their
-#: primary keys come from a sequence and `gen_random_uuid()`, so a replay
-#: necessarily mints different ones - identity is not derived state, and a
-#: test that demanded it match would be asserting that `TRUNCATE` resets a
-#: sequence rather than anything about the log. Every other table keeps its
-#: id in the comparison, because those rows are not recreated and a changed
-#: id there would be a real defect.
+#: The two tables whose rows folding creates with an id it did not choose.
+#: `agent_status_history` has a bigserial and `run_steps` a bigserial, so a
+#: replay necessarily mints different ones - identity is not derived state,
+#: and a test that demanded it match would be asserting that `TRUNCATE`
+#: resets a sequence rather than anything about the log.
+#:
+#: `runs` is created by folding too, since R1, and is deliberately **not**
+#: here: its id is `run_id_for(project_id, run_ref)`, a function of what
+#: names it, so a rebuilt run gets the id it had. That is what keeps
+#: `run_steps.run_id` comparable as well - the steps point at the same run
+#: after a replay as before one, which a random id would have made
+#: impossible to assert without dropping the column from the comparison.
 APPENDED_TABLES = ("agent_status_history", "run_steps")
 
 
@@ -349,6 +354,7 @@ async def test_refolding_the_stored_log_reproduces_the_state(
     from agentworld.domain.reducers import fold
     from agentworld.repositories.base import TenantScope
     from agentworld.repositories.derived import DerivedStateRepository
+    from agentworld.repositories.events import ResolvedRefs
 
     stream = [
         event(dedup_key="r-1", type="agent.registered", payload={"capabilities": ["search"]}),
@@ -357,10 +363,29 @@ async def test_refolding_the_stored_log_reproduces_the_state(
             type="agent.status_changed",
             payload={"status": "working", "reason": "picked up a task"},
         ),
+        # The run and its trace, correlated to the agent that owns it. Since
+        # R1 these rebuild rather than staying empty, which is what makes
+        # `runs` and `run_steps` part of this comparison rather than two
+        # tables it trivially agrees about.
         event(
             dedup_key="r-3",
             type="run.started",
             subject={"kind": "run", "ref": "run-1"},
+            correlation={"agent_key": "researcher"},
+        ),
+        event(
+            dedup_key="r-3a",
+            type="run.step_started",
+            subject={"kind": "run", "ref": "run-1"},
+            correlation={"agent_key": "researcher"},
+            payload={"seq": 0, "name": "turn", "kind": "llm"},
+        ),
+        event(
+            dedup_key="r-3b",
+            type="run.step_finished",
+            subject={"kind": "run", "ref": "run-1"},
+            correlation={"agent_key": "researcher"},
+            payload={"seq": 0, "output": {"tokens": 240}},
         ),
         event(
             dedup_key="r-4",
@@ -371,6 +396,10 @@ async def test_refolding_the_stored_log_reproduces_the_state(
     assert post(client, ingest, *stream).status_code == 202
     before = await _snapshot(owner_database)
     assert before["agent_status_history"], "the fixture should have produced history"
+    # Named explicitly, because a replay of two empty tables agrees about
+    # nothing and would pass. R1 is what made these non-empty.
+    assert before["runs"], "the fixture should have produced a run"
+    assert before["run_steps"], "the fixture should have produced a trace step"
 
     # Throw the derived state away - everything except the agent rows, which
     # are configuration and were never derived from the log.
@@ -401,7 +430,12 @@ async def test_refolding_the_stored_log_reproduces_the_state(
             await session.execute(
                 text(
                     "SELECT id, dedup_key, type, protocol_version, occurred_at, "
-                    "       subject_kind, subject_ref, correlation, severity, labels, payload "
+                    "       subject_kind, subject_ref, correlation, severity, labels, payload, "
+                    # Resolved when the event was first ingested and stored on
+                    # the row, so a replay needs no second lookup - and could
+                    # not do one honestly anyway, since the agent may have
+                    # been renamed or removed since.
+                    "       agent_id "
                     "  FROM events WHERE project_id = :p ORDER BY seq"
                 ),
                 {"p": ingest.project_id},
@@ -423,8 +457,9 @@ async def test_refolding_the_stored_log_reproduces_the_state(
                     "payload": row.payload,
                 }
             )
+            refs = ResolvedRefs(agent_id=row.agent_id)
             for mutation in fold(envelope):
-                await derived.apply(mutation, event_id=row.id)
+                await derived.apply(mutation, event_id=row.id, refs=refs)
 
     after = await _snapshot(owner_database)
     _assert_same(before, after)

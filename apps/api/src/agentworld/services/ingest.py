@@ -151,7 +151,10 @@ class IngestService:
 
                 changed = 0
                 for mutation in fold(envelope):
-                    changed += await derived.apply(mutation, event_id=event_id)
+                    # `refs` travels with the mutations folded from this
+                    # event: creating a run needs the agent that owns it, and
+                    # resolving it twice could resolve it differently.
+                    changed += await derived.apply(mutation, event_id=event_id, refs=refs)
 
                 outcomes.append(
                     EventOutcome(

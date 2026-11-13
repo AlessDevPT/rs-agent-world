@@ -279,13 +279,12 @@ class AgentRepository(ScopedRepository):
         `status_history` deliberately: one question, one agent, a bounded
         list, the tenant predicate stated here rather than left to RLS.
 
-        **This returns nothing in production today, and that is honest
-        rather than broken.** `runs` is folded by the reducers but created
-        by nothing - `DerivedStateRepository` patches a run and appends its
-        steps, and no statement anywhere inserts one - so until a producer
-        exists the table is empty for every agent. An empty list is then a
-        true answer about a real table, which is the only answer available
-        without inventing rows.
+        The rows come from ingested events and nothing else:
+        `DerivedStateRepository._append_run` creates one when the agent
+        reports `run.started`, and the rest of the `run.*` namespace patches
+        it. So an empty list means this agent has reported no runs - which
+        is the whole answer for a `managed` agent, whose work is in
+        `workflow_executions` instead.
 
         Ordered by `started_at` and then by `id`. `runs_agent_idx` is
         `(agent_id, started_at DESC)`, so the leading columns are served by

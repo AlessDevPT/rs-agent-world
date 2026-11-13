@@ -473,12 +473,13 @@ async def agent_status_history(
     response_model=list[RunView],
     summary="What this agent reported doing",
     description=(
-        "Newest first, folded from the events the agent sent about its own work. "
-        "**Empty for every agent in this release**: the reducers fold a run, but nothing "
-        "yet creates one, so there is no row to return - and an agent AgentWorld runs "
-        "itself would have none of these in any case. Its work is under "
-        "`GET /v1/projects/{project_id}/agents/{agent_id}/executions`. Readable for an "
-        "archived agent, because what it did before it was archived is the question."
+        "Newest first, folded from the events the agent sent about its own work: a run "
+        "appears here once the agent has reported `run.started` for it. **An agent "
+        "AgentWorld runs itself has none** - a managed agent reports nothing, and its "
+        "work appears under `GET /v1/projects/{project_id}/agents/{agent_id}/executions` "
+        "instead, so an empty list here is an answer about where to look rather than a "
+        "missing record. Readable for an archived agent, because what it did before it "
+        "was archived is the question."
     ),
 )
 async def agent_runs(

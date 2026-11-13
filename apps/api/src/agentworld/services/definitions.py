@@ -355,13 +355,12 @@ class AgentService:
         included, because what an agent did before it was archived is the
         question being asked.
 
-        **An agent AgentWorld runs itself has no runs, and neither has any
-        other agent yet.** `runs` is folded from events an external agent
-        sends about itself, and nothing in this release creates the row that
-        folding needs - so this is an empty list for every agent until a
-        producer exists. `executions` is where a managed agent's work is,
-        and the route's description says so rather than leaving a reader to
-        conclude the record was lost.
+        **An agent AgentWorld runs itself has no runs, and that is
+        correct.** A run is folded from events an external agent sends about
+        its own work, and a managed agent sends none - its work is in
+        `workflow_executions`. An empty list here is an answer about where
+        to look rather than a missing record, and the route's description
+        says so.
         """
         async with self._factory.begin(visible_workspaces=set(principal.memberships)) as work:
             workspace_id = await _workspace_of(work, project_id)
