@@ -1,3 +1,5 @@
+import Link from "next/link";
+
 import { ApiError } from "@/lib/api/client";
 import { listProjects, roleAtLeast, type Project } from "@/lib/api/tenancy";
 import { requireSession } from "@/lib/session";
@@ -65,7 +67,12 @@ export default async function ProjectsPage({
           {projects.map((project) => (
             <li className="list__item" key={project.id}>
               <div>
-                <span className="list__title">{project.name}</span>
+                <Link
+                  className="list__title"
+                  href={`/w/${workspaceId}/p/${project.id}/agents`}
+                >
+                  {project.name}
+                </Link>
                 <span className="muted">
                   {" "}
                   <code>{project.slug}</code>
@@ -74,12 +81,15 @@ export default async function ProjectsPage({
                   <p className="muted">{project.description}</p>
                 )}
               </div>
-              <span className="muted">
-                {/* No agent or task counts yet: the tables they would come
-                    from arrive in Phase 2. An invented zero would read as a
-                    fact. */}
-                no agents yet
-              </span>
+              {/* A link rather than a count. The API has no aggregate to
+                  count with, so a number here would mean one request per
+                  project - and an invented zero would read as a fact. */}
+              <Link
+                className="workspace-bar__link"
+                href={`/w/${workspaceId}/p/${project.id}/agents`}
+              >
+                Agents →
+              </Link>
             </li>
           ))}
         </ul>
