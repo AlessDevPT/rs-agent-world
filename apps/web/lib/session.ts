@@ -8,10 +8,12 @@
  * everywhere rather than per page.
  */
 
+import { headers } from "next/headers";
 import { redirect } from "next/navigation";
 
 import { ApiError } from "./api/client";
 import { getMe, type Me } from "./api/tenancy";
+import { preferredReturnPath, RETURN_TO_HEADER } from "./redirects";
 import { isAuthConfigured } from "./supabase/config";
 import { getAccessToken } from "./supabase/server";
 
@@ -64,6 +66,22 @@ export async function readSession(): Promise<SessionState> {
  *
  * For pages that have nothing to show a stranger. The signed-out redirect
  * carries the current path so sign-in returns to where they were headed.
+ *
+ * **Where that path comes from, and why `returnTo` is now the fallback.** A
+ * caller can only name its own route, and under a layout that is the wrong
+ * answer: a layout and its page both redirect, and only one of them is served.
+ * Measured, before this existed: every route under `/w/{id}` sent a visitor
+ * back to `/w/{id}`, the workspace layout's path, with the rest of what they
+ * asked for dropped - the keys page included, since it was written. Middleware
+ * puts the real destination in a request header, and the header wins because
+ * it is the only value that is the page the visitor actually asked for, not a
+ * guess made by whichever layer happened to notice first.
+ *
+ * `returnTo` stays as the fallback rather than being deleted from its seven
+ * call sites. The matcher covers every route there is today, `/w/` included
+ * by its own entry - but it is a list, and a tree added outside the ones it
+ * names would render without a header rather than fail loudly. A slightly
+ * stale `next` is a better failure than none at all.
  */
 export async function requireSession(
   returnTo?: string,
@@ -81,7 +99,14 @@ export async function requireSession(
       // to render a half-working workspace screen instead.
       return redirect("/");
     case "signed-out": {
-      const next = returnTo ? `?next=${encodeURIComponent(returnTo)}` : "";
+      // Validated here rather than trusted. Middleware overwrites the header
+      // on every request it runs on, and the matcher covers every route there
+      // is - but a matcher is a list, and this line should not be the thing
+      // that breaks when one is added to it. The validation keeps whatever
+      // arrives to a path on this origin.
+      const forwarded = (await headers()).get(RETURN_TO_HEADER);
+      const destination = preferredReturnPath(forwarded, returnTo);
+      const next = destination ? `?next=${encodeURIComponent(destination)}` : "";
       return redirect(`/login${next}`);
     }
   }

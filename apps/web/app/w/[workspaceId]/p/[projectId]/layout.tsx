@@ -33,6 +33,12 @@ export const dynamic = "force-dynamic";
  * name, and that is a limit rather than a choice: a layout receives its own
  * params and its ancestors', never a child's, so `agentId` does not arrive
  * here - and a server layout has no pathname to read either.
+ *
+ * It no longer decides where a signed-out visitor returns to, and does not
+ * need to. Middleware forwards the real destination in a request header and
+ * `requireSession` prefers it, so whichever layer redirects first now builds
+ * the same `?next=` - the page that was actually asked for. This argument is
+ * the fallback for a render the header never reached.
  */
 export default async function ProjectLayout({
   children,
