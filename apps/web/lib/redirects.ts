@@ -37,6 +37,29 @@ export function safeInternalPath(value: string | null | undefined): string {
   return value;
 }
 
+/**
+ * Is this one of the paths whose job is to get a visitor signed in or out?
+ *
+ * Those are the paths that must never be a return destination. `/login` as a
+ * `next` would send a signed-in visitor from the sign-in page back to the
+ * sign-in page, and `/auth/signout` would sign them out on arrival - both
+ * loops, and both reachable from a query parameter anybody can type.
+ *
+ * The query string is cut off first, so `/login?next=x` is recognised as
+ * `/login`. Prefix matching is on `/login/` and `/auth/` with the slash,
+ * because `/loginsomething` is a different route and not one of these.
+ */
+export function isAuthPath(value: string): boolean {
+  const query = value.indexOf("?");
+  const path = query === -1 ? value : value.slice(0, query);
+  return (
+    path === "/login" ||
+    path.startsWith("/login/") ||
+    path === "/auth" ||
+    path.startsWith("/auth/")
+  );
+}
+
 // ------------------------------------------------- carrying the destination ---
 
 /**

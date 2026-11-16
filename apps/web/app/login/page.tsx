@@ -1,9 +1,8 @@
 import Link from "next/link";
 import { redirect } from "next/navigation";
 
-import { safeInternalPath } from "@/lib/redirects";
-import { isAuthConfigured } from "@/lib/supabase/config";
-import { getAccessToken } from "@/lib/supabase/server";
+import { loginDestination, returnTarget } from "@/lib/auth/destination";
+import { readSession } from "@/lib/session";
 
 import { SignInForm } from "./sign-in-form";
 
@@ -18,18 +17,32 @@ export const metadata = { title: "Sign in · AgentWorld" };
  * signing in returns them to it. It is validated as a same-site path before
  * use: an unchecked redirect target taken from a query string is an open
  * redirect, and a sign-in page is exactly where one is most useful to an
- * attacker.
+ * attacker. `/login` and `/auth/*` are refused on top of that, because this
+ * page now returns a signed-in visitor to `next` rather than always to `/`,
+ * and a `next` pointing back here would be a loop.
+ *
+ * **It asks `readSession()` rather than reading the cookie.** It used to do
+ * the latter - `getAccessToken() !== null` and redirect to `/` - which is a
+ * different question from the one every other page asks, and the two could
+ * disagree. When the API rejected a token the cookie still held, this page
+ * said "already signed in" and `/` said "signed out", and the browser bounced
+ * between them until it gave up. Measured, twelve hops, no `Set-Cookie` on any
+ * of them. So there is one question now, and `lib/auth/destination.ts` turns
+ * its answer into what this page does.
  */
 export default async function LoginPage({
   searchParams,
 }: {
-  readonly searchParams: Promise<{ next?: string }>;
+  readonly searchParams: Promise<{ next?: string; error?: string }>;
 }) {
-  if (!isAuthConfigured()) redirect("/");
-  if ((await getAccessToken()) !== null) redirect("/");
+  const { next, error } = await searchParams;
+  const session = await readSession();
 
-  const { next } = await searchParams;
-  const target = safeInternalPath(next);
+  const destination = loginDestination(session.kind, next ?? null);
+  if (destination.kind === "redirect") redirect(destination.to);
+
+  const target = returnTarget(next ?? null);
+  const rejected = session.kind === "token-rejected";
 
   return (
     <section className="stack stack--narrow">
@@ -41,6 +54,20 @@ export default async function LoginPage({
         </p>
       </div>
 
+      {rejected && <StaleSession next={target} />}
+
+      {/* The one thing the callback route can fail at. It sends no detail in
+          the URL - the reason is for the log, not for a querystring that ends
+          up in browser history - so this says what it can and no more. */}
+      {error === "exchange" && (
+        <div className="card">
+          <p className="form__error" role="alert">
+            That sign-in link could not be completed. It may have been used already or
+            expired. Signing in below works just as well.
+          </p>
+        </div>
+      )}
+
       <div className="card">
         <SignInForm next={target} />
       </div>
@@ -49,5 +76,44 @@ export default async function LoginPage({
         <Link href="/">Back to the start</Link>
       </p>
     </section>
+  );
+}
+
+/**
+ * What to say when the browser has a session this server will not accept.
+ *
+ * Deliberately specific about whose problem it is. The visitor did nothing
+ * wrong and signing in again may not help them: the usual cause is this
+ * deployment's API being configured for a different Supabase project, or for a
+ * different audience or issuer, and a fresh token from the same project would
+ * be refused in exactly the same way. So it names the two things that do help
+ * - clearing the session, and telling whoever runs the server - rather than
+ * implying a retry will fix it.
+ *
+ * No request id, no status, no detail from the API. A sign-in page is reachable
+ * by anyone, and what it says about how the server is configured should be the
+ * minimum that lets an honest visitor act.
+ */
+function StaleSession({ next }: { readonly next: string }) {
+  return (
+    <div className="card">
+      <h2 className="card__title">This browser&apos;s sign-in is not valid here</h2>
+      <p className="muted">
+        You are signed in to the identity provider, but this server will not accept that
+        session. Signing in again may not change that - if it does not, the server and the
+        identity provider are configured for different projects, and whoever runs it needs
+        to know.
+      </p>
+      {/* A POST, like the sign-out button in the workspace bar: no other site
+          should be able to clear a session with an image tag. `next` rides
+          along so that clearing it does not also lose where the visitor was
+          headed. */}
+      <form action="/auth/signout" method="post">
+        <input type="hidden" name="next" value={next} />
+        <button className="button button--quiet" type="submit">
+          Clear this session
+        </button>
+      </form>
+    </div>
   );
 }

@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   RETURN_TO_HEADER,
+  isAuthPath,
   preferredReturnPath,
   returnPath,
   safeInternalPath,
@@ -48,6 +49,44 @@ describe("safeInternalPath", () => {
     // harmless, and this records that distinction on purpose.
     expect(safeInternalPath("/w/abc//keys")).toBe("/w/abc//keys");
     expect(safeInternalPath("//w/abc")).toBe("/");
+  });
+});
+
+/**
+ * The paths that must never be a return destination.
+ *
+ * Each of these is a loop if it gets through as a `next`: the sign-in page
+ * sends a signed-in visitor to `next`, so `/login` would send them back to
+ * itself, and `/auth/signout` would sign them out on arrival.
+ */
+describe("isAuthPath", () => {
+  it.each([
+    ["the sign-in page", "/login"],
+    ["…with a query", "/login?next=%2Fw%2Fabc"],
+    ["sign-out", "/auth/signout"],
+    ["the OAuth callback", "/auth/callback"],
+    ["…with a code", "/auth/callback?code=abc"],
+    ["the bare auth segment", "/auth"],
+  ])("recognises %s", (_label, path) => {
+    expect(isAuthPath(path)).toBe(true);
+  });
+
+  it.each([
+    ["the root", "/"],
+    ["a workspace", "/w/abc"],
+    ["a deep agent page", "/w/abc/p/def/agents/ghi"],
+    ["onboarding", "/onboarding"],
+  ])("leaves %s alone", (_label, path) => {
+    expect(isAuthPath(path)).toBe(false);
+  });
+
+  it("matches on the path segment rather than the prefix", () => {
+    // `/loginsomething` is a different route and not one of these, so the
+    // prefix check is on `/login/` with the slash.
+    expect(isAuthPath("/loginsomething")).toBe(false);
+    expect(isAuthPath("/authority")).toBe(false);
+    expect(isAuthPath("/login/extra")).toBe(true);
+    expect(isAuthPath("/auth/anything")).toBe(true);
   });
 });
 

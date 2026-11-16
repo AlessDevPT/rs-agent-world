@@ -13,13 +13,25 @@ import { redirect } from "next/navigation";
 
 import { ApiError } from "./api/client";
 import { getMe, type Me } from "./api/tenancy";
+import { guardDestination, kindForApiFailure } from "./auth/destination";
 import { preferredReturnPath, RETURN_TO_HEADER } from "./redirects";
 import { isAuthConfigured } from "./supabase/config";
 import { getAccessToken } from "./supabase/server";
 
 export type SessionState =
   | { readonly kind: "unconfigured" }
+  /** No Supabase session at all. */
   | { readonly kind: "signed-out" }
+  /**
+   * A Supabase session the API will not accept.
+   *
+   * Kept apart from `signed-out` because it is a different fact and the two
+   * need different handling: there is a cookie, nothing in a server render can
+   * remove it, and the sign-in page must render rather than trust it. Folding
+   * this into `signed-out` is what made `/` and `/login` redirect to each
+   * other indefinitely.
+   */
+  | { readonly kind: "token-rejected" }
   | {
       readonly kind: "api-unreachable";
       readonly message: string;
@@ -30,10 +42,15 @@ export type SessionState =
 /**
  * Resolve the viewer without redirecting.
  *
- * Returns a state rather than throwing, because the three failure modes mean
- * different things to the person looking at the screen: no Supabase project
- * is a setup instruction, no session is a sign-in prompt, and an unreachable
+ * Returns a state rather than throwing, because the four failure modes mean
+ * different things to the person looking at the screen: no Supabase project is
+ * a setup instruction, no session is a sign-in prompt, a session the API
+ * refuses is a sign-in prompt that has to explain itself, and an unreachable
  * API is "the backend is down", which is not the user's problem to fix.
+ *
+ * **This is the only place the question is asked.** Everything that needs to
+ * know consults this - the sign-in page included, which used to read the
+ * cookie directly and reach the opposite conclusion.
  */
 export async function readSession(): Promise<SessionState> {
   if (!isAuthConfigured()) return { kind: "unconfigured" };
@@ -47,11 +64,14 @@ export async function readSession(): Promise<SessionState> {
     const me = await getMe(token);
     return { kind: "signed-in", token, me };
   } catch (error) {
-    if (error instanceof ApiError && error.problem.status === 401) {
+    const status = error instanceof ApiError ? error.problem.status : null;
+    if (kindForApiFailure(status) === "token-rejected") {
       // A token Supabase still accepts but the API does not - a mismatched
-      // audience or project, usually. Treating it as signed out sends the
-      // user somewhere they can act, rather than showing a 401 they cannot.
-      return { kind: "signed-out" };
+      // audience or issuer, or an API pointed at another Supabase project.
+      // Deliberately not `signed-out`: there *is* a session, and saying
+      // otherwise is what let the sign-in page send the visitor straight back
+      // out again on the strength of the cookie that caused this.
+      return { kind: "token-rejected" };
     }
     return {
       kind: "api-unreachable",
@@ -64,8 +84,9 @@ export async function readSession(): Promise<SessionState> {
 /**
  * Resolve the viewer or send them away.
  *
- * For pages that have nothing to show a stranger. The signed-out redirect
- * carries the current path so sign-in returns to where they were headed.
+ * For pages that have nothing to show a stranger. The redirect to sign-in -
+ * for no session and for one the API refuses alike - carries the current path
+ * so signing in returns them to where they were headed.
  *
  * **Where that path comes from, and why `returnTo` is now the fallback.** A
  * caller can only name its own route, and under a layout that is the wrong
@@ -87,27 +108,21 @@ export async function requireSession(
   returnTo?: string,
 ): Promise<{ token: string; me: Me }> {
   const session = await readSession();
-  switch (session.kind) {
-    case "signed-in":
-      return { token: session.token, me: session.me };
-    // `return redirect(...)`, because `redirect` is typed `never` - it works
-    // by throwing - and a bare call reads to eslint as a fall-through into
-    // the next case.
-    case "unconfigured":
-    case "api-unreachable":
-      // Both are states the start page explains properly; it would be unkind
-      // to render a half-working workspace screen instead.
-      return redirect("/");
-    case "signed-out": {
-      // Validated here rather than trusted. Middleware overwrites the header
-      // on every request it runs on, and the matcher covers every route there
-      // is - but a matcher is a list, and this line should not be the thing
-      // that breaks when one is added to it. The validation keeps whatever
-      // arrives to a path on this origin.
-      const forwarded = (await headers()).get(RETURN_TO_HEADER);
-      const destination = preferredReturnPath(forwarded, returnTo);
-      const next = destination ? `?next=${encodeURIComponent(destination)}` : "";
-      return redirect(`/login${next}`);
-    }
-  }
+  if (session.kind === "signed-in") return { token: session.token, me: session.me };
+
+  // Validated here rather than trusted. Middleware overwrites the header on
+  // every request it runs on, and the matcher covers every route there is -
+  // but a matcher is a list, and this line should not be the thing that breaks
+  // when one is added to it. The validation keeps whatever arrives to a path
+  // on this origin.
+  const forwarded = (await headers()).get(RETURN_TO_HEADER);
+  const destination = guardDestination(
+    session.kind,
+    preferredReturnPath(forwarded, returnTo),
+  );
+
+  // `return redirect(...)`, because `redirect` is typed `never` - it works by
+  // throwing - and returning it states the control flow instead of leaving a
+  // bare call that reads as falling through.
+  return redirect(destination.to);
 }

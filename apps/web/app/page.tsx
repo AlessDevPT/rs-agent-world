@@ -17,8 +17,14 @@ export const dynamic = "force-dynamic";
  * Each branch sends the visitor somewhere they can act: a setup instruction,
  * a sign-in form, their workspace, or an honest statement that the backend is
  * down. Nothing here is a dead end.
+ *
+ * **The return type is annotated on purpose.** Without it a `SessionState`
+ * added later would fall off the end of this switch and the function would
+ * return `undefined`, which React renders as an empty page with a 200 - a
+ * silent dead end, and exactly what happened when `token-rejected` was added
+ * and this file was not. Naming the type makes the next one a build error.
  */
-export default async function StartPage() {
+export default async function StartPage(): Promise<React.ReactElement> {
   const session = await readSession();
 
   switch (session.kind) {
@@ -30,7 +36,15 @@ export default async function StartPage() {
     // `never` because it works by throwing, but eslint cannot know that and
     // reads the next `case` as a fall-through. Returning it states the
     // control flow instead of adding an unreachable `break`.
+    //
+    // A session the API refuses goes to the same place as no session at all,
+    // and the sign-in page is what tells the two apart: it renders for both,
+    // and explains itself for the rejected one. It must not be folded in with
+    // the branches above - this page *renders* for `api-unreachable`, so
+    // sending a rejected token there would report a configuration problem as
+    // an outage and leave the visitor nothing to do.
     case "signed-out":
+    case "token-rejected":
       return redirect("/login");
     case "signed-in":
       // A user with no workspace is not an error state; it is the onboarding
