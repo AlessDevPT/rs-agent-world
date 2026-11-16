@@ -92,5 +92,19 @@ export const config = {
     // Everything except Next's own assets and obvious static files. Running
     // on an image request would refresh tokens dozens of times per page.
     "/((?!_next/static|_next/image|favicon.ico|.*\\.(?:svg|png|jpg|jpeg|gif|webp|ico)$).*)",
+    // The authenticated tree, unconditionally - because the entry above
+    // excludes *any* path ending in an image extension, and a route parameter
+    // is entitled to end that way. `/w/x.png` is a workspace id, not a
+    // picture, and `/agents/agent.png` is an agent detail page. Measured
+    // before this line existed: both skipped middleware, so a client-supplied
+    // `x-agentworld-return-to` reached the render unreplaced.
+    //
+    // Added rather than narrowing the regex above, which stays byte for byte.
+    // Next tries each entry and runs middleware on the first that matches
+    // (`shared/lib/router/utils/middleware-route-matcher.js`), so entries are
+    // a union with no precedence: this can only widen coverage, and cannot
+    // make a path the first entry excludes - `/logo.png`, `/favicon.ico`,
+    // `/_next/*` - start matching.
+    "/w/:path*",
   ],
 };
