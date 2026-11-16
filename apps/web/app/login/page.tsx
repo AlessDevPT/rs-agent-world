@@ -87,8 +87,8 @@ export default async function LoginPage({
  * deployment's API being configured for a different Supabase project, or for a
  * different audience or issuer, and a fresh token from the same project would
  * be refused in exactly the same way. So it names the two things that do help
- * - clearing the session, and telling whoever runs the server - rather than
- * implying a retry will fix it.
+ * - signing out, and telling whoever runs the server - rather than implying a
+ * retry will fix it.
  *
  * No request id, no status, no detail from the API. A sign-in page is reachable
  * by anyone, and what it says about how the server is configured should be the
@@ -105,15 +105,30 @@ function StaleSession({ next }: { readonly next: string }) {
         to know.
       </p>
       {/* A POST, like the sign-out button in the workspace bar: no other site
-          should be able to clear a session with an image tag. `next` rides
-          along so that clearing it does not also lose where the visitor was
-          headed. */}
+          should be able to sign a visitor out with an image tag. `next` rides
+          along so that recovering does not also lose where the visitor was
+          headed.
+
+          The label says "everywhere" because that is what the route does: it
+          signs out with the library's global scope, which revokes this
+          account's sessions on the visitor's other devices too. "Clear this
+          session" would describe a smaller act than the button performs.
+
+          The copy says "once their current session expires" on purpose. A
+          global sign-out revokes refresh tokens; it does not invalidate
+          access tokens already issued, and this API verifies those locally
+          against JWKS with no revocation check - so another device keeps
+          working until its own token runs out and the refresh fails. */}
       <form action="/auth/signout" method="post">
         <input type="hidden" name="next" value={next} />
         <button className="button button--quiet" type="submit">
-          Clear this session
+          Sign out everywhere
         </button>
       </form>
+      <p className="muted">
+        This is the same sign-out the app itself uses, so your other devices are signed
+        out too, once their current session expires.
+      </p>
     </div>
   );
 }
