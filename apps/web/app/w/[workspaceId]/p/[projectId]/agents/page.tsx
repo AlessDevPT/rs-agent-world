@@ -1,3 +1,4 @@
+import Link from "next/link";
 import { notFound } from "next/navigation";
 
 import { getProject, listAgents, type Agent } from "@/lib/api/agents";
@@ -114,7 +115,15 @@ export default async function AgentsPage({
               return (
                 <li className="list__item" key={agent.id}>
                   <div>
-                    <span className="list__title">{agent.display_name}</span>{" "}
+                    {/* The row's own link, styled by `a.list__title` - the
+                        same rule a project row uses, so the title keeps the
+                        row's colour rather than the browser's link blue. */}
+                    <Link
+                      className="list__title"
+                      href={`/w/${workspaceId}/p/${projectId}/agents/${agent.id}`}
+                    >
+                      {agent.display_name}
+                    </Link>{" "}
                     <span className="muted">
                       <code>{agent.agent_key}</code>
                     </span>

@@ -28,6 +28,11 @@ export const dynamic = "force-dynamic";
  * concurrently - `notFound()` here decides what is sent to the browser, not
  * what runs underneath - so every page under this one repeats the checks it
  * depends on. These exist for the shell this layout itself renders.
+ *
+ * The path passed to `requireSession` is the deepest route this layout can
+ * name, and that is a limit rather than a choice: a layout receives its own
+ * params and its ancestors', never a child's, so `agentId` does not arrive
+ * here - and a server layout has no pathname to read either.
  */
 export default async function ProjectLayout({
   children,
