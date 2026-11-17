@@ -1,10 +1,14 @@
+import Link from "next/link";
 import { notFound } from "next/navigation";
 import { Fragment } from "react";
 
-import { loadAgentOverview } from "@/lib/agents/load";
+import { loadAgentExecutions, loadAgentOverview } from "@/lib/agents/load";
 import {
+  executionStatusTone,
+  executionsEmptyState,
   formatSeconds,
   formatTimestamp,
+  listingNote,
   livenessLabel,
   livenessSentence,
   livenessTone,
@@ -12,6 +16,12 @@ import {
   statusLabel,
   statusTone,
 } from "@/lib/agents/presentation";
+import {
+  DEFAULT_LIMIT,
+  type AgentExecution,
+  type AgentInteractionMode,
+} from "@/lib/api/agents";
+import { executionStatusLabel, executionTiming } from "@/lib/executions/presentation";
 import { requireSession } from "@/lib/session";
 
 export const dynamic = "force-dynamic";
@@ -87,6 +97,10 @@ export default async function AgentDetailPage({
   }
 
   const { project, agent } = result;
+  // After the overview, not beside it: this list is one card's content, and
+  // asking for it before the path is known to be coherent would request an
+  // agent's executions for a path the loader is about to refuse.
+  const executions = await loadAgentExecutions(token, projectId, agentId, DEFAULT_LIMIT);
   const heartbeat = livenessSentence(agent);
   const archived = agent.archived_at !== null;
   // A heartbeat TTL and a last-heartbeat time are facts about an agent that is
@@ -136,6 +150,29 @@ export default async function AgentDetailPage({
           </span>
         </p>
         <p className="muted">{heartbeat.detail}</p>
+      </div>
+
+      <div className="card">
+        <h2 className="card__title">Executions</h2>
+        {executions.kind === "error" ? (
+          <>
+            <p className="form__error" role="alert">
+              {executions.message}
+            </p>
+            {executions.requestId !== undefined && (
+              <p className="muted">
+                Request <code>{executions.requestId}</code> if you are reporting this.
+              </p>
+            )}
+          </>
+        ) : (
+          <ExecutionList
+            executions={executions.executions}
+            workspaceId={workspaceId}
+            projectId={projectId}
+            mode={agent.interaction_mode}
+          />
+        )}
       </div>
 
       <div className="card">
@@ -206,5 +243,62 @@ export default async function AgentDetailPage({
         </dl>
       </div>
     </section>
+  );
+}
+
+/**
+ * The agent's executions, newest first, each a link to what its steps did.
+ *
+ * A row says only what it can: the status, when it ran, and - for a managed
+ * agent, whose executions are mostly its own tests - whether this one was the
+ * `agent.test` harness rather than a workflow somebody drew. The id is not
+ * printed; it is the link, and a uuid on screen is noise.
+ */
+function ExecutionList({
+  executions,
+  workspaceId,
+  projectId,
+  mode,
+}: {
+  readonly executions: readonly AgentExecution[];
+  readonly workspaceId: string;
+  readonly projectId: string;
+  readonly mode: AgentInteractionMode;
+}) {
+  if (executions.length === 0) {
+    const empty = executionsEmptyState(mode);
+    return (
+      <>
+        <p>{empty.headline}</p>
+        <p className="muted">{empty.detail}</p>
+      </>
+    );
+  }
+
+  const note = listingNote(executions.length, DEFAULT_LIMIT);
+  return (
+    <>
+      <ul className="list">
+        {executions.map((execution) => (
+          <li className="list__item" key={execution.id}>
+            <div>
+              <Link
+                className="list__title"
+                href={`/w/${workspaceId}/p/${projectId}/executions/${execution.id}`}
+              >
+                {execution.is_test_harness ? "Test of this agent" : "Workflow run"}
+              </Link>
+              <p className="muted">{executionTiming(execution)}</p>
+            </div>
+            <div>
+              <span className={pillClassName(executionStatusTone(execution.status))}>
+                {executionStatusLabel(execution.status)}
+              </span>
+            </div>
+          </li>
+        ))}
+      </ul>
+      {note !== null && <p className="muted">{note}</p>}
+    </>
   );
 }

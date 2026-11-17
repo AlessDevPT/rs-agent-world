@@ -404,6 +404,18 @@ a.list__title:focus-visible {
   font-size: 0.85rem;
 }
 
+/* A step's output on the execution page, which is mostly a model's answer.
+   Two properties and no more: the answer is written with line breaks and loses
+   its shape without `pre-wrap`, and a model can return one unbroken token -
+   a base64 blob, a long URL - that runs past the card's edge without
+   `overflow-wrap`. Scoped to this class rather than to `p`, because every
+   other paragraph on the site is prose that wraps at spaces and would gain
+   nothing but the chance to inherit a surprise. */
+.step__output {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
 /* The one-time key display. Wrapped rather than scrolled: a key that runs off
    the edge invites a partial copy, and a partial key fails in a way nobody
    connects back to this screen. */

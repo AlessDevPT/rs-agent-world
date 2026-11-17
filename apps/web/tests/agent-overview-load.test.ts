@@ -15,8 +15,8 @@
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { loadAgentOverview } from "@/lib/agents/load";
-import type { Agent } from "@/lib/api/agents";
+import { loadAgentExecutions, loadAgentOverview } from "@/lib/agents/load";
+import type { Agent, AgentExecution } from "@/lib/api/agents";
 import type { Project } from "@/lib/api/tenancy";
 
 const WORKSPACE = "w-1";
@@ -238,5 +238,93 @@ describe("loadAgentOverview", () => {
     const result = await loadAgentOverview("t", WORKSPACE, "p-1", "a-1");
 
     expect(result).toEqual({ kind: "error", message: "Could not load this project" });
+  });
+});
+
+
+/**
+ * The agent page's execution list, which is one card rather than the page.
+ *
+ * The claim worth pinning is the one `loadAgentOverview` does not make: this
+ * loader has **no `not_found`**. A 404 here arrives after the agent has
+ * already loaded - the agent exists, the viewer may read it - so it is a race
+ * or a deletion mid-render, and turning it into `notFound()` would take down a
+ * page whose status and heartbeat are still perfectly readable. It stays an
+ * error inside the card.
+ */
+describe("loadAgentExecutions", () => {
+  const EXECUTIONS_PATH = "/v1/projects/p-1/agents/a-1/executions?limit=50";
+
+  const EXECUTION: AgentExecution = {
+    id: "e-1",
+    workflow_id: "wf-1",
+    workflow_version_id: "v-1",
+    status: "completed",
+    initiator_kind: "user",
+    initiator_label: "ana@example.com",
+    input: {},
+    output: { confirm: { text: "ACCEPTED" } },
+    error: null,
+    created_at: "2026-11-17T09:00:00Z",
+    started_at: "2026-11-17T09:00:01Z",
+    finished_at: "2026-11-17T09:00:04Z",
+    is_test_harness: true,
+  };
+
+  it("returns what the agent took part in, asking for the limit it was given", async () => {
+    const { paths } = captureFetch({ [EXECUTIONS_PATH]: ok([EXECUTION]) });
+
+    const result = await loadAgentExecutions("t", "p-1", "a-1", 50);
+
+    expect(result).toEqual({ kind: "ok", executions: [EXECUTION] });
+    expect(paths).toEqual([EXECUTIONS_PATH]);
+  });
+
+  it("treats an empty list as an answer rather than as nothing", async () => {
+    // An agent with no executions is the ordinary case for a `dispatchable`
+    // or `observed` one, and the card has a sentence for it.
+    captureFetch({ [EXECUTIONS_PATH]: ok([]) });
+
+    expect(await loadAgentExecutions("t", "p-1", "a-1", 50)).toEqual({
+      kind: "ok",
+      executions: [],
+    });
+  });
+
+  it("keeps the API's own words and its request id when it refuses", async () => {
+    captureFetch({
+      [EXECUTIONS_PATH]: problem(503, "The database is not accepting connections", "req_abc"),
+    });
+
+    expect(await loadAgentExecutions("t", "p-1", "a-1", 50)).toEqual({
+      kind: "error",
+      message: "The database is not accepting connections",
+      requestId: "req_abc",
+    });
+  });
+
+  it("does not turn a 404 into a missing page", async () => {
+    // The whole point of this loader being separate: the outcome has no
+    // `not_found` member, so a 404 cannot reach `notFound()` from here.
+    captureFetch({ [EXECUTIONS_PATH]: problem(404, "Agent not found") });
+
+    const result = await loadAgentExecutions("t", "p-1", "a-1", 50);
+
+    expect(result).toEqual({ kind: "error", message: "Agent not found" });
+    expect(result.kind).not.toBe("not_found");
+  });
+
+  it("falls back to its own sentence for a thrown value it knows nothing about", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => {
+        throw new TypeError("fetch failed");
+      }),
+    );
+
+    expect(await loadAgentExecutions("t", "p-1", "a-1", 50)).toEqual({
+      kind: "error",
+      message: "Could not load this agent's executions",
+    });
   });
 });

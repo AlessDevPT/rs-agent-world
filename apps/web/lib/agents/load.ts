@@ -24,7 +24,13 @@
  * never be reported as an agent that does not exist.
  */
 
-import { getAgent, getProject, type Agent } from "@/lib/api/agents";
+import {
+  getAgent,
+  getProject,
+  listExecutions,
+  type Agent,
+  type AgentExecution,
+} from "@/lib/api/agents";
 import { ApiError } from "@/lib/api/client";
 import type { Project } from "@/lib/api/tenancy";
 
@@ -84,6 +90,45 @@ export async function loadAgentOverview(
   if (agent.project_id !== projectId) return NOT_FOUND;
 
   return { kind: "ok", project, agent };
+}
+
+/**
+ * What AgentWorld ran for this agent, or why the list cannot be shown.
+ *
+ * Separate from `loadAgentOverview` rather than folded into it, and the
+ * difference is what a failure should cost. The overview decides whether the
+ * page exists at all; this decides whether one card on it has content. An
+ * execution list that cannot be read must not take the page down with it - the
+ * agent's status and heartbeat are still worth seeing - so there is no
+ * `not_found` member here: a 404 after the agent has already loaded is a race,
+ * and it reads as an error in that card rather than as a missing page.
+ */
+export type AgentExecutions =
+  | {
+      readonly kind: "error";
+      readonly message: string;
+      readonly requestId?: string | undefined;
+    }
+  | { readonly kind: "ok"; readonly executions: readonly AgentExecution[] };
+
+export async function loadAgentExecutions(
+  token: string,
+  projectId: string,
+  agentId: string,
+  limit: number,
+): Promise<AgentExecutions> {
+  try {
+    return { kind: "ok", executions: await listExecutions(token, projectId, agentId, { limit }) };
+  } catch (caught) {
+    if (caught instanceof ApiError) {
+      return {
+        kind: "error",
+        message: caught.problem.detail,
+        requestId: caught.requestId,
+      };
+    }
+    return { kind: "error", message: "Could not load this agent's executions" };
+  }
 }
 
 /**
