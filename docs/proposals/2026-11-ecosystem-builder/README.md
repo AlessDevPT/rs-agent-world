@@ -1,9 +1,20 @@
 # Proposal: AgentWorld as a visual AI ecosystem builder
 
-> **Revision 4, 2026-11-01** — approved; Phase 2 implementation has begun. **Nothing here is implemented.**
-> `docs/01`–`05` still describe the previous product direction and remain the contract the
-> code was written against. On approval these documents are merged into that set and this
-> directory is removed.
+> **Revision 4, 2026-11-01 — approved, and being implemented.**
+>
+> **Status, 2026-11-17.** Phase 2 is complete. Phase 3's Track A is nearly complete — T0–T6d
+> have landed, with the OpenAI-compatible provider, the event bus and the WebSocket gateway
+> still open. Phase 3's Track B, the island skeleton and the minimal pages, **has not
+> started**: `apps/web/world/` holds a README and no code. Parts of Phase 4's Track A landed
+> early, which that phase's section now records. What is built, what is not and what comes
+> next are in [`docs/STATUS-2026-11-17.md`](../../STATUS-2026-11-17.md), written from the
+> code rather than from this plan — read that for status and these documents for reasoning.
+>
+> `docs/01`–`05` describe the **previous** product direction. Phases 0–1 were built against
+> them and much of that still stands — tenancy, roles, problem details, the ingest plane —
+> but where they disagree with this directory or with the code, they are history, and each
+> now carries a banner saying so. On completion this directory's decisions are merged into
+> that set and this directory is removed.
 
 **Where every decision stands — implemented, approved, deferred, open — is in
 [07-DECISION-RECORD.md](07-DECISION-RECORD.md). Start there if you want status rather

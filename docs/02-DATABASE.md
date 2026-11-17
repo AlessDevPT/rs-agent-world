@@ -1,7 +1,29 @@
 # AgentWorld — Database Schema
 
-> PostgreSQL 16. Revision 1 (2026-10-31). This document is the source of truth for the
-> first Alembic migration; the SQL below is written to be runnable as-is.
+> PostgreSQL 16. Revision 1 (2026-10-31). This document was the source of truth for
+> the first Alembic migration; the SQL below is written to be runnable as-is.
+
+> [!IMPORTANT]
+> **No longer the source of truth (2026-11-17).** The schema has moved on through
+> 26 migrations. The live schema is `apps/api/src/agentworld/repositories/models.py`
+> plus `apps/api/migrations/versions/`, and
+> `test_the_models_match_the_migrated_schema` keeps those two honest against a
+> freshly migrated database. The tables below that still exist are described
+> accurately; the delta is:
+>
+> **14 tables exist that this document does not mention** - `workflows`,
+> `workflow_versions`, `workflow_steps`, `workflow_edges`, `workflow_executions`,
+> `execution_steps`, `dispatches`, `connections`, `credentials`, `model_profiles`,
+> `project_event_cursors`, `world_nodes`, `world_routes`, `world_districts`. They
+> are specified in
+> [`proposals/2026-11-ecosystem-builder/01-DOMAIN-AND-PROTOCOL.md`](proposals/2026-11-ecosystem-builder/01-DOMAIN-AND-PROTOCOL.md).
+>
+> **4 tables here were never built** - `integrations`, `webhooks`,
+> `webhook_deliveries` (outbound delivery is Phase 4 of the live roadmap) and
+> `world_placements`, which became `world_nodes`.
+>
+> `tasks` and `task_dependencies` exist and are unused: no endpoint serves them.
+> Overall status is in [`STATUS-2026-11-17.md`](STATUS-2026-11-17.md).
 
 ## 1. Shape of the data
 

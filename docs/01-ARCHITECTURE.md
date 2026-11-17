@@ -1,6 +1,28 @@
 # AgentWorld — Architecture
 
-> Status: design, pre-implementation. Revision 1 (2026-10-31).
+> Status: Revision 1 (2026-10-31), **largely implemented, and partly superseded.**
+
+> [!IMPORTANT]
+> **Read this with [`STATUS-2026-11-17.md`](STATUS-2026-11-17.md) beside it (2026-11-17).**
+>
+> "Design, pre-implementation" has not been true since Phase 0. What this
+> document describes as the core - tenancy and identity, the ingest plane, event
+> sourcing with replay, problem details, the visual-layer contract in §6 - is
+> built and tested. Two things in it are now history:
+>
+> - **Tasks and commands.** The product direction changed on 2026-11-01 to an
+>   orchestration platform: workflows, versions, executions, a dispatch outbox,
+>   model profiles and provider credentials. The `tasks` and `task_dependencies`
+>   tables still exist, but no endpoint serves them and no agent claims from
+>   them. The domain and protocol as actually built are in [`proposals/2026-11-ecosystem-builder/`](proposals/2026-11-ecosystem-builder/README.md),
+>   documents 01 and 02.
+> - **The protocol package and the SDKs.** There is no `packages/` directory, no
+>   generated client, no drift check and no SDK. The protocol has a version
+>   number and, deliberately, zero external consumers.
+>
+> Realtime (§5's WebSocket gateway) is **not built**: `api/ws/` is an empty
+> placeholder package. The goals and the risk register below still hold and are
+> what the import-linter contracts enforce in CI.
 
 ## 1. What this is
 

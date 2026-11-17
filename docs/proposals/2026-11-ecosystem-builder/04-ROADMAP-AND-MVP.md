@@ -86,6 +86,11 @@ brief does not contradict it and it is what keeps the island honest:
 
 ### Phase 2 — Core model and protocol  *(Track A, 2–2.5 w)*
 
+> **Status, 2026-11-17 — complete, with one criterion that cannot be tested yet.**
+> The ledger below was reconciled against the suites on that date: every tick names
+> the test that earns it. The single open box, `initiator_label` surviving a deleted
+> trigger, waits on triggers themselves, which are Phase 7.
+
 Makes the ecosystem expressible and proves the event pipeline honest. No execution yet.
 
 **Build**
@@ -112,29 +117,75 @@ Makes the ecosystem expressible and proves the event pipeline honest. No executi
 - The permission matrix rows for everything above (`05-PERMISSIONS.md`).
 
 **Acceptance criteria**
-- [ ] An ecosystem — two agents, a connection, a draft workflow — is created through the
+- [x] An ecosystem — two agents, a connection, a draft workflow — is created through the
       API, and `GET` returns it.
-- [ ] `validate` produces every documented finding code, each with a test, including
+      **Met, piecewise rather than as one flow.** Agents in
+      `tests/integration/test_agents_api.py`, connections and their grants in
+      `test_workflows_api.py`, the draft and its graph in `test_workflow_writes.py`,
+      `test_workflow_reads.py` and `test_workflow_graph.py`. No single test builds the
+      whole ecosystem end to end; each part is created and read back through the API.
+- [x] `validate` produces every documented finding code, each with a test, including
       `observed_agent_assigned`, `tool_not_granted`, `cycle` and `unreachable_step`.
-- [ ] **Replay equivalence:** ingest a recorded stream, snapshot state, truncate
+      **Met.** `tests/unit/test_validate.py` covers the finding codes, including
+      `observed_agent_assigned`, `tool_not_granted` and `unreachable_step`, with the graph
+      cases in `tests/integration/test_workflow_graph.py` and
+      `test_validate_survives_a_graph_full_of_nonsense` as the don't-crash case.
+- [x] **Replay equivalence:** ingest a recorded stream, snapshot state, truncate
       current-state tables, replay, assert byte-identical.
-- [ ] **Protocol promise 7:** the same replay with dispatch workers running creates
+      **Met.** `test_refolding_the_stored_log_reproduces_the_state`
+      (`tests/integration/test_ingest.py`): the stored log is refolded and the resulting
+      state compared with the state the live pipeline produced.
+- [x] **Protocol promise 7:** the same replay with dispatch workers running creates
       **zero** `dispatches` rows.
-- [ ] The same batch ingested three times yields one event per `dedup_key`.
-- [ ] Reducer table-driven tests pass for every event type, including stale and
+      **Met, twice.** `test_folding_a_workflow_trace_creates_no_dispatches`
+      (`tests/integration/test_ingest.py`) and `test_replaying_the_log_creates_no_dispatch`
+      (`tests/integration/test_executions_api.py`). Folding the log causes no work.
+- [x] The same batch ingested three times yields one event per `dedup_key`.
+      **Met.** `test_the_same_batch_three_times_yields_one_event_each`, with
+      `test_two_concurrent_batches_with_one_dedup_key_report_a_duplicate` for the race and
+      `test_dedup_is_case_insensitive` for the near miss
+      (`tests/integration/test_ingest.py`, `tests/integration/test_schema.py`).
+- [x] Reducer table-driven tests pass for every event type, including stale and
       out-of-order delivery.
-- [ ] The expression evaluator resists attribute escape, unbounded recursion and I/O.
-- [ ] Tenant isolation: every new endpoint returns 404 for a foreign id, and the owner
+      **Met.** `tests/unit/test_reducers.py` for the table, and
+      `tests/integration/test_stale_events.py` for stale and out-of-order delivery.
+- [x] The expression evaluator resists attribute escape, unbounded recursion and I/O.
+      **Met.** `tests/unit/test_expressions.py`.
+- [x] Tenant isolation: every new endpoint returns 404 for a foreign id, and the owner
       succeeds on the same call. The coverage guard fails if a route is missing from the
       table.
-- [ ] Schema and enum drift tests pass against a freshly migrated database.
-- [ ] The presentation tables have no execution-state columns (the forbidden-name test).
-- [ ] Every execution has an initiator: the XOR constraint refuses a row with neither, with
+      **Met.** `tests/integration/test_tenant_isolation.py` for the per-endpoint pairs and
+      `test_tenant_pairs.py` for the coverage guard, which is verified by planting a route
+      missing from the table.
+- [x] Schema and enum drift tests pass against a freshly migrated database.
+      **Met.** `test_every_python_enum_exists_in_the_database_with_the_same_members`,
+      `test_there_are_no_database_enums_the_code_does_not_know_about` and
+      `test_the_models_match_the_migrated_schema` (`tests/integration/test_schema.py`),
+      all against a freshly migrated database; CI also runs migrations from scratch.
+- [x] The presentation tables have no execution-state columns (the forbidden-name test).
+      **Met.** `tests/integration/test_world_separation.py` - *the presentation tables hold
+      no execution state, and prove it*.
+- [x] Every execution has an initiator: the XOR constraint refuses a row with neither, with
       both, or with a `system` kind carrying a user id.
+      **Met.** `test_a_contradictory_initiator_is_refused`,
+      `test_a_user_initiated_execution_names_a_user`,
+      `test_a_system_initiated_execution_names_no_user` and
+      `test_an_initiator_label_is_required`
+      (`tests/integration/test_execution_integrity.py`).
 - [ ] `initiator_label` survives deleting the trigger that caused the execution.
-- [ ] A user who has initiated an execution cannot be hard-deleted (`ON DELETE RESTRICT`).
-- [ ] `authorize()` refuses every control-plane action for a `SystemPrincipal`, for every
+      **Open, and not yet testable.** Triggers arrive in Phase 7, so there is no trigger to
+      delete. What exists today is the column's independence:
+      `test_an_initiator_label_is_required` (`tests/integration/test_execution_integrity.py`)
+      refuses an execution that carries no label, which is the half of the criterion the
+      schema can enforce now.
+- [x] A user who has initiated an execution cannot be hard-deleted (`ON DELETE RESTRICT`).
+      **Met.** `test_an_initiating_user_cannot_be_hard_deleted`
+      (`tests/integration/test_execution_integrity.py`).
+- [x] `authorize()` refuses every control-plane action for a `SystemPrincipal`, for every
       action in the enum — the same exhaustive test the key principal already has.
+      **Met.** `test_the_system_principal_may_perform_no_control_action`, exhaustive over
+      the `Action` enum, with `test_a_system_run_is_not_a_member_of_anything` and
+      `test_the_system_actor_has_no_id_to_record` beside it (`tests/unit/test_policy.py`).
 
 **Affects Phase 0/1:** additively. New enums, new `Action` rows, new tables in
 `RLS_PROTECTED_TABLES`, one `ALTER TYPE agent_status ADD VALUE 'paused'`. No existing
@@ -143,6 +194,13 @@ behaviour changes.
 ---
 
 ### Phase 3 — Execution core + island skeleton  *(Tracks A and B, 3 w)*
+
+> **Status, 2026-11-17 — not complete.** Track A: T0–T6d are in; what remains is the
+> OpenAI-compatible provider, the event bus with the WebSocket gateway, and the single
+> live provider call. Track B: **nothing built.** The acceptance ledger below was
+> reconciled against the suites on that date — every tick names the test that earns it
+> and every open box says why it is open. Overall status and the ordered next steps
+> are in [`docs/STATUS-2026-11-17.md`](../../STATUS-2026-11-17.md).
 
 The first phase where something runs, and the first where something is visible.
 
@@ -266,31 +324,60 @@ The first phase where something runs, and the first where something is visible.
   rather than closed - a crash still strands an execution, and T6c guarantees somebody
   comes back for it within the interval plus the grace period. See
   `18-T6C-ADVANCEMENT-RECOVERY.md`.
-- ~~`POST /v1/workflows/{id}/run`, `GET /v1/executions/{id}`.~~ **Run route done (T5);
-  execution detail still to come.** Plus the T6b review queue:
+- ~~`POST /v1/workflows/{id}/run`, `GET /v1/executions/{id}`.~~ **Done (T5, T6b).** The run route, and execution
+  detail at `GET /v1/projects/{project_id}/executions/{execution_id}` with the
+  project-scoped list and `POST .../executions/{id}/cancel` beside it
+  (`api/v1/executions.py`). Plus the T6b review queue:
   `GET /v1/projects/{project_id}/dispatches` and
   `POST /v1/projects/{project_id}/dispatches/{dispatch_id}/resolve`, which were not in
   this plan - the `needs_review` state T6 created has to have an authorized way out, or
   an execution that reaches it is stuck for ever.
-- `infra/event_bus.py` + the WebSocket gateway: snapshot, deltas, cursors, `resume`,
-  `resync_required`.
-- The two new import-linter contracts, each verified by planting a violation.
+- **Open, not started.** `infra/event_bus.py` + the WebSocket gateway: snapshot,
+  deltas, cursors, `resume`, `resync_required`. `api/ws/__init__.py` is an empty
+  placeholder package, there is no `ws-ticket` endpoint and no event bus. This is the
+  largest piece of Phase 3 still outstanding, and the island's statuses are specified
+  to come from it.
+- ~~The two new import-linter contracts, each verified by planting a violation.~~
+  **Done (T2, T3).** Eight contracts in `apps/api/pyproject.toml`; the two newest keep
+  `httpx` inside `infra/net/` and provider SDKs inside `infra/providers/`, and CI runs
+  them as the *Architecture contracts* step.
 
 **Build — Track B: island milestone I1**
+
+> **None of this has been built (2026-11-17).** `apps/web/world/` holds a README;
+> neither Phaser nor Zustand is in any `package.json`; the `world_nodes`,
+> `world_routes`, `world_districts` and `world_layouts` tables exist with no endpoints
+> in front of them.
 - `world/types.ts`, `projector/projectBuild` + `projectLive`, `interpreter/`, `dispatch/`,
   `phaser/`, `bridge/` — the final architecture, minimal content.
 - Static isometric grid, one sprite per `building_kind`, agents placed from `world_nodes`.
 - Click to select → inspector panel → **the real agent form in Simple mode**.
 - Status rendered from live WebSocket deltas.
 - Build / Live toggle, distinct from the start: Build allows select; Live is read-only.
-- Minimal pages: agent list and form, execution detail.
+- Minimal pages: agent list and form, execution detail. **The agent list and the agent
+  detail page landed on 2026-11-15/16; the form and the execution detail page are
+  open.**
 
 **Acceptance criteria**
 - [ ] `POST /v1/workflows/{id}/run` on a one-step workflow calls a real provider, writes a
       run trace, and completes — through `curl`, with no frontend.
-- [ ] `advance()` unit tests pass with no database and no network; called twice on identical
+      **Open, and not a code task.** The route, the run trace and the completion are
+      exercised end to end against recorded provider responses
+      (`tests/integration/test_dispatch_worker.py`). What is missing is the one *live*
+      call, which needs an `ANTHROPIC_API_KEY` nobody has supplied;
+      `scripts/live_provider_smoke.py` is that check, kept out of the suite so CI keeps
+      reporting zero skips.
+- [x] `advance()` unit tests pass with no database and no network; called twice on identical
       state it returns identical decisions.
-- [ ] A double `advance` produces **one** dispatch; the loser hits the unique constraint.
+      **Met.** `test_advance_imports_nothing_it_should_not` and
+      `test_nothing_in_the_module_reads_a_clock` assert it from the module's syntax tree;
+      `test_the_same_state_twice_gives_the_same_decisions`,
+      `test_a_different_clock_changes_nothing_but_the_timestamp` and
+      `test_a_recorded_sequence_replays_to_the_same_decisions` assert the determinism
+      (`tests/unit/test_advance.py`).
+- [x] A double `advance` produces **one** dispatch; the loser hits the unique constraint.
+      **Met.** `test_a_double_advance_produces_one_dispatch`
+      (`tests/integration/test_executions_api.py`).
 - [x] A worker killed mid-dispatch: the lease expires and the step completes exactly once.
       **Met only for a crash *before* the outbound call** -
       `test_an_expired_lease_is_recovered_and_the_work_runs`. A crash *during* the call is
@@ -315,24 +402,65 @@ The first phase where something runs, and the first where something is visible.
       `ProviderFailure.is_retryable` was consulted by nothing, so a 400 was retried too,
       despite being classified terminal since T3 and asserted as such in
       `test_providers.py`. Both bounded on `claim_count` and the classification now.
-- [ ] A credential row copied into another workspace at the SQL level cannot be decrypted.
-- [ ] KEK rotation re-wraps every DEK with no plaintext access and no `ciphertext` change.
+- [x] A credential row copied into another workspace at the SQL level cannot be decrypted.
+      **Met.** `test_a_row_read_for_another_workspace_cannot_be_decrypted`, with
+      `test_a_row_read_under_another_credential_id_cannot_be_decrypted` and
+      `test_moving_both_halves_together_does_not_help` closing the two ways around it
+      (`tests/unit/test_secrets.py`): the AAD binds the workspace and the credential id.
+- [x] KEK rotation re-wraps every DEK with no plaintext access and no `ciphertext` change.
+      **Met.** `test_rewrapping_moves_the_key_and_leaves_the_ciphertext_alone`
+      (`tests/unit/test_secrets.py`).
 - [ ] **The island displays real agents** from the backend, with their real statuses, and
       opens the real configuration form. No mock data path exists in the codebase.
+      **Open.** Track B has not started: `apps/web/world/` holds a README and no code.
 - [ ] An agent going `offline` stays visible and renders shuttered.
+      **Open.** Needs Track B, and needs the realtime deltas it would render from.
 - [ ] Deleting `world/phaser/` leaves the backend suite and the non-world web suite green.
-- [ ] Planting `import anthropic` in `services/` fails the new import contract.
-- [ ] Planting `httpx.AsyncClient(...)` outside `infra/net/` fails its contract.
-- [ ] Every range in `06-OUTBOUND-SECURITY.md` §3 is refused, parametrised one case per
+      **Not yet meaningful.** There is no `world/phaser/` to delete and Phaser is in no
+      `package.json`. The criterion becomes testable the day Track B starts, which is also
+      when it is worth running.
+- [x] Planting `import anthropic` in `services/` fails the new import contract.
+      **Met (T3).** Verified by planting one, recorded in `12-T3-PROVIDERS.md`. The
+      companion `test_no_vendor_is_named_outside_the_provider_package` covers what no
+      import contract can see - a vendor's name in a string, a constant or a comment -
+      with `test_the_pattern_would_actually_catch_one` as its non-vacuity guard.
+- [x] Planting `httpx.AsyncClient(...)` outside `infra/net/` fails its contract.
+      **Met (T2).** Verified by planting one in `services/projects.py`;
+      `11-T2-GUARDED-CLIENT.md` records the result. `apps/api/pyproject.toml` now carries
+      eight import contracts and CI runs them as the *Architecture contracts* step.
+- [x] Every range in `06-OUTBOUND-SECURITY.md` §3 is refused, parametrised one case per
       row, for both IP families — including `::ffff:169.254.169.254` and the NAT64 form.
-- [ ] A resolver returning a public address then `10.0.0.5` still connects to the first:
+      **Met.** `test_every_blocked_ipv4_range_is_refused`,
+      `test_every_blocked_ipv6_range_is_refused`,
+      `test_the_metadata_addresses_are_refused`,
+      `test_the_metadata_hostnames_are_refused_by_name`,
+      `test_a_nat64_wrapped_public_address_is_still_refused` and
+      `test_the_short_decimal_hex_and_octal_forms_of_loopback_are_refused`, with
+      `test_the_tables_are_the_documented_size` guarding against a table that silently
+      shrinks (`tests/unit/test_egress.py`).
+- [x] A resolver returning a public address then `10.0.0.5` still connects to the first:
       the address is pinned, not re-resolved.
-- [ ] `Host` and TLS SNI carry the original hostname when connecting by IP, against a real
+      **Met.** `test_the_address_is_pinned_against_a_rebinding_resolver` and
+      `test_exactly_one_lookup_happens_per_request` - the second is what makes the first
+      mean *pinned* rather than *lucky* (`tests/unit/test_egress.py`).
+- [x] `Host` and TLS SNI carry the original hostname when connecting by IP, against a real
       TLS test server.
-- [ ] A blocked destination, a non-existent host and a refused connection are
+      **Met.** `test_the_host_header_and_sni_carry_the_original_hostname` and
+      `test_the_certificate_is_verified_against_the_name_not_the_address`, against a real
+      TLS server fixture (`tests/unit/test_guarded_tls.py`).
+- [x] A blocked destination, a non-existent host and a refused connection are
       indistinguishable in step output, event payload and problem document.
-- [ ] A `dispatchable` or `observed` agent cannot be saved with a `model_profile_id` —
+      **Met at the client layer.** `test_a_refused_connection_is_unreachable` asserts that
+      a real refused socket renders the *same string* as a `BLOCKED_DESTINATION` error, and
+      `test_a_host_that_resolves_to_nothing_is_refused` covers the third case
+      (`tests/unit/test_guarded_tls.py`, `tests/unit/test_egress.py`). The step-output and
+      problem-document surfaces inherit that one normalised message rather than asserting
+      it themselves - said plainly so the scope of the tick is not overread.
+- [x] A `dispatchable` or `observed` agent cannot be saved with a `model_profile_id` —
       the check constraint, not a service check.
+      **Met.** `test_only_a_managed_agent_may_name_a_model_profile`
+      (`tests/integration/test_schema.py`), asserted against the database rather than
+      through a service, which is what the criterion asked for.
 
 ---
 
@@ -342,6 +470,16 @@ The milestone the refinement brief asks for. Everything here is narrow in each d
 and complete end to end.
 
 **Build — Track A**
+
+> **Partly built already, ahead of this phase (2026-11-17).** `input_mapping` and the
+> multi-step wiring exist (`domain/expressions/parser.py`,
+> `domain/orchestration/advance.py`), as do delegate compilation
+> (`domain/orchestration/delegation.py`), `agent.test` (`services/agent_test.py`,
+> `POST /v1/projects/{id}/agents/{id}/test`) and `execution.cancel`
+> (`POST /v1/projects/{id}/executions/{id}/cancel`). Track A ran ahead of its phase
+> while Track B stood still, so what actually remains of Phase 4 is Track B's I2 and
+> Track C's builder prototype.
+
 - Multi-step sequential execution: step output → next step input via `input_mapping`.
 - A `delegate` connection compiles to a two-step `workflow_version`. **A "team" is not a
   new entity and not a second execution path** — one orchestrator, always.

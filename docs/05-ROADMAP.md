@@ -13,6 +13,9 @@
 > [`proposals/2026-11-ecosystem-builder/04-ROADMAP-AND-MVP.md`](proposals/2026-11-ecosystem-builder/04-ROADMAP-AND-MVP.md),
 > not the ones below. Phases 0-1 here were built roughly as written; the rest is kept for
 > the goals and the milestone gates, which still hold.
+>
+> **Where things actually stand, measured from the code, is in**
+> [`STATUS-2026-11-17.md`](STATUS-2026-11-17.md) **(2026-11-17).**
 
 ## Ordering principle
 

@@ -2,8 +2,38 @@
 
 > Revision 1 (2026-10-31). Base path `/v1`. All bodies JSON, UTF-8. All timestamps
 > RFC 3339 with explicit offset. FastAPI generates the machine-readable OpenAPI document
-> at `/openapi.json`; this file is the human contract and the spec the implementation is
-> written against.
+> at `/openapi.json`; this file was the spec the first implementation was written
+> against.
+
+> [!IMPORTANT]
+> **Partly superseded (2026-11-17). `/openapi.json` is the contract now.** The
+> conventions (§2), identity, workspaces, projects, API keys, the ingest plane
+> (§4), problem details, rate limits and health all describe what is served. The
+> rest has diverged:
+>
+> **Documented here, never built:** `GET /v1/self`, `POST /v1/self/tasks/claim`,
+> `GET /v1/self/commands`, `POST /v1/self/commands/{id}/ack`,
+> `POST /v1/agents/{id}/commands`, `POST /v1/agents/{id}/maintenance`, every
+> `/v1/tasks/*` and `/v1/projects/{id}/tasks` route, the event, log, metric and
+> export reads, `GET /v1/projects/{id}/overview`, the `/world` routes, the
+> integration and webhook routes, `POST /v1/hooks/{integration_id}`,
+> `GET /v1/adapters`, and the whole of §6 Realtime - there is no WebSocket and no
+> `ws-ticket`.
+>
+> **Served, and not documented here:** workflows, versions, drafts, `validate`,
+> `publish` and `restore` (14 routes); executions - run, list, read, cancel;
+> the dispatch review queue (`GET .../dispatches`, `POST .../dispatches/{id}/resolve`);
+> credentials (create, rotate, revoke, delete); model profiles; connections;
+> `POST .../agents/{id}/test`, `POST .../agents/{id}/restore`, an agent's runs,
+> status history and executions; `GET /v1/projects/{id}/runs`;
+> `DELETE /v1/api-keys/{id}`.
+>
+> **One shape difference worth knowing:** agents are addressed under their project
+> (`/v1/projects/{project_id}/agents/{agent_id}`), not by id alone as §3 has it.
+>
+> The endpoints as built are in
+> [`proposals/2026-11-ecosystem-builder/03-API-AND-FRONTEND.md`](proposals/2026-11-ecosystem-builder/03-API-AND-FRONTEND.md);
+> overall status is in [`STATUS-2026-11-17.md`](STATUS-2026-11-17.md).
 
 ## 1. Planes
 

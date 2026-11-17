@@ -1,7 +1,32 @@
 # AgentWorld — Project Structure
 
 > Revision 1 (2026-10-31). A pnpm + uv monorepo. The API and the web app share no runtime
-> code; they share only the generated client and the protocol schemas.
+> code.
+
+> [!IMPORTANT]
+> **Aspirational in places (2026-11-17).** The real tree is `apps/api`, `apps/web`,
+> `docs`, `infra`, `scripts`, `.github`, plus `Makefile`, `package.json` and
+> `pnpm-workspace.yaml`. Differences that matter:
+>
+> - **There is no `packages/` directory.** No `packages/protocol`, no
+>   `packages/sdk-typescript`, no `packages/sdk-python`, no generated client and no
+>   codegen drift check. The web app hand-writes its typed client in
+>   `apps/web/lib/api/`, so "they share only the generated client" is not yet true
+>   of anything.
+> - **`apps/web` is `app/`, `lib/`, `tests/`, `world/` and `middleware.ts`.** There
+>   is no `components/`, `features/` or `island/`, and `world/` holds a README and no
+>   code. Vitest runs in `node` with no jsdom, so no `.tsx` file is under test.
+> - **`apps/api/src/agentworld` is** `adapters/`, `api/`, `domain/`, `infra/`,
+>   `repositories/`, `services/`, `workers/`, `main.py`, `settings.py`. The module
+>   boundaries are enforced by eight import-linter contracts in
+>   `apps/api/pyproject.toml`, which CI runs as the *Architecture contracts* step -
+>   that file, not this document, is where the layering is defined.
+> - **Commands and CI:** the runner tasks are the `scripts` block of the root
+>   `package.json` (`npm run dev`, `test`, `lint`, `typecheck`, `verify`,
+>   `api:worker`, `api:reaper`, `infra:up`), and CI is three jobs - `api`, `web`,
+>   `compose` - in `.github/workflows/`.
+>
+> Overall status is in [`STATUS-2026-11-17.md`](STATUS-2026-11-17.md).
 
 ## 1. Top level
 
