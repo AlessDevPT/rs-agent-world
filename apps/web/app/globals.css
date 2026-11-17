@@ -404,6 +404,18 @@ a.list__title:focus-visible {
   font-size: 0.85rem;
 }
 
+/* The settings group's own navigation. A row like the workspace bar's, set
+   apart from the page below it rather than styled as a second bar: it sits
+   inside the shell that already has one, and two bars would read as two
+   products. */
+.settings-nav {
+  display: flex;
+  gap: 1rem;
+  padding-bottom: 0.75rem;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 0.5rem;
+}
+
 /* A step's output on the execution page, which is mostly a model's answer.
    Two properties and no more: the answer is written with line breaks and loses
    its shape without `pre-wrap`, and a model can return one unbroken token -

@@ -19,6 +19,14 @@ import { redirect } from "next/navigation";
 
 import { ApiError } from "@/lib/api/client";
 import {
+  createCredential,
+  deleteCredential,
+  revokeCredential,
+  rotateCredential,
+  type Credential,
+  type CredentialKind,
+} from "@/lib/api/credentials";
+import {
   createApiKey,
   createProject,
   createWorkspace,
@@ -159,5 +167,112 @@ export async function revokeApiKeyAction(
     return failure(error);
   }
   revalidatePath(`/w/${workspaceId}/keys`);
+  return { ok: true };
+}
+
+// ------------------------------------------------------------ credentials ---
+//
+// **The secret arrives here and stops here.** A server action runs on the
+// server, so material typed into the form reaches this process and the API
+// over the server-to-server call - it is never held in client state, never
+// put in a URL, and never returned: every action below answers with metadata
+// or with nothing at all. There is no API route that could echo it back even
+// if one of these asked.
+
+export async function createCredentialAction(
+  workspaceId: string,
+  form: FormData,
+): Promise<ActionResult<{ credential: Credential }>> {
+  const name = text(form, "name");
+  if (!name) return { ok: false, message: "A credential needs a name" };
+
+  const providerSlug = text(form, "provider_slug");
+  if (!providerSlug) return { ok: false, message: "Name the provider this key belongs to" };
+
+  // Not trimmed: leading or trailing whitespace can be part of material, and
+  // silently removing it would store a key that fails for a reason nobody
+  // could see. The API refuses an empty one.
+  const secret = form.get("secret");
+  if (typeof secret !== "string" || secret === "") {
+    return { ok: false, message: "There is no material to store" };
+  }
+
+  const projectId = text(form, "project_id");
+  const expiresAt = text(form, "expires_at");
+  const scopes = text(form, "scopes")
+    .split(",")
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+
+  const { token } = await requireSession();
+  try {
+    const credential = await createCredential(token, workspaceId, {
+      name,
+      kind: text(form, "kind") as CredentialKind,
+      provider_slug: providerSlug,
+      secret,
+      project_id: projectId || null,
+      scopes: scopes.length > 0 ? scopes : null,
+      // A date input gives `2026-12-01`; the API wants a timestamp. End of
+      // that day in UTC, so "expires on the first" does not expire at
+      // midnight the night before for anyone west of here.
+      expires_at: expiresAt ? `${expiresAt}T23:59:59Z` : null,
+    });
+    revalidatePath(`/w/${workspaceId}/settings/credentials`);
+    return { ok: true, credential };
+  } catch (error) {
+    return failure(error);
+  }
+}
+
+export async function rotateCredentialAction(
+  workspaceId: string,
+  credentialId: string,
+  form: FormData,
+): Promise<ActionResult<{ credential: Credential }>> {
+  const secret = form.get("secret");
+  if (typeof secret !== "string" || secret === "") {
+    return { ok: false, message: "There is no replacement material to store" };
+  }
+  const expiresAt = text(form, "expires_at");
+
+  const { token } = await requireSession();
+  try {
+    const credential = await rotateCredential(token, workspaceId, credentialId, {
+      secret,
+      expires_at: expiresAt ? `${expiresAt}T23:59:59Z` : null,
+    });
+    revalidatePath(`/w/${workspaceId}/settings/credentials`);
+    return { ok: true, credential };
+  } catch (error) {
+    return failure(error);
+  }
+}
+
+export async function revokeCredentialAction(
+  workspaceId: string,
+  credentialId: string,
+): Promise<ActionResult> {
+  const { token } = await requireSession();
+  try {
+    await revokeCredential(token, workspaceId, credentialId);
+  } catch (error) {
+    return failure(error);
+  }
+  revalidatePath(`/w/${workspaceId}/settings/credentials`);
+  return { ok: true };
+}
+
+export async function deleteCredentialAction(
+  workspaceId: string,
+  credentialId: string,
+): Promise<ActionResult> {
+  const { token } = await requireSession();
+  try {
+    await deleteCredential(token, workspaceId, credentialId);
+  } catch (error) {
+    return failure(error);
+  }
+  revalidatePath(`/w/${workspaceId}/settings/credentials`);
   return { ok: true };
 }

@@ -46,6 +46,13 @@ export default async function WorkspaceLayout({
           <Link className="workspace-bar__link" href={`/w/${workspaceId}/keys`}>
             API keys
           </Link>
+          {/* Workspace-wide configuration. The link renders for every role,
+              as the API keys one does: a viewer who follows it is told why
+              the page is not theirs, which is more use than a link that was
+              never there. */}
+          <Link className="workspace-bar__link" href={`/w/${workspaceId}/settings/credentials`}>
+            Settings
+          </Link>
         </nav>
 
         <div className="workspace-bar__user">
