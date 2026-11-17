@@ -30,6 +30,8 @@ from agentworld.domain.enums import (
     CredentialKind,
     MemberRole,
     RunStatus,
+    StepKind,
+    StepStatus,
 )
 
 
@@ -571,3 +573,45 @@ class WorkflowVersion:
     version: int
     published_at: datetime
     created_at: datetime | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ExecutionStep:
+    """One step of one execution, as somebody reading it sees it.
+
+    Every field is derived. A step row is seeded `pending` when the execution
+    is created and changed only by folding `workflow.step_*` events, so
+    `status` is the whole of what is known about the step rather than a
+    summary of something richer held elsewhere. In particular a step whose
+    dispatch is awaiting human review keeps the status it had when the call
+    went out: the worker writes no event for an outcome nobody knows, and
+    inventing one here would be this layer deciding what happened.
+
+    `kind` travels with the step because it is what decides how `output` may
+    be read. A model's answer and an author's expression are both "output"
+    and they are not equally safe to hand back, so the API redacts per kind -
+    and a reader that was not told the kind could not tell which it had.
+
+    No row id. A step is addressed by `(execution, step_key, attempt)`, which
+    is what the unique constraint says too; an id here would invite a route
+    that reads one step apart from the execution it only means anything
+    inside of.
+    """
+
+    step_key: str
+    kind: StepKind
+    status: StepStatus
+    attempt: int
+    #: The agent the frozen graph assigned, for an `agent_task`. `None` for
+    #: every other kind, and also for a step whose agent row has since been
+    #: deleted - the column is `ON DELETE SET NULL`.
+    agent_key: str | None = None
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+    #: Whatever the producing event carried. Not yet redacted: that happens
+    #: at the API boundary, where the kind's rule is applied.
+    output: Mapping[str, Any] | None = None
+    #: The reducer's shape - `{"code", "message"}` - but only by convention:
+    #: `_error` passes a mapping through whole, so a producer could have put
+    #: anything in it. The API narrows it.
+    error: Mapping[str, Any] | None = None

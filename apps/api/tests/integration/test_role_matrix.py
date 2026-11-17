@@ -274,6 +274,9 @@ ENDPOINTS = [
     Endpoint("POST", "/v1/projects/{project}/workflows/{workflow}/run", MemberRole.MEMBER, {}),
     Endpoint("GET", "/v1/projects/{project}/executions", MemberRole.VIEWER),
     Endpoint("GET", "/v1/projects/{project}/executions/{execution}", MemberRole.VIEWER),
+    # The same `execution.read` the header needs: an execution's steps are
+    # not a separate thing to be allowed, they are what the execution is.
+    Endpoint("GET", "/v1/projects/{project}/executions/{execution}/steps", MemberRole.VIEWER),
     # member, per 05-PERMISSIONS.md: stopping work that is running is an
     # operator action, not an administrative one.
     Endpoint("POST", "/v1/projects/{project}/executions/{execution}/cancel", MemberRole.MEMBER),

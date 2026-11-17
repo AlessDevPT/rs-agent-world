@@ -45,6 +45,7 @@ from dataclasses import dataclass
 from typing import Any
 from uuid import UUID, uuid4
 
+from agentworld.domain.entities import ExecutionStep
 from agentworld.domain.enums import ExecutionStatus, InitiatorKind, StepKind
 from agentworld.domain.errors import (
     ConflictError,
@@ -659,6 +660,38 @@ class ExecutionService:
             if header is None:
                 raise NotFoundError("Execution not found", execution_id=str(execution_id))
             return header
+
+    async def steps(
+        self, principal: UserPrincipal, project_id: UUID, execution_id: UUID
+    ) -> Sequence[ExecutionStep]:
+        """What one execution's steps did.
+
+        Beside `get` rather than inside it. `get` answers "what is this
+        execution?", which is what starting one returns and what every list
+        row shows; this answers "what did it do?". They are separate reads
+        because they are separate questions, and because the execution
+        document is the same wherever it is served from - a field present on
+        one route and absent on the others would break that, which three
+        tests say in as many words.
+
+        The same `EXECUTION_READ` the header has always needed: the steps of
+        an execution are not a separate thing to be allowed, they are what
+        the execution is.
+
+        The header is read first and discarded. That is the 404: without it
+        an unknown execution would answer `[]`, which says "this execution
+        ran nothing" to a caller who is not entitled to know it exists.
+        """
+        async with self._factory.begin(visible_workspaces=set(principal.memberships)) as work:
+            workspace_id = await _workspace_of(work, project_id)
+            authorize(principal, Action.EXECUTION_READ, Resource(workspace_id))
+            executions = work.executions(TenantScope(workspace_id, project_id))
+            if await executions.header(execution_id) is None:
+                # The same refusal `get` gives, for the same reason: a
+                # project the caller cannot see has no rows to find, so this
+                # cannot confirm that someone else's execution exists.
+                raise NotFoundError("Execution not found", execution_id=str(execution_id))
+            return await executions.steps(execution_id)
 
     async def list_in(self, principal: UserPrincipal, project_id: UUID) -> Sequence[Any]:
         async with self._factory.begin(visible_workspaces=set(principal.memberships)) as work:

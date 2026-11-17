@@ -14,14 +14,16 @@ shape a malformed request body produces, so a client has one parser.
 from __future__ import annotations
 
 import datetime as dt
-from typing import Annotated, Any
+from collections.abc import Mapping
+from typing import Annotated, Any, Final
 from uuid import UUID
 
 from fastapi import APIRouter, status
 from pydantic import BaseModel, ConfigDict, Field
 
 from agentworld.api.deps import CallContextDep, CurrentUser, ExecutionServiceDep
-from agentworld.domain.enums import ExecutionStatus, InitiatorKind
+from agentworld.domain.entities import ExecutionStep
+from agentworld.domain.enums import ExecutionStatus, InitiatorKind, StepKind, StepStatus
 
 workflow_router = APIRouter(prefix="/v1/projects/{project_id}/workflows", tags=["executions"])
 router = APIRouter(prefix="/v1/projects/{project_id}/executions", tags=["executions"])
@@ -57,8 +59,175 @@ class RunRequest(BaseModel):
     )
 
 
+class StepErrorView(BaseModel):
+    """Why a step failed, narrowed to the two fields that may be shown.
+
+    The reducer stores whatever mapping the producing event carried - its
+    `_error` passes one through whole - so what is in the column is not a
+    promise about its shape. This model is the promise: a code a client can
+    switch on and a message a person can read, and nothing else travels, so a
+    producer that put a provider's response body or a stack trace beside them
+    cannot have it served.
+    """
+
+    code: str
+    message: str
+
+
+class ExecutionStepView(BaseModel):
+    """One step of an execution, as an authorized reader may see it.
+
+    `status` is reported exactly as stored. A step whose dispatch went to
+    `needs_review` reads as whatever it was when the call left - `dispatched`
+    - because the worker deliberately writes no event for an outcome nobody
+    knows. There is no `needs_review` member of `StepStatus` and this does
+    not invent one: the uncertainty belongs to the dispatch, and the review
+    queue is where it is answered.
+    """
+
+    step_key: str
+    kind: StepKind
+    status: StepStatus
+    attempt: int = Field(
+        description="0 for the first attempt. A retry adds a row rather than replacing one."
+    )
+    agent_key: str | None = Field(
+        default=None,
+        description="The agent the frozen graph assigned, for an `agent_task` step.",
+    )
+    started_at: dt.datetime | None = None
+    finished_at: dt.datetime | None = None
+    output: dict[str, Any] | None = Field(
+        default=None,
+        description=(
+            "Absent when the step produced nothing, and also when its kind has no rule "
+            "for showing one - see the redaction note on the endpoint."
+        ),
+    )
+    error: StepErrorView | None = None
+
+    @classmethod
+    def of(cls, step: ExecutionStep) -> ExecutionStepView:
+        return cls(
+            step_key=step.step_key,
+            kind=step.kind,
+            status=step.status,
+            attempt=step.attempt,
+            agent_key=step.agent_key,
+            started_at=step.started_at,
+            finished_at=step.finished_at,
+            output=_safe_output(step.kind, step.output),
+            error=_safe_error(step.error),
+        )
+
+
+#: The fields of an `agent_task` output that may be served, and the type each
+#: has to be. Everything else a provider turn's output carries - or that
+#: anything else wrote beside it - is dropped rather than inspected.
+_TURN_FIELDS: Final[Mapping[str, type | tuple[type, ...]]] = {
+    "text": str,
+    "stop_reason": str,
+    "model": str,
+}
+
+#: Inside `usage`, which is the one nested shape this release produces.
+_USAGE_FIELDS: Final[tuple[str, ...]] = ("input_tokens", "output_tokens")
+
+
+def _safe_output(kind: StepKind, output: Mapping[str, Any] | None) -> dict[str, Any] | None:
+    """What of a step's output may be served, decided by the step's kind.
+
+    **The rule has to survive copying, which is why `transform` is not served
+    at all.** A later step's `input_mapping` is evaluated against a scope that
+    holds every earlier step's output *as stored* (`advance._scope`), and the
+    expression grammar can name any key of it or the whole object - so
+    `{"everything": "$.steps.research.output"}` puts a model turn's entire
+    stored output, including anything this function would have dropped, inside
+    a transform's own output. Serving that would make the narrowing below
+    decorative: a reader would get the hidden fields through the next step
+    instead. The boundary is therefore drawn where provenance is still known.
+
+    - **`agent_task`** is a model's answer, assembled by the step runner from
+      a provider's response. Only the fields this system puts there are
+      served - the text, why it stopped, which model answered, what it cost -
+      so a provider's own payload, an error document it quoted, or a field a
+      dispatchable agent added when reporting its own step cannot be served.
+    - **`condition`** has one known field, `{"result": bool}`, written by
+      `advance()` itself and derived from nothing but the expression's truth.
+      It is projected rather than passed through, so a condition row that
+      somehow carried more would not widen this.
+    - **`transform`** is **omitted**. Its values are copies, and this layer
+      cannot tell a copy of the author's own input from a copy of something
+      upstream that was not served. The execution's own `output` is
+      unaffected and still carries the result. Serving transform output again
+      needs provenance, or an author-declared output schema; both are
+      decisions, not details.
+    - **anything else** - a kind this release cannot publish, or one added
+      later - is omitted whole, for the same reason the instruction says to
+      omit rather than guess.
+    """
+    if output is None:
+        return None
+    if kind is StepKind.CONDITION:
+        result = output.get("result")
+        return {"result": result} if isinstance(result, bool) else None
+    if kind is not StepKind.AGENT_TASK:
+        return None
+
+    safe: dict[str, Any] = {}
+    for field_name, expected in _TURN_FIELDS.items():
+        value = output.get(field_name)
+        if isinstance(value, expected):
+            safe[field_name] = value
+    usage = output.get("usage")
+    if isinstance(usage, Mapping):
+        counted = {
+            name: usage[name]
+            for name in _USAGE_FIELDS
+            if isinstance(usage.get(name), int) and not isinstance(usage.get(name), bool)
+        }
+        if counted:
+            safe["usage"] = counted
+    return safe or None
+
+
+def _safe_error(error: Mapping[str, Any] | None) -> StepErrorView | None:
+    """A stored error narrowed to `{code, message}`, or nothing.
+
+    An error with neither readable field becomes `None` rather than an empty
+    object: "this step failed and here is why" and "this step failed" are
+    different statements, and a client should not have to tell them apart by
+    inspecting an object with no content.
+
+    This narrows the *shape*. It cannot scrub a secret that a producer wrote
+    into the message itself - no rule can - and the producers in this system
+    do not: a provider failure's message is the generic
+    `ProviderError.__str__`, and its `reason` never leaves the server.
+    """
+    if error is None:
+        return None
+    code = error.get("code")
+    message = error.get("message")
+    if not isinstance(message, str) or not message.strip():
+        return None
+    return StepErrorView(
+        code=code if isinstance(code, str) and code.strip() else "unspecified",
+        message=message,
+    )
+
+
 class ExecutionView(BaseModel):
-    """An execution's own record. Step detail is T12's."""
+    """An execution's own record.
+
+    Unchanged by T12a, deliberately. Three tests assert that every route
+    returning an execution returns the *same* document -
+    `test_the_view_is_the_one_the_execution_routes_return`,
+    `test_the_execution_view_is_the_shared_one_plus_the_flag`, and
+    `test_the_answer_is_read_through_the_existing_execution_endpoint`, which
+    is decision 6's "no second result API". A step collection loaded on one
+    route and absent on the others would break all three, so the steps are a
+    route of their own instead.
+    """
 
     id: UUID
     workflow_id: UUID
@@ -252,3 +421,30 @@ async def get_execution(
     service: ExecutionServiceDep,
 ) -> ExecutionView:
     return ExecutionView.of(await service.get(principal, project_id, execution_id))
+
+
+@router.get(
+    "/{execution_id}/steps",
+    response_model=list[ExecutionStepView],
+    summary="What the execution's steps did",
+    description=(
+        "One entry per step row, ordered by the published version's graph rather than "
+        "by what finished first, with a step's attempts together and ascending. A "
+        "step's `output` is narrowed to what its kind makes safe to serve - a model "
+        "turn to its text, stop reason, model and token counts, a condition to its "
+        "result, a transform not at all - and `error` to its code and message, so no "
+        "provider payload, credential or internal detail travels. A step whose dispatch "
+        "is awaiting human review keeps the status it had when the call went out; it is "
+        "not reported as succeeded or failed. A route of its own rather than a field on "
+        "the execution, because every route that returns an execution returns the same "
+        "document and this read is the only one that pays for the steps."
+    ),
+)
+async def get_execution_steps(
+    project_id: UUID,
+    execution_id: UUID,
+    principal: CurrentUser,
+    service: ExecutionServiceDep,
+) -> list[ExecutionStepView]:
+    steps = await service.steps(principal, project_id, execution_id)
+    return [ExecutionStepView.of(step) for step in steps]

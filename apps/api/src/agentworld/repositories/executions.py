@@ -28,12 +28,14 @@ from uuid import UUID
 
 import sqlalchemy as sa
 
+from agentworld.domain.entities import ExecutionStep
 from agentworld.domain.enums import (
     DispatchKind,
     DispatchStatus,
     ExecutionStatus,
     InitiatorKind,
     SideEffect,
+    StepKind,
     StepStatus,
 )
 from agentworld.domain.orchestration import ExecutionState, StepState
@@ -155,6 +157,84 @@ class ExecutionRepository(ScopedRepository):
                 )
             )
         ).scalar_one_or_none()
+
+    async def steps(self, execution_id: UUID) -> Sequence[ExecutionStep]:
+        """Every step row of one execution, in the version's own order.
+
+        **The order comes from `workflow_versions.graph`, not from the frozen
+        tables.** `workflow_steps` has no position column: publishing
+        normalises the author's list into rows, and the list's order survives
+        only in the `graph` column those rows are a projection of. So the
+        order is read from there and applied here, which is the difference
+        between "the order the author drew" and "the order things finished
+        in" - and the second is never what a reader wants.
+
+        A step whose key is not in the graph is sorted last by key rather
+        than dropped. The execution's own rows are the authority on what ran;
+        a graph that cannot account for one of them is a reason to show the
+        row, not to hide it.
+
+        Attempts of one step stay together and ascend, so a retried step
+        reads as its own history rather than as two unrelated rows.
+        """
+        rows = (
+            await self._session.execute(
+                sa.select(
+                    m.ExecutionStep.step_key,
+                    m.ExecutionStep.status,
+                    m.ExecutionStep.attempt,
+                    m.ExecutionStep.output,
+                    m.ExecutionStep.error,
+                    m.ExecutionStep.started_at,
+                    m.ExecutionStep.finished_at,
+                    m.ExecutionStep.workflow_version_id,
+                    m.WorkflowStep.kind,
+                    m.Agent.agent_key,
+                )
+                # Inner: a step row names the frozen step it was seeded from,
+                # and that row cannot be deleted while the version exists.
+                .join(m.WorkflowStep, m.WorkflowStep.id == m.ExecutionStep.workflow_step_id)
+                # Outer: `execution_steps.agent_id` is `ON DELETE SET NULL`,
+                # and a step that outlived its agent still ran.
+                .outerjoin(m.Agent, m.Agent.id == m.ExecutionStep.agent_id)
+                .where(
+                    m.ExecutionStep.execution_id == execution_id,
+                    m.ExecutionStep.project_id == self.scope.require_project(),
+                )
+            )
+        ).all()
+        if not rows:
+            return ()
+
+        graph = (
+            await self._session.execute(
+                sa.select(m.WorkflowVersion.graph).where(
+                    m.WorkflowVersion.id == rows[0].workflow_version_id,
+                    m.WorkflowVersion.project_id == self.scope.require_project(),
+                )
+            )
+        ).scalar_one_or_none()
+        order = _authored_order(graph)
+        unplaced = len(order)
+
+        def position(step_key: str, attempt: int) -> tuple[int, str, int]:
+            folded = step_key.casefold()
+            return (order.get(folded, unplaced), folded, attempt)
+
+        return [
+            ExecutionStep(
+                step_key=str(row.step_key),
+                kind=StepKind(row.kind),
+                status=StepStatus(row.status),
+                attempt=int(row.attempt),
+                agent_key=str(row.agent_key) if row.agent_key is not None else None,
+                started_at=row.started_at,
+                finished_at=row.finished_at,
+                output=dict(row.output) if row.output is not None else None,
+                error=dict(row.error) if row.error is not None else None,
+            )
+            for row in sorted(rows, key=lambda row: position(str(row.step_key), int(row.attempt)))
+        ]
 
     async def by_idempotency_key(self, key: str) -> UUID | None:
         return (
@@ -510,3 +590,38 @@ def _message(error: Any) -> str | None:
         message = error.get("message")
         return str(message) if message is not None else None
     return None
+
+
+def _authored_order(graph: Any) -> Mapping[str, int]:
+    """Step key -> the author's position, read from a version's graph.
+
+    Defensive about the shape for the same reason the service's graph reader
+    is: the column is JSONB that a published version froze, and a reader of
+    it that raises turns one malformed graph into an unreadable execution.
+    Anything it cannot understand simply contributes no position, and the
+    caller sorts those keys last.
+
+    Keys are folded because `step_key` is `CITEXT`: the graph may spell a key
+    in one case and the row in another, and the database considers those the
+    same step.
+
+    **The `step-{index}` fallback mirrors the normaliser**, and it is not
+    cosmetic. A graph may carry steps with no key of their own: publishing
+    names those `step-{index}` (`services/definitions.py`,
+    `_definition_from_draft`) and stores that name, and `multiple_entry_steps`
+    is only a warning, so such a graph really can be published. Reading the
+    graph for keys it does not have would leave every one of them unplaced,
+    and the alphabetical fallback would then order eleven of them
+    `step-0, step-1, step-10, step-2` - wrong, and silently so.
+    """
+    steps = graph.get("steps") if isinstance(graph, Mapping) else None
+    if not isinstance(steps, list):
+        return {}
+    order: dict[str, int] = {}
+    for index, raw in enumerate(steps):
+        if not isinstance(raw, Mapping):
+            continue
+        key = raw.get("step_key") or raw.get("key")
+        named = key.strip() if isinstance(key, str) and key.strip() else f"step-{index}"
+        order.setdefault(named.casefold(), index)
+    return order

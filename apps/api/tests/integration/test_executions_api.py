@@ -14,6 +14,7 @@ is recorded immutably on the row.
 from __future__ import annotations
 
 import asyncio
+import json
 import uuid
 from typing import Any
 
@@ -1216,3 +1217,452 @@ async def test_a_workflow_cannot_name_another_workflows_version(
 
     # And the run it would have broken still works.
     assert scenario.run(mine).status_code == 202
+
+
+# ------------------------------------------------------------- the step tree ---
+#
+# T12a. `GET .../executions/{id}/steps` - a route of its own, because every
+# route that returns an execution returns the same document and three tests
+# above and elsewhere say so. What is pinned here: the order is the author's
+# and not the database's, the output served is narrower than the output
+# stored, and the narrowing survives a later step copying an earlier one's.
+
+
+def _unordered_graph() -> dict[str, Any]:
+    """Three pure steps whose author order is deliberately not alphabetical.
+
+    Alphabetically these are `alpha, mike, zulu`; the author wrote them in the
+    opposite order and the execution runs them in that order too. Without that
+    gap every assertion below would pass just as well against an
+    `ORDER BY step_key` - which is what the frozen tables alone would give,
+    since they have no position column and the order lives in the version's
+    `graph`.
+    """
+    return {
+        "steps": [
+            {"step_key": "zulu", "kind": "transform", "input_mapping": {"value": "$.input.seed"}},
+            {
+                "step_key": "mike",
+                "kind": "transform",
+                "input_mapping": {"value": "$.steps.zulu.output.value"},
+            },
+            {
+                "step_key": "alpha",
+                "kind": "transform",
+                "input_mapping": {"value": "$.steps.mike.output.value"},
+            },
+        ],
+        "edges": [{"from": "zulu", "to": "mike"}, {"from": "mike", "to": "alpha"}],
+    }
+
+
+AUTHORED = ["zulu", "mike", "alpha"]
+
+
+def _steps(scenario: Scenario, execution_id: str, actor: Actor | None = None) -> Any:
+    return scenario.client.get(
+        f"/v1/projects/{scenario.project_id}/executions/{execution_id}/steps",
+        headers=(actor or scenario.actor).headers,
+    )
+
+
+def _keys(scenario: Scenario, execution_id: str) -> list[str]:
+    response = _steps(scenario, execution_id)
+    assert response.status_code == 200, response.text
+    return [step["step_key"] for step in response.json()]
+
+
+async def _set_step(
+    owner_database: Database, execution_id: str, step_key: str, **columns: Any
+) -> None:
+    """Write one step row as the schema owner.
+
+    The states this section needs are reached by running the graph wherever
+    that is possible; these are the ones where it is not - a crafted error
+    document, a model turn nothing here can produce without a provider - and
+    they are written the way `test_producer_authority.py` writes its own.
+    """
+    assignments = ", ".join(f"{column} = :{column}" for column in columns)
+    async with owner_database.session() as session:
+        await session.execute(
+            text(
+                f"UPDATE execution_steps SET {assignments} "
+                "WHERE execution_id = :execution_id AND step_key = :step_key"
+            ),
+            {"execution_id": execution_id, "step_key": step_key, **columns},
+        )
+        await session.commit()
+
+
+async def _completed(scenario: Scenario, factory: UnitOfWorkFactory) -> str:
+    workflow_id = scenario.workflow(_unordered_graph())
+    assert scenario.publish(workflow_id).status_code == 201
+    execution_id = scenario.run(workflow_id, input={"seed": "value"}).json()["id"]
+    await _drain(factory, scenario, execution_id)
+    return str(execution_id)
+
+
+async def test_an_executions_steps_come_back_in_the_versions_order(
+    scenario: Scenario, factory: UnitOfWorkFactory
+) -> None:
+    """The first criterion, with the ordering one in the same assertion."""
+    execution_id = await _completed(scenario, factory)
+
+    response = _steps(scenario, execution_id)
+    assert response.status_code == 200, response.text
+    steps = response.json()
+
+    assert [step["step_key"] for step in steps] == AUTHORED
+    # The gap this test lives in: were the order the frozen tables' own it
+    # would be alphabetical, and this assertion would fail.
+    assert [step["step_key"] for step in steps] != sorted(step["step_key"] for step in steps)
+    assert {step["status"] for step in steps} == {StepStatus.SUCCEEDED}
+    assert [step["kind"] for step in steps] == ["transform", "transform", "transform"]
+    assert [step["attempt"] for step in steps] == [0, 0, 0]
+    # Transform output is not served at all - see the next test for why.
+    assert {step["output"] for step in steps} == {None}
+
+
+async def test_a_condition_reports_the_one_field_it_has(
+    scenario: Scenario, factory: UnitOfWorkFactory
+) -> None:
+    """`{"result": bool}` is written by `advance()` and projected, not passed
+    through: a condition row that somehow carried more would not widen it."""
+    workflow_id = scenario.workflow(
+        {
+            "steps": [{"step_key": "gate", "kind": "condition", "condition": "$.input.go == true"}],
+            "edges": [],
+        }
+    )
+    assert scenario.publish(workflow_id).status_code == 201
+    execution_id = str(scenario.run(workflow_id, input={"go": True}).json()["id"])
+    await _drain(factory, scenario, execution_id)
+
+    [step] = _steps(scenario, execution_id).json()
+    assert step["kind"] == "condition"
+    assert step["status"] == StepStatus.SUCCEEDED
+    assert step["output"] == {"result": True}
+
+
+async def test_a_transform_cannot_be_used_to_read_round_the_narrowing(
+    scenario: Scenario, factory: UnitOfWorkFactory, owner_database: Database
+) -> None:
+    """The reason `transform` output is omitted rather than passed through.
+
+    `advance._scope` hands a later step every earlier step's output *as
+    stored*, and the expression grammar can name any key of it, so a transform
+    that maps `$.steps.research.output.api_key` copies a field the model-turn
+    projection would have dropped into an output of its own. If that output
+    were served, the projection would be decorative.
+    """
+    workflow_id = scenario.workflow(
+        {
+            "steps": [
+                {"step_key": "research", "kind": "agent_task", "agent_key": "researcher"},
+                {
+                    "step_key": "shape",
+                    "kind": "transform",
+                    "input_mapping": {
+                        "leak": "$.steps.research.output.api_key",
+                        "everything": "$.steps.research.output",
+                    },
+                },
+            ],
+            "edges": [{"from": "research", "to": "shape"}],
+        }
+    )
+    assert scenario.publish(workflow_id).status_code == 201
+    execution_id = str(scenario.run(workflow_id).json()["id"])
+    await _set_step(
+        owner_database,
+        execution_id,
+        "research",
+        status="succeeded",
+        output=json.dumps({"text": "the answer", "api_key": "sk-ant-not-a-real-key"}),
+    )
+    await _drain(factory, scenario, execution_id)
+
+    # The copy really happened: the transform's stored output has it.
+    async with owner_database.session() as session:
+        stored = (
+            await session.execute(
+                text(
+                    "SELECT output FROM execution_steps "
+                    "WHERE execution_id = :id AND step_key = 'shape'"
+                ),
+                {"id": execution_id},
+            )
+        ).scalar_one()
+    assert stored["leak"] == "sk-ant-not-a-real-key", "the fixture did not reproduce the copy"
+
+    response = _steps(scenario, execution_id)
+    served = json.dumps(response.json())
+    assert "sk-ant-not-a-real-key" not in served
+    shape = next(step for step in response.json() if step["step_key"] == "shape")
+    assert shape["output"] is None
+    research = next(step for step in response.json() if step["step_key"] == "research")
+    assert research["output"] == {"text": "the answer"}
+
+
+async def test_the_order_is_the_graphs_even_when_a_later_step_finished_first(
+    scenario: Scenario, factory: UnitOfWorkFactory, owner_database: Database
+) -> None:
+    """Completion order is not an order anybody asked for.
+
+    These three really do finish in sequence, so the timestamps are rewritten
+    to say the opposite - the last step a minute before the first. A read that
+    sorted by `finished_at`, or that left the order to the database, would
+    come back reversed.
+    """
+    execution_id = await _completed(scenario, factory)
+    async with owner_database.session() as session:
+        await session.execute(
+            text(
+                "UPDATE execution_steps SET finished_at = now() - make_interval(secs => 60) "
+                "WHERE execution_id = :id AND step_key = 'alpha'"
+            ),
+            {"id": execution_id},
+        )
+        await session.execute(
+            text(
+                "UPDATE execution_steps SET finished_at = now() "
+                "WHERE execution_id = :id AND step_key = 'zulu'"
+            ),
+            {"id": execution_id},
+        )
+        await session.commit()
+
+    steps = _steps(scenario, execution_id).json()
+    assert [step["step_key"] for step in steps] == AUTHORED
+    assert steps[0]["finished_at"] > steps[2]["finished_at"], (
+        "the fixture did not invert the timing it set out to invert"
+    )
+
+
+async def test_steps_with_no_key_of_their_own_keep_the_authors_order(
+    scenario: Scenario, factory: UnitOfWorkFactory
+) -> None:
+    """`multiple_entry_steps` is a warning, so this graph really publishes.
+
+    Eleven steps with no `step_key` are named `step-0` … `step-10` by the
+    normaliser, and the graph the order is read from carries no key for any of
+    them. Reading it naively leaves all eleven unplaced and the alphabetical
+    fallback then answers `step-0, step-1, step-10, step-2` - the one case
+    where the fallback is silently wrong, which is why `_authored_order`
+    mirrors the normaliser's own naming.
+    """
+    workflow_id = scenario.workflow({"steps": [{"kind": "transform"}] * 11, "edges": []})
+    assert scenario.publish(workflow_id).status_code == 201
+    execution_id = str(scenario.run(workflow_id).json()["id"])
+    await _drain(factory, scenario, execution_id)
+
+    keys = _keys(scenario, execution_id)
+    assert keys == [f"step-{index}" for index in range(11)]
+    assert keys != sorted(keys), "eleven is the point: ten would sort the same either way"
+
+
+async def test_a_failed_step_says_why_in_the_two_fields_a_reader_gets(
+    scenario: Scenario, factory: UnitOfWorkFactory, owner_database: Database
+) -> None:
+    execution_id = await _completed(scenario, factory)
+    await _set_step(
+        owner_database,
+        execution_id,
+        "mike",
+        status="failed",
+        error=json.dumps({"code": "rate_limited", "message": "The model provider call failed"}),
+    )
+
+    steps = {step["step_key"]: step for step in _steps(scenario, execution_id).json()}
+    assert steps["mike"]["status"] == StepStatus.FAILED
+    assert steps["mike"]["error"] == {
+        "code": "rate_limited",
+        "message": "The model provider call failed",
+    }
+
+
+async def test_an_error_carrying_more_than_code_and_message_is_narrowed(
+    scenario: Scenario, factory: UnitOfWorkFactory, owner_database: Database
+) -> None:
+    """The reducer stores whatever mapping a producer sent, whole.
+
+    `fold._error` passes a mapping through without inspecting it, so the
+    column is not a promise about its shape - which is why the narrowing is at
+    the boundary that serves it rather than at the one that stores it.
+    """
+    execution_id = await _completed(scenario, factory)
+    await _set_step(
+        owner_database,
+        execution_id,
+        "mike",
+        status="failed",
+        error=json.dumps(
+            {
+                "code": "provider_error",
+                "message": "The model provider call failed",
+                "provider_body": {"error": {"message": "invalid x-api-key"}},
+                "api_key": "sk-ant-not-a-real-key",
+                "stack": "Traceback (most recent call last): ...",
+            }
+        ),
+    )
+
+    body = _steps(scenario, execution_id).json()
+    step = next(s for s in body if s["step_key"] == "mike")
+    assert set(step["error"]) == {"code", "message"}
+    served = json.dumps(body)
+    for secret in ("sk-ant-not-a-real-key", "invalid x-api-key", "Traceback"):
+        assert secret not in served, f"{secret} reached the response"
+
+
+async def test_a_model_turn_is_reduced_to_what_this_system_put_there(
+    scenario: Scenario, owner_database: Database
+) -> None:
+    """An `agent_task` output is a provider's answer, so only the fields the
+    step runner writes are served, and `usage` only in whole token counts.
+
+    The graph really contains an agent task - the frozen version cannot be
+    edited into one, as T0's trigger refuses any change to a published
+    version's graph - and no worker runs here, so the turn's output is
+    written onto the step row the way a worker's report would have folded it.
+    """
+    workflow_id = scenario.workflow(_one_step_graph())
+    assert scenario.publish(workflow_id).status_code == 201
+    execution_id = str(scenario.run(workflow_id).json()["id"])
+    await _set_step(
+        owner_database,
+        execution_id,
+        "research",
+        status="succeeded",
+        output=json.dumps(
+            {
+                "text": "the answer",
+                "stop_reason": "completed",
+                "model": "a-model-id",
+                "usage": {"input_tokens": 12, "output_tokens": 3, "cache_key": "sk-leak"},
+                "raw_response": {"id": "msg_01", "content": [{"type": "text", "text": "x"}]},
+                "api_key": "sk-ant-not-a-real-key",
+            }
+        ),
+    )
+
+    body = _steps(scenario, execution_id).json()
+    step = next(s for s in body if s["step_key"] == "research")
+    assert step["kind"] == "agent_task"
+    assert step["agent_key"] == "researcher"
+    assert step["output"] == {
+        "text": "the answer",
+        "stop_reason": "completed",
+        "model": "a-model-id",
+        "usage": {"input_tokens": 12, "output_tokens": 3},
+    }
+    served = json.dumps(body)
+    for secret in ("sk-ant-not-a-real-key", "sk-leak", "msg_01"):
+        assert secret not in served, f"{secret} reached the response"
+
+
+async def test_a_step_whose_dispatch_awaits_review_is_neither_succeeded_nor_failed(
+    scenario: Scenario, owner_database: Database
+) -> None:
+    """The uncertainty belongs to the dispatch, and stays there.
+
+    No worker runs here, so the agent task is `dispatched` with a pending
+    outbox row; the row is then moved to `needs_review` the way a lease that
+    expired in flight would leave it. The step is untouched by that -
+    deliberately, because the worker writes no event for an outcome nobody
+    knows - and this read must not improve on it.
+    """
+    workflow_id = scenario.workflow(_one_step_graph())
+    assert scenario.publish(workflow_id).status_code == 201
+    execution_id = str(scenario.run(workflow_id).json()["id"])
+    async with owner_database.session() as session:
+        await session.execute(
+            text(
+                "UPDATE dispatches SET status = 'needs_review', "
+                "side_effect_started_at = now(), last_error = 'the lease expired in flight' "
+                "WHERE execution_id = :id"
+            ),
+            {"id": execution_id},
+        )
+        await session.commit()
+
+    steps = _steps(scenario, execution_id).json()
+    assert len(steps) == 1
+    assert steps[0]["status"] == StepStatus.DISPATCHED
+    assert steps[0]["output"] is None
+    assert steps[0]["error"] is None
+    # And nothing about the dispatch's own trouble travels with this read.
+    assert "the lease expired in flight" not in json.dumps(steps)
+
+
+async def test_another_projects_execution_is_a_404_and_the_owner_still_reads_it(
+    scenario: Scenario, factory: UnitOfWorkFactory, client: TestClient, actor: Actor
+) -> None:
+    """Same caller, same workspace, wrong project: the tenant predicate does
+    not weaken because the caller is a member somewhere."""
+    execution_id = await _completed(scenario, factory)
+    elsewhere = client.post(
+        f"/v1/workspaces/{scenario.workspace_id}/projects",
+        json={"name": "Other island"},
+        headers=actor.headers,
+    ).json()
+
+    wrong = client.get(
+        f"/v1/projects/{elsewhere['id']}/executions/{execution_id}/steps", headers=actor.headers
+    )
+    # A 404, not an empty list: `[]` would say this execution ran nothing.
+    assert wrong.status_code == 404, wrong.text
+    assert "zulu" not in wrong.text
+
+    assert _keys(scenario, execution_id) == AUTHORED
+
+
+async def test_a_stranger_reads_nothing_and_is_told_nothing(
+    scenario: Scenario, factory: UnitOfWorkFactory, make_actor: Any
+) -> None:
+    """A different workspace entirely: RLS hides the project, so the refusal
+    cannot confirm that the execution exists."""
+    execution_id = await _completed(scenario, factory)
+    stranger = make_actor("outsider@example.com")
+
+    refused = _steps(scenario, execution_id, stranger)
+    assert refused.status_code == 404
+    assert "zulu" not in refused.text
+
+
+async def test_the_execution_document_is_unchanged_by_any_of_this(
+    scenario: Scenario, factory: UnitOfWorkFactory
+) -> None:
+    """The reason the steps are a route of their own.
+
+    Three tests elsewhere assert that the execution read, the lists and
+    `agent.test`'s 202 return the same document; this asserts the fact they
+    depend on - that the document gained no field - from the side that would
+    have changed it.
+    """
+    execution_id = await _completed(scenario, factory)
+    detail = scenario.client.get(
+        f"/v1/projects/{scenario.project_id}/executions/{execution_id}",
+        headers=scenario.actor.headers,
+    ).json()
+    listed = scenario.client.get(
+        f"/v1/projects/{scenario.project_id}/executions",
+        headers=scenario.actor.headers,
+    ).json()
+
+    assert "steps" not in detail
+    assert detail == next(row for row in listed if row["id"] == str(execution_id))
+    assert set(detail) == {
+        "id",
+        "workflow_id",
+        "workflow_version_id",
+        "status",
+        "initiator_kind",
+        "initiator_label",
+        "input",
+        "output",
+        "error",
+        "created_at",
+        "started_at",
+        "finished_at",
+    }
