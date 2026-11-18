@@ -16,6 +16,20 @@ Both checks run before anything is written, so a request that may change the
 name and may not change the model profile changes neither. Partially
 applying it would be worse than refusing: the caller would have to diff the
 response to discover which half landed.
+
+`ModelProfileService` has a rule of its own, and it is the same shape:
+
+> A profile may name only a provider this build can serve, and only a
+> credential issued for that same provider.
+
+Both halves are checked by `create` and by `update`, before either writes
+anything, and `update` checks them against the row the request would leave
+behind rather than the fields it happens to mention. Nothing downstream
+repeats either check - `DispatchService._plan` reads `provider_slug` and
+`credential_id` off the one row and uses both as they stand - so without
+this, a profile naming one vendor while holding another's key would send
+that key to the wrong endpoint, and a slug no build serves would reach
+`registry.build` as an unhandled `UnknownProviderError`.
 """
 
 from __future__ import annotations
@@ -63,7 +77,9 @@ from agentworld.domain.orchestration import validate as domain_validate
 from agentworld.domain.policy import Action, Condition, Resource, authorize
 from agentworld.domain.principals import UserPrincipal
 from agentworld.domain.slugs import validated as validated_slug
+from agentworld.infra.providers import available as available_providers
 from agentworld.repositories.base import TenantScope
+from agentworld.repositories.credentials import CredentialRepository
 from agentworld.repositories.definitions import UNSET
 from agentworld.repositories.unit_of_work import UnitOfWork, UnitOfWorkFactory
 from agentworld.services import audit
@@ -98,8 +114,22 @@ class ModelProfileService:
         credential_id: UUID | None = None,
         is_default: bool = False,
     ) -> ModelProfile:
-        """`admin`, because a profile names a credential and a spend ceiling."""
+        """`admin`, because a profile names a credential and a spend ceiling.
+
+        **The provider and the credential are checked here, before the
+        insert.** `update` makes the same two checks through the same two
+        helpers, because a rule that held on one path and not the other
+        would be a rule about which request you sent rather than about what
+        a profile may be.
+
+        The credential is resolved through this workspace's own repository
+        rather than trusted - the check `update` has had since Stage B2c and
+        this path did not. A bare foreign key cannot stand in for it: it
+        admits any credential row in the database, including another
+        tenant's.
+        """
         authorize(principal, Action.MODEL_PROFILE_CREATE, Resource(workspace_id))
+        _servable(provider_slug)
 
         async with self._factory.begin(visible_workspaces={workspace_id}) as work:
             scope = TenantScope(workspace_id)
@@ -108,6 +138,8 @@ class ModelProfileService:
                 raise ConflictError(
                     f"This workspace already has a model profile called '{name}'", name=name
                 )
+            if credential_id is not None:
+                await _compatible(work.credentials(scope), credential_id, provider_slug)
             if is_default:
                 # Before the insert: `one_default_model_profile` is a unique
                 # index, so there is no moment at which two may exist.
@@ -163,10 +195,17 @@ class ModelProfileService:
         revoked key stops working. Nothing here reads, decrypts or logs
         material: `Credential` has no field for it.
 
-        **Provider and credential are not checked against each other.**
-        `create` does not check it either, and validating here alone would
-        make the two paths disagree about the same profile. That pairing is
-        Stage E's, with the create path, in one change.
+        **Provider and credential are checked against each other**, and
+        against the row this request would leave behind rather than the
+        fields it mentions. A `provider_slug` the caller sends is checked
+        against the registry; the pairing is checked whenever either half
+        moves, and skipped when neither does.
+
+        That last clause is deliberate. A profile stored before this rule
+        may name a provider no build serves, and re-checking it on every
+        PATCH would make such a row unrenamable and undetachable - the two
+        edits an operator needs in order to fix it. Sending either half is
+        what asks for the pair to be valid.
 
         One transaction, so `clear_default` and the write that follows it
         cannot be separated: the partial unique index
@@ -178,6 +217,8 @@ class ModelProfileService:
 
         sent = {name: value for name, value in fields.items() if value is not UNSET}
         _not_null(sent, "name", "provider_slug", "model_id", "parameters", "is_default")
+        if "provider_slug" in sent:
+            _servable(sent["provider_slug"])
 
         async with self._factory.begin(visible_workspaces={workspace_id}) as work:
             scope = TenantScope(workspace_id)
@@ -194,16 +235,15 @@ class ModelProfileService:
                     f"This workspace already has a model profile called '{name}'", name=name
                 )
 
-            credential_id = sent.get("credential_id")
-            if (
-                credential_id is not None
-                and await work.credentials(scope).get(credential_id) is None
-            ):
-                raise ValidationFailedError(
-                    "This workspace has no such credential",
-                    field="credential_id",
-                    credential_id=str(credential_id),
-                )
+            # The row this request would leave behind. The current value is
+            # the default rather than the fallback for a null: an explicit
+            # null is *in* `sent` and detaches the credential, and only an
+            # absent field falls through to what the profile already holds.
+            credential_id = sent.get("credential_id", existing.credential_id)
+            provider_slug = sent.get("provider_slug", existing.provider_slug)
+            moved = "credential_id" in sent or "provider_slug" in sent
+            if credential_id is not None and moved:
+                await _compatible(work.credentials(scope), credential_id, provider_slug)
 
             if sent.get("is_default"):
                 # Before the write, as `create` does: the unique index means
@@ -630,6 +670,67 @@ def _not_null(sent: Mapping[str, Any], *names: str) -> None:
     for name in names:
         if name in sent and sent[name] is None:
             raise ValidationFailedError(f"'{name}' cannot be null", field=name)
+
+
+def _servable(provider_slug: str) -> None:
+    """Refuse a provider this build has no implementation for.
+
+    The set comes from the registry that `registry.build` consults when a
+    step is dispatched, and that `GET /v1/meta` publishes - one list, so
+    what a client is offered, what a profile may store and what the server
+    can actually call cannot drift apart. A build that gains a provider
+    accepts it with no edit here.
+
+    Compared exactly, with no folding or normalisation. A slug that nearly
+    matches is a typo, and quietly turning it into the one it resembles
+    would store something the caller did not write - on the row that
+    decides which vendor a workspace's key is sent to.
+    """
+    servable = available_providers()
+    if provider_slug not in servable:
+        raise ValidationFailedError(
+            "This server cannot serve that model provider. It serves: "
+            + ", ".join(sorted(servable)),
+            field="provider_slug",
+            provider_slug=provider_slug,
+        )
+
+
+async def _compatible(
+    credentials: CredentialRepository, credential_id: UUID, provider_slug: str
+) -> None:
+    """Resolve the credential in this workspace, then check whose key it is.
+
+    The order is the point. The row is read back through this workspace's
+    own repository - which filters on `workspace_id` and excludes
+    tombstones - *before* the two slugs are compared, so a mismatch can only
+    ever be reported about a credential the caller can already list.
+    Comparing first would make the error an oracle: "that key is for another
+    provider" confirms a row exists, which is exactly what one `NotFoundError`
+    for both causes is there to prevent.
+
+    A revoked credential still resolves, and is still accepted, for the
+    reason it always was: an operator mid-rotation legitimately points at
+    one, and the runtime is where a revoked key stops working.
+
+    Nothing here reads, decrypts or logs material. `Credential` has no field
+    for it - `provider_slug` is who the key is *for*, which is metadata.
+    """
+    credential = await credentials.get(credential_id)
+    if credential is None:
+        raise ValidationFailedError(
+            "This workspace has no such credential",
+            field="credential_id",
+            credential_id=str(credential_id),
+        )
+    if credential.provider_slug != provider_slug:
+        raise ValidationFailedError(
+            f"That credential is for '{credential.provider_slug}' and this profile "
+            f"names '{provider_slug}'. A profile sends its credential to the provider "
+            "it names, so the two have to agree.",
+            field="credential_id",
+            credential_id=str(credential_id),
+        )
 
 
 def _check_model_mode(mode: AgentInteractionMode, model_profile_id: UUID | None) -> None:

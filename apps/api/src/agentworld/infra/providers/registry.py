@@ -39,7 +39,14 @@ class UnknownProviderError(ValueError):
 
 
 def available() -> frozenset[str]:
-    """Every slug this build can serve. For the providers endpoint, later."""
+    """Every slug this build can serve.
+
+    Two callers, and they are the reason this is a function rather than a
+    list written down somewhere: `GET /v1/meta` publishes it so a client
+    can offer the choice, and `ModelProfileService` refuses to store a slug
+    outside it. Both read the mapping `build` dispatches on, so what is
+    offered, what is stored and what can actually be called are one list.
+    """
     return frozenset(_BUILDERS)
 
 

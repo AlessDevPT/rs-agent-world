@@ -290,8 +290,9 @@ export function CredentialManager({
               placeholder="anthropic"
             />
             <p className="form__hint">
-              The provider&apos;s slug, as a model profile will spell it. Nothing checks
-              the two against each other yet, so a typo here surfaces when an agent runs.
+              The provider&apos;s slug, as a model profile will spell it. A profile may
+              only use a credential issued for the provider it names, so a typo here is
+              refused when you attach the credential.
             </p>
           </div>
 

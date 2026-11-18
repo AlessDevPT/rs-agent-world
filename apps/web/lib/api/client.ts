@@ -104,6 +104,15 @@ export interface Meta {
   readonly api_version: string;
   readonly protocol_version: string;
   readonly adapters: readonly string[];
+  /**
+   * The model providers this build can serve, sorted.
+   *
+   * What a form offering the choice should offer, and the whole of what it
+   * may offer: the API refuses a model profile naming anything else with a
+   * 422 on `provider_slug`. A select built from this list cannot produce
+   * that error.
+   */
+  readonly providers: readonly string[];
   readonly server_time: string;
 }
 

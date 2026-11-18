@@ -5,6 +5,7 @@ from fastapi.testclient import TestClient
 
 from agentworld.api.deps import get_database
 from agentworld.domain.protocol.version import PROTOCOL_VERSION
+from agentworld.infra.providers import registry
 
 
 def test_healthz_is_ok(client: TestClient) -> None:
@@ -74,6 +75,25 @@ def test_meta_reports_protocol_version_separately(client: TestClient) -> None:
     assert body["api_version"] != body["protocol_version"] or True
     assert body["adapters"] == []
     assert body["server_time"].endswith(("Z", "+00:00"))
+
+
+def test_meta_lists_the_providers_this_build_can_serve(client: TestClient) -> None:
+    """The list a client offers as choices, and the one `build()` consults.
+
+    Compared against the registry rather than against a literal, because a
+    literal would pass while the two drifted - and this list is what a client
+    offers as choices while `ModelProfileService` refuses everything outside
+    it. A client offered a slug the service would refuse is the failure.
+
+    Sorted, so a client rendering a select gets a stable order rather than
+    whatever a set iterated in.
+    """
+    body = client.get("/v1/meta").json()
+
+    assert body["providers"] == sorted(registry.available())
+    # Non-vacuity: an empty registry would satisfy the equality above and
+    # mean this server can run no agent at all.
+    assert len(body["providers"]) >= 1
 
 
 def test_every_response_carries_a_request_id(client: TestClient) -> None:

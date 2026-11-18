@@ -850,7 +850,13 @@ async def create_model_profile(
     context: CallContextDep,
     service: ModelProfileServiceDep,
 ) -> ModelProfileView:
-    """`admin`: a profile names a credential and a spend ceiling."""
+    """`admin`: a profile names a credential and a spend ceiling.
+
+    `provider_slug` must be one this build serves - `GET /v1/meta` lists
+    them - and a `credential_id` must name a credential of this workspace
+    issued for that same provider. Either failing is a 422 on the field,
+    before anything is written.
+    """
     profile = await service.create(
         principal,
         context,
@@ -872,6 +878,8 @@ async def create_model_profile(
     description=(
         "`admin`. A `credential_id` is resolved in this workspace before it is stored, so "
         "an id from somewhere else is a 422 rather than a profile that fails at dispatch. "
+        "The provider and the credential are checked against the profile this request "
+        "would leave behind, so moving either half re-checks the pair. "
         "No endpoint at any role returns credential material."
     ),
 )
