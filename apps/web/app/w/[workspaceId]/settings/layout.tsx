@@ -39,6 +39,9 @@ export default async function SettingsLayout({
         <Link className="workspace-bar__link" href={`/w/${workspaceId}/settings/credentials`}>
           Credentials
         </Link>
+        <Link className="workspace-bar__link" href={`/w/${workspaceId}/settings/model-profiles`}>
+          Model profiles
+        </Link>
         <Link className="workspace-bar__link" href={`/w/${workspaceId}/keys`}>
           API keys
         </Link>

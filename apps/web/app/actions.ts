@@ -17,7 +17,7 @@
 import { revalidatePath } from "next/cache";
 import { redirect } from "next/navigation";
 
-import { ApiError } from "@/lib/api/client";
+import { ApiError, type Problem } from "@/lib/api/client";
 import {
   createCredential,
   deleteCredential,
@@ -26,6 +26,14 @@ import {
   type Credential,
   type CredentialKind,
 } from "@/lib/api/credentials";
+import {
+  createModelProfile,
+  deleteModelProfile,
+  updateModelProfile,
+  type CreateModelProfileBody,
+  type ModelProfile,
+  type UpdateModelProfileBody,
+} from "@/lib/api/model-profiles";
 import {
   createApiKey,
   createProject,
@@ -43,6 +51,15 @@ export interface ActionFailure {
   // distinction between "absent" and "present and undefined", and the
   // failure() helper below produces the latter.
   readonly requestId?: string | undefined;
+  /**
+   * The request field the API blamed, when it named one.
+   *
+   * Carried so a form can put the message against the input rather than
+   * above the whole card. It is the API's `field` locator verbatim, which
+   * means it is the API's spelling of the field - `provider_slug`, not
+   * `providerSlug`.
+   */
+  readonly field?: string | undefined;
 }
 
 /**
@@ -57,12 +74,40 @@ export type ActionResult<T = object> = ({ readonly ok: true } & T) | ActionFailu
 /** Turn any thrown value into something worth putting on the screen. */
 function failure(error: unknown): ActionFailure {
   if (error instanceof ApiError) {
-    return { ok: false, message: error.problem.detail, requestId: error.requestId };
+    return {
+      ok: false,
+      message: problemMessage(error.problem),
+      requestId: error.requestId,
+      field: error.problem.field,
+    };
   }
   return {
     ok: false,
     message: error instanceof Error ? error.message : "Something went wrong",
   };
+}
+
+/**
+ * The sentence to show for a problem document.
+ *
+ * `detail` alone is the answer for a refusal the application wrote, which is
+ * most of them. It is **not** the answer for a schema failure: FastAPI's
+ * request-validation handler sets `detail` to "2 field(s) failed validation"
+ * and puts the two in `errors`, so showing `detail` alone told somebody that
+ * something was wrong and refused to say what.
+ *
+ * Appended rather than substituted, and only for entries that carry their own
+ * `detail` - a workflow publish refusal puts findings of another shape in the
+ * same array, and the original sentence is never worth losing.
+ */
+function problemMessage(problem: Problem): string {
+  const described = (problem.errors ?? []).filter(
+    (entry) => typeof entry.detail === "string" && entry.detail !== "",
+  );
+  if (described.length === 0) return problem.detail;
+  return `${problem.detail}: ${described
+    .map((entry) => `${entry.pointer === "" ? "the request" : entry.pointer} ${entry.detail}`)
+    .join("; ")}`;
 }
 
 function text(form: FormData, field: string): string {
@@ -274,5 +319,81 @@ export async function deleteCredentialAction(
     return failure(error);
   }
   revalidatePath(`/w/${workspaceId}/settings/credentials`);
+  return { ok: true };
+}
+
+// --------------------------------------------------------- model profiles ---
+//
+// **Typed bodies rather than FormData.** The credential actions above take a
+// form because material has to reach the server without passing through
+// client state. A profile holds no secret, and its PATCH body is a decision
+// rather than a transcription: which fields moved, and whether a cleared
+// credential means `null` or "leave it alone". That decision is `profileEdits`
+// in `lib/model-profiles/presentation.ts`, where it is tested; these actions
+// carry its answer to the API and add nothing to it.
+//
+// The role is the API's to enforce either way. All three routes are `admin`,
+// and the page's own gate only decides whether a form is worth rendering - a
+// body posted at one of these actions without the role is refused by the
+// endpoint, not by the absence of a button.
+
+export async function createModelProfileAction(
+  workspaceId: string,
+  body: CreateModelProfileBody,
+): Promise<ActionResult<{ profile: ModelProfile }>> {
+  const { token } = await requireSession();
+  try {
+    const profile = await createModelProfile(token, workspaceId, body);
+    revalidatePath(`/w/${workspaceId}/settings/model-profiles`);
+    return { ok: true, profile };
+  } catch (error) {
+    return failure(error);
+  }
+}
+
+/**
+ * Change a profile, including making it the workspace default.
+ *
+ * An empty body is refused here rather than sent. `ModelProfileService.update`
+ * accepts one and records an audit row for it, so a PATCH that writes no
+ * column would still leave a trail of an edit that never happened.
+ */
+export async function updateModelProfileAction(
+  workspaceId: string,
+  profileId: string,
+  body: UpdateModelProfileBody,
+): Promise<ActionResult<{ profile: ModelProfile }>> {
+  if (Object.keys(body).length === 0) {
+    return { ok: false, message: "Nothing was changed" };
+  }
+
+  const { token } = await requireSession();
+  try {
+    const profile = await updateModelProfile(token, workspaceId, profileId, body);
+    revalidatePath(`/w/${workspaceId}/settings/model-profiles`);
+    return { ok: true, profile };
+  } catch (error) {
+    return failure(error);
+  }
+}
+
+/**
+ * Delete a profile.
+ *
+ * A 409 here is the API refusing to un-configure the agents that use it. The
+ * failure is returned rather than swallowed, and the caller leaves the row on
+ * screen: a profile that is still in use has not gone anywhere.
+ */
+export async function deleteModelProfileAction(
+  workspaceId: string,
+  profileId: string,
+): Promise<ActionResult> {
+  const { token } = await requireSession();
+  try {
+    await deleteModelProfile(token, workspaceId, profileId);
+  } catch (error) {
+    return failure(error);
+  }
+  revalidatePath(`/w/${workspaceId}/settings/model-profiles`);
   return { ok: true };
 }

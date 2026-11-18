@@ -15,6 +15,16 @@ export interface Problem {
   readonly status: number;
   readonly detail: string;
   readonly instance?: string;
+  /**
+   * Which field of the request the refusal is about, when the API knows.
+   *
+   * One of the two locator keys the API puts at the top level of a problem
+   * document - `field` and `index`, and nothing else from an error's context
+   * travels (`LOCATOR_KEYS` in `apps/api/.../api/errors.py`). It is what lets
+   * a form put a 422 against the input that caused it instead of above the
+   * whole thing.
+   */
+  readonly field?: string;
   readonly errors?: ReadonlyArray<{
     pointer: string;
     code: string;
