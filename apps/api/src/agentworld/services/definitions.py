@@ -81,7 +81,7 @@ from agentworld.domain.slugs import validated as validated_slug
 from agentworld.infra.providers import available as available_providers
 from agentworld.repositories.base import TenantScope
 from agentworld.repositories.credentials import CredentialRepository
-from agentworld.repositories.definitions import UNSET
+from agentworld.repositories.definitions import UNSET, ModelProfileRepository
 from agentworld.repositories.unit_of_work import UnitOfWork, UnitOfWorkFactory
 from agentworld.services import audit
 from agentworld.services.context import CallContext
@@ -485,6 +485,12 @@ class AgentService:
                 # about editing rather than about capability.
                 authorize(principal, Action.AGENT_CONFIGURE, resource)
 
+            # After both authorization checks and before any write: a member
+            # who may not configure an agent is told that, rather than being
+            # told something about this workspace's model profiles.
+            if (profile_id := configuration.get("model_profile_id")) is not None:
+                await _owned_profile(work.model_profiles(TenantScope(workspace_id)), profile_id)
+
             scope = TenantScope(workspace_id, project_id)
             agents = work.agents(scope)
             if await agents.key_taken(key):
@@ -553,6 +559,20 @@ class AgentService:
             mode = sent.get("interaction_mode", existing.interaction_mode)
             profile = sent.get("model_profile_id", existing.model_profile_id)
             _check_model_mode(mode, profile)
+
+            # Only when this request moves it. An agent whose stored profile
+            # was legitimate stays editable, and re-resolving a column the
+            # caller did not touch would refuse a rename because somebody
+            # else deleted something.
+            #
+            # Here as well as in `create` because of what it buys the error
+            # handler: `agents_model_profile_id_fkey` can only be violated
+            # after a row this service has already resolved has gone, which
+            # is what lets `CONFLICT_FOREIGN_KEYS` call that one violation a
+            # conflict instead of a 500. A writer of that column that did not
+            # resolve first would make the status dishonest again.
+            if "model_profile_id" in sent and profile is not None:
+                await _owned_profile(work.model_profiles(TenantScope(workspace_id)), profile)
 
             agent = await agents.update(agent_id, **sent)
             if agent is None:  # pragma: no cover - the row was read above
@@ -731,6 +751,39 @@ async def _compatible(
             "it names, so the two have to agree.",
             field="credential_id",
             credential_id=str(credential_id),
+        )
+
+
+async def _owned_profile(profiles: ModelProfileRepository, model_profile_id: UUID) -> None:
+    """Resolve the profile in this workspace before an agent may name it.
+
+    The foreign key behind `agents.model_profile_id` names `model_profiles.id`
+    and nothing else, and referential integrity checks bypass row-level
+    security by design - so the database alone would accept a profile
+    belonging to another workspace. Nothing downstream would then work:
+    `dispatch._plan` looks the profile up under the *agent's* workspace scope,
+    so the row would never resolve and every step would settle as
+    `misconfigured`. A pointer that can only ever fail is not worth storing,
+    and an agent in one workspace referencing another's configuration is not
+    worth storing either.
+
+    **One sentence for both causes, on purpose.** "No such profile here" is
+    returned whether the id is unknown everywhere or belongs to a workspace
+    the caller cannot see, exactly as `_compatible` does for credentials:
+    distinguishing them would turn the error into an oracle for ids in other
+    tenants, and the caller's next move - pick one from this workspace's list
+    - is the same either way.
+
+    A `ValidationFailedError` rather than a 404, because the id arrived in a
+    request body as a choice among a list the caller can read: the request is
+    answerable and this field of it is wrong. It carries the locator, so a
+    form can put the message on the select that caused it.
+    """
+    if await profiles.get(model_profile_id) is None:
+        raise ValidationFailedError(
+            "This workspace has no such model profile",
+            field="model_profile_id",
+            model_profile_id=str(model_profile_id),
         )
 
 

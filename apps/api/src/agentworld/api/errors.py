@@ -8,7 +8,8 @@ that can decide a race between two requests, and the loser's `IntegrityError`
 would otherwise arrive here as an unmodelled exception and leave as a 500 -
 telling a caller their request was this server's fault when in fact somebody
 else got there first. `_integrity` is where that is told apart, by SQLSTATE
-rather than by message text.
+and - for the foreign keys in `CONFLICT_FOREIGN_KEYS` - by constraint name,
+never by message text.
 """
 
 from __future__ import annotations
@@ -70,7 +71,9 @@ _TITLE_BY_STATUS: dict[int, str] = {
 #: - `23503` foreign key is ambiguous by nature: a delete that lost a race to
 #:   a new reference is a conflict, while a caller naming an id that does not
 #:   exist is a validation failure wanting 404 or 422. One status cannot be
-#:   honest about both, so it keeps the 500 that leaves the gap visible.
+#:   honest about both, so it keeps the 500 that leaves the gap visible -
+#:   except for the named constraints in `CONFLICT_FOREIGN_KEYS` below, where
+#:   the ambiguity has been removed upstream rather than guessed at here.
 #: - `23001` restrict is in the set because the only things that raise it here
 #:   are the guard triggers in migrations 0018 and 0019, which chose
 #:   `ERRCODE = 'restrict_violation'` deliberately. "This version is published
@@ -91,6 +94,33 @@ CONFLICT_SQLSTATES: Final = frozenset(
 #: detail of this schema and the table name a detail of this release; neither
 #: is actionable by a caller whose only useful move is to try again.
 CONFLICT_DETAIL: Final = "That change collided with a concurrent change. Try again."
+
+#: Foreign keys whose violation can only be a race, by constraint name, with
+#: the request field it is about and what to tell the caller.
+#:
+#: **Earned per constraint, never by SQLSTATE.** A `23503` is only honestly a
+#: 409 when the service resolved that row under the caller's own scope
+#: earlier in the same request: then "the id was wrong" has already been
+#: answered, and "it is gone now" is the only explanation left. Each entry
+#: here therefore names a constraint whose every writer validates first -
+#: `agents.model_profile_id` is written by `AgentService.create` and
+#: `AgentService.update`, and both call `_owned_profile`. A new writer of a
+#: listed column, or a new entry without that check, puts a wrong status on a
+#: real bug, which is what the 500 above is for.
+#:
+#: The sentence says what happened to the row and nothing about the schema:
+#: no constraint name, no table, no driver text.
+CONFLICT_FOREIGN_KEYS: Final[Mapping[str, tuple[str, str]]] = {
+    "agents_model_profile_id_fkey": (
+        "model_profile_id",
+        "That model profile was deleted while this request was in flight. "
+        "Pick another one, or save the agent without a model.",
+    ),
+}
+
+#: PostgreSQL's `foreign_key_violation`. Named rather than inlined, so the
+#: branch below reads as the rule it is.
+FOREIGN_KEY_VIOLATION: Final = "23503"
 
 INTERNAL_ERROR_DETAIL: Final = (
     "An unexpected error occurred. Quote the instance id when reporting it."
@@ -299,6 +329,26 @@ def register_error_handlers(app: FastAPI) -> None:
         assert isinstance(exc, IntegrityError)
         sqlstate = _sqlstate(exc)
         constraint = _constraint(exc)
+        conflicting_fk = CONFLICT_FOREIGN_KEYS.get(constraint or "")
+        if sqlstate == FOREIGN_KEY_VIOLATION and conflicting_fk is not None:
+            # The row this request named was resolved under the caller's own
+            # scope a moment ago and has since been deleted. A conflict, with
+            # the locator so a form can point at the field rather than
+            # putting "try again" above the whole thing.
+            field, detail = conflicting_fk
+            log.warning(
+                "integrity_conflict",
+                path=request.url.path,
+                sqlstate=sqlstate,
+                constraint=constraint,
+            )
+            return problem(
+                status=409,
+                code="conflict",
+                title="Conflict",
+                detail=detail,
+                locator={"field": field},
+            )
         if sqlstate not in CONFLICT_SQLSTATES:
             # Still a 500, and still logged as one: this is a bug in a
             # statement this server built, and the traceback is the point.

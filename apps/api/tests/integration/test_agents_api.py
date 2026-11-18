@@ -16,6 +16,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy import text
 
 from agentworld.infra.db import Database
+from agentworld.services import definitions
 from helpers import Actor
 
 pytestmark = pytest.mark.integration
@@ -372,6 +373,227 @@ def test_only_one_profile_is_the_default(client: TestClient, world: World, actor
         )
     profiles = client.get(url, headers=actor.headers).json()
     assert [p["name"] for p in profiles if p["is_default"]] == ["Second"]
+
+
+# ---------------------------------------- the profile an agent is allowed to name ---
+#
+# `agents.model_profile_id` has a single-column foreign key to
+# `model_profiles.id`, and referential integrity checks bypass row-level
+# security - so without `_owned_profile` the database would happily store
+# another workspace's profile id. Nothing downstream would work: `_plan`
+# resolves the profile under the agent's own workspace, so every step would
+# settle as `misconfigured` for a reason nobody could see in the agent.
+#
+# The pair of tests about *disclosure* is the point of the shared sentence: a
+# caller must not be able to use this endpoint to find out whether an id
+# exists in a workspace they cannot see.
+
+
+def _profile(client: TestClient, actor: Actor, workspace_id: str, name: str = "Default") -> Any:
+    return client.post(
+        f"/v1/workspaces/{workspace_id}/model-profiles",
+        json={"name": name, "provider_slug": "anthropic", "model_id": "claude-opus-5"},
+        headers=actor.headers,
+    ).json()
+
+
+async def _rows(owner_database: Database, sql: str, **params: Any) -> list[Any]:
+    async with owner_database.session() as session:
+        return list((await session.execute(text(sql), params)).all())
+
+
+def test_a_profile_from_this_workspace_is_accepted(
+    client: TestClient, world: World, actor: Actor
+) -> None:
+    profile = _profile(client, actor, world.workspace_id)
+
+    created = create_agent(client, world, actor, model_profile_id=profile["id"])
+
+    assert created.status_code == 201, created.text
+    assert created.json()["model_profile_id"] == profile["id"]
+
+
+def test_a_profile_from_another_workspace_is_refused(
+    client: TestClient, world: World, actor: Actor
+) -> None:
+    """The actor owns both workspaces, so a refusal here is about scope and
+    not about permission: nothing but the profile's own workspace decides."""
+    other = client.post("/v1/workspaces", json={"name": "Elsewhere"}, headers=actor.headers).json()
+    foreign = _profile(client, actor, str(other["id"]), name="Theirs")
+
+    refused = create_agent(client, world, actor, model_profile_id=foreign["id"])
+
+    assert refused.status_code == 422, refused.text
+    body = refused.json()
+    assert body["detail"] == "This workspace has no such model profile"
+    assert body["field"] == "model_profile_id"
+
+
+def test_a_profile_that_does_not_exist_is_refused(
+    client: TestClient, world: World, actor: Actor
+) -> None:
+    refused = create_agent(client, world, actor, model_profile_id=str(uuid.uuid4()))
+
+    assert refused.status_code == 422, refused.text
+    assert refused.json()["field"] == "model_profile_id"
+
+
+def test_the_refusal_does_not_say_whether_a_foreign_profile_exists(
+    client: TestClient, world: World, actor: Actor
+) -> None:
+    """Byte-identical answers, or the endpoint is an existence oracle for
+    ids in workspaces the caller cannot see."""
+    other = client.post("/v1/workspaces", json={"name": "Elsewhere"}, headers=actor.headers).json()
+    foreign = _profile(client, actor, str(other["id"]), name="Theirs")
+
+    real = create_agent(client, world, actor, agent_key="one", model_profile_id=foreign["id"])
+    invented = create_agent(
+        client, world, actor, agent_key="two", model_profile_id=str(uuid.uuid4())
+    )
+
+    assert real.status_code == invented.status_code
+    assert real.json()["detail"] == invented.json()["detail"]
+    assert real.json()["type"] == invented.json()["type"]
+
+
+async def test_a_refused_profile_leaves_no_agent_and_no_audit(
+    client: TestClient, world: World, actor: Actor, owner_database: Database
+) -> None:
+    """Validation runs inside the transaction and before both writes, so
+    there is nothing to roll back - and nothing recorded as if there were."""
+    refused = create_agent(client, world, actor, model_profile_id=str(uuid.uuid4()))
+    assert refused.status_code == 422
+
+    assert await _rows(owner_database, "SELECT id FROM agents") == []
+    assert (
+        await _rows(
+            owner_database,
+            "SELECT action FROM audit_log WHERE resource_type = 'agent'",
+        )
+        == []
+    )
+
+
+async def test_a_member_sending_a_foreign_profile_is_told_about_the_role(
+    client: TestClient, world: World, actor: Actor, make_actor: Any, owner_database: Database
+) -> None:
+    """Authorization first, deliberately. A member may not configure an agent
+    at all, so they learn that - and not something about which model profiles
+    this workspace has."""
+    member = make_actor("curious@example.com")
+    await _join(owner_database, world, member.user_id, member.email, "member")
+
+    refused = create_agent(client, world, member, model_profile_id=str(uuid.uuid4()))
+
+    assert refused.status_code == 403
+    assert "model profile" not in refused.json()["detail"]
+
+
+def test_a_foreign_profile_cannot_be_patched_in_either(
+    client: TestClient, world: World, actor: Actor
+) -> None:
+    """The same check on the other writer of that column. Without it the
+    hole stays open through PATCH, and the conflict mapping below would be
+    putting a 409 on a caller's mistake."""
+    agent = create_agent(client, world, actor).json()
+    other = client.post("/v1/workspaces", json={"name": "Elsewhere"}, headers=actor.headers).json()
+    foreign = _profile(client, actor, str(other["id"]), name="Theirs")
+
+    refused = client.patch(
+        f"{world.agents_url()}/{agent['id']}",
+        json={"model_profile_id": foreign["id"]},
+        headers=actor.headers,
+    )
+
+    assert refused.status_code == 422
+    assert refused.json()["field"] == "model_profile_id"
+    after = client.get(f"{world.agents_url()}/{agent['id']}", headers=actor.headers).json()
+    assert after["model_profile_id"] is None
+
+
+def test_a_rename_is_not_refused_for_a_profile_it_did_not_touch(
+    client: TestClient, world: World, actor: Actor
+) -> None:
+    """The check is gated on the field moving. An agent already pointing at
+    a profile stays renamable."""
+    profile = _profile(client, actor, world.workspace_id)
+    agent = create_agent(client, world, actor, model_profile_id=profile["id"]).json()
+
+    renamed = client.patch(
+        f"{world.agents_url()}/{agent['id']}",
+        json={"display_name": "Renamed"},
+        headers=actor.headers,
+    )
+
+    assert renamed.status_code == 200
+    assert renamed.json()["display_name"] == "Renamed"
+    assert renamed.json()["model_profile_id"] == profile["id"]
+
+
+async def test_a_profile_deleted_after_validation_is_a_conflict_not_a_crash(
+    client: TestClient,
+    world: World,
+    actor: Actor,
+    owner_database: Database,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The race the validation above cannot close.
+
+    `_owned_profile` resolves the row without locking it, so a profile that
+    is deleted between that read and the insert is a real interleaving -
+    and the insert then violates `agents_model_profile_id_fkey`. Before
+    `CONFLICT_FOREIGN_KEYS` that arrived as a 500, which told the caller
+    their request was this server's fault.
+
+    Neutralising the check is how the window is made deterministic: a test
+    that raced two connections for real would pass or fail on timing. What
+    is being asserted is the handler's answer to that violation, which is
+    the same either way.
+    """
+    monkeypatch.setattr(definitions, "_owned_profile", _accept_anything)
+
+    response = create_agent(client, world, actor, model_profile_id=str(uuid.uuid4()))
+
+    assert response.status_code == 409, response.text
+    body = response.json()
+    assert body["field"] == "model_profile_id"
+    assert "deleted" in body["detail"]
+    # No constraint name, no table, no driver text.
+    assert "fkey" not in body["detail"]
+    assert "agents" not in body["detail"]
+
+    # The transaction that raised is rolled back whole, and the audit row
+    # comes after the insert, so neither exists.
+    assert await _rows(owner_database, "SELECT id FROM agents") == []
+    assert (
+        await _rows(owner_database, "SELECT action FROM audit_log WHERE action LIKE 'agent.%'")
+        == []
+    )
+
+
+async def _accept_anything(*_args: Any, **_kwargs: Any) -> None:
+    """Stands in for `_owned_profile` when the row is to vanish after it."""
+
+
+def test_an_unrelated_foreign_key_still_fails_loudly(
+    client: TestClient, world: World, actor: Actor
+) -> None:
+    """The mapping is per constraint, not per SQLSTATE.
+
+    A project id that does not exist is a `23503` on
+    `agents_project_id_fkey`, which is not in `CONFLICT_FOREIGN_KEYS` - and
+    must not become a 409 just because it is a foreign key. Here the API
+    answers earlier than the database, with the 404 a missing project
+    deserves; the assertion is that it is not the conflict reserved for a
+    deleted model profile.
+    """
+    response = client.post(
+        f"/v1/projects/{uuid.uuid4()}/agents",
+        json={"display_name": "Nowhere", "interaction_mode": "managed"},
+        headers=actor.headers,
+    )
+
+    assert response.status_code == 404
 
 
 # ------------------------------------------------------------------- tenancy ---
