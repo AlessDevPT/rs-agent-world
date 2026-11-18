@@ -33,6 +33,7 @@ from sqlalchemy import text
 from agentworld.domain.enums import DispatchStatus, ExecutionStatus, SideEffect, StepStatus
 from agentworld.infra import net
 from agentworld.infra.db import Database
+from agentworld.infra.providers import registry
 from agentworld.repositories.base import TenantScope
 from agentworld.repositories.unit_of_work import UnitOfWorkFactory
 from agentworld.services import dispatch as dispatch_service
@@ -730,6 +731,65 @@ async def test_a_consequential_dispatch_is_refused_rather_than_performed(
     row = await _dispatch_row(owner_database, execution_id)
     assert row.status == DispatchStatus.DEAD
     assert row.last_error_code == "consequential_refused"
+
+    _, step = await _states(owner_database, execution_id)
+    assert step == StepStatus.FAILED
+
+
+async def test_a_provider_this_build_no_longer_serves_is_misconfigured_not_a_crash(
+    scenario: Scenario,
+    provider: FakeProvider,
+    factory: UnitOfWorkFactory,
+    owner_database: Database,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A retired provider is a configuration problem, settled as one.
+
+    `ModelProfileService` refuses to store a slug the registry has no
+    builder for, so the only way a row can still name one is a build that
+    stopped serving it after the row was written - which is what emptying
+    `_BUILDERS` is. The rule governs what may be written and sweeps no
+    existing rows, so such a row arrives here intact.
+
+    What this pins is the classification. `build` raises
+    `UnknownProviderError`, and with no handler for it the loop's catch-all
+    reads it as a programming error: `runner_error`, logged with a stack
+    trace, and retried - spending the whole attempt budget to learn three
+    times that a slug is still the same slug. `dead` and `misconfigured` is
+    what the sibling case settles as, a profile with no credential, and this
+    is the same kind of fact about the same row.
+    """
+    execution_id = scenario.run()
+    monkeypatch.setattr(registry, "_BUILDERS", {})
+
+    claimed = await _worker(factory, provider).run_once()
+    assert claimed is not None
+
+    row = await _dispatch_row(owner_database, execution_id)
+    assert row.status == DispatchStatus.DEAD, (
+        f"the dispatch is {row.status!r}. Waiting does not teach this build a provider, "
+        "so the attempt budget buys nothing"
+    )
+    assert row.last_error_code == "misconfigured", (
+        f"classified {row.last_error_code!r} - 'runner_error' is the catch-all for a "
+        "programming mistake, and a profile naming a provider this build does not have "
+        "is an operator's configuration"
+    )
+    assert row.claim_count == 1, f"claimed {row.claim_count} times for one terminal fact"
+    assert provider.requests == [], "the refusal must precede the outbound call"
+    assert row.side_effect_started_at is None, "nothing went out, so nothing is in flight"
+
+    async with owner_database.session() as session:
+        message = (
+            await session.execute(
+                text("SELECT last_error FROM dispatches WHERE execution_id = :id"),
+                {"id": str(execution_id)},
+            )
+        ).scalar_one()
+    assert "anthropic" in message, (
+        f"the recorded failure reads {message!r}. It has to name the slug, which is the "
+        "one thing an operator has to change"
+    )
 
     _, step = await _states(owner_database, execution_id)
     assert step == StepStatus.FAILED

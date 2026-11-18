@@ -32,9 +32,16 @@ class UnknownProviderError(ValueError):
 
     A `ValueError` rather than a `ProviderError`: nothing was attempted, so
     there is no call to classify. It is a configuration mistake - a profile
-    naming a provider this deployment does not have - and the service layer
-    turns it into a validation failure naming the slug, which is safe
-    because the slug is something the caller wrote.
+    naming a provider this deployment does not have.
+
+    Two places answer for that mistake, and neither of them lets this
+    escape. `ModelProfileService` refuses to store a slug outside
+    `available()` at all, so the normal way to make one is closed at the
+    form. A row that still names one - written before that rule, or naming a
+    provider this build has since stopped serving - raises this at
+    `StepRunner._managed_agent_turn`, which settles the dispatch `dead` with
+    `error_code='misconfigured'`: terminal, because no number of attempts
+    teaches a build a provider it does not ship.
     """
 
 

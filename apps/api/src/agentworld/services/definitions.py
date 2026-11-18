@@ -28,8 +28,9 @@ behind rather than the fields it happens to mention. Nothing downstream
 repeats either check - `DispatchService._plan` reads `provider_slug` and
 `credential_id` off the one row and uses both as they stand - so without
 this, a profile naming one vendor while holding another's key would send
-that key to the wrong endpoint, and a slug no build serves would reach
-`registry.build` as an unhandled `UnknownProviderError`.
+that key to the wrong endpoint, and a slug no build serves would only be
+caught by `registry.build`, which the runner reaches after a run has
+started and settles as a failed step rather than a message beside a field.
 """
 
 from __future__ import annotations

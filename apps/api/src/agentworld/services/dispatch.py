@@ -64,6 +64,7 @@ from agentworld.infra.providers import (
     ProviderFailure,
     Role,
     StopReason,
+    UnknownProviderError,
 )
 from agentworld.infra.providers import (
     build as build_provider,
@@ -223,17 +224,34 @@ class StepRunner:
         """
         try:
             plan = await self._plan(claimed)
+            # Inside the same `try` as the plan, because "this build has no
+            # implementation for that slug" is the same kind of fact as "that
+            # agent has no model profile": a row an operator has to change,
+            # which the next attempt will find unchanged.
+            provider = build_provider(
+                plan.provider_slug,
+                self._client,
+                api_key=plan.api_key,
+                base_url=plan.base_url,
+            )
         except (NotFoundError, ConflictError) as exc:
             # A misconfigured agent is terminal: it will be just as
             # misconfigured in thirty seconds.
             return Outcome(status=DispatchStatus.DEAD, error=exc.detail, error_code="misconfigured")
-
-        provider = build_provider(
-            plan.provider_slug,
-            self._client,
-            api_key=plan.api_key,
-            base_url=plan.base_url,
-        )
+        except UnknownProviderError as exc:
+            # `ModelProfileService` refuses to store a slug outside the
+            # registry, so a row that still names one was either written
+            # before that rule or named a provider this build has since
+            # stopped serving. Classified with the other configuration
+            # problems rather than left to the loop's catch-all, which reads
+            # an escaped exception as a programming error: it logs a stack
+            # trace at ERROR and retries, spending the attempt budget three
+            # times over to learn that a slug is still the same slug.
+            return Outcome(
+                status=DispatchStatus.DEAD,
+                error=f"this server has no implementation for the provider '{exc}'",
+                error_code="misconfigured",
+            )
         request = CompletionRequest(
             model=plan.model_id,
             messages=[Message(role=Role.USER, content=plan.prompt)],
