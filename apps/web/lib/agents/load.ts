@@ -32,7 +32,21 @@ import {
   type AgentExecution,
 } from "@/lib/api/agents";
 import { ApiError } from "@/lib/api/client";
+import { listModelProfiles, type ModelProfile } from "@/lib/api/model-profiles";
 import type { Project } from "@/lib/api/tenancy";
+
+/**
+ * The two outcomes every loader here shares, and the only two `outcomeOf`
+ * produces. Named so that a loader's own success member can differ without
+ * each one restating what a failure looks like.
+ */
+type LoadFailure =
+  | { readonly kind: "not_found" }
+  | {
+      readonly kind: "error";
+      readonly message: string;
+      readonly requestId?: string | undefined;
+    };
 
 export type AgentOverview =
   /** No such agent, or none the viewer may see through this path. */
@@ -45,7 +59,7 @@ export type AgentOverview =
     }
   | { readonly kind: "ok"; readonly project: Project; readonly agent: Agent };
 
-const NOT_FOUND: AgentOverview = { kind: "not_found" };
+const NOT_FOUND: LoadFailure = { kind: "not_found" };
 
 /**
  * One agent and the project it belongs to, or why neither can be shown.
@@ -132,6 +146,66 @@ export async function loadAgentExecutions(
 }
 
 /**
+ * What the "new agent" form needs before it can be filled in honestly.
+ *
+ * Same sequence rule as `loadAgentOverview`, for the same reason: the project
+ * decides whether this path is coherent, and nothing else is asked for until
+ * it does. The create form is a `member` action on a `project`, so a project
+ * reached through the wrong workspace must not get as far as listing that
+ * workspace's model profiles.
+ *
+ * **`profiles` is `null` when it is unknown and `[]` when there are none**,
+ * which are two different sentences the form has to say differently - "we
+ * could not ask" must never be shown as "this workspace has no profiles".
+ * They are only asked for at all when the viewer may attach one: listing
+ * them is `viewer` on the API, but offering a picker to a member whose
+ * request would then 403 is worse than not offering it, so the page decides
+ * with `canConfigureAgents` and this takes the answer as an argument.
+ *
+ * A profile listing that fails costs the picker, not the page: an agent
+ * without a model is a legitimate thing to create, and losing the form over
+ * a card that is optional anyway would be the wrong trade.
+ */
+export type AgentCreation =
+  | { readonly kind: "not_found" }
+  | {
+      readonly kind: "error";
+      readonly message: string;
+      readonly requestId?: string | undefined;
+    }
+  | {
+      readonly kind: "ok";
+      readonly project: Project;
+      readonly profiles: readonly ModelProfile[] | null;
+    };
+
+export async function loadAgentCreation(
+  token: string,
+  workspaceId: string,
+  projectId: string,
+  options: { readonly mayConfigure: boolean },
+): Promise<AgentCreation> {
+  let project: Project;
+  try {
+    project = await getProject(token, projectId);
+  } catch (caught) {
+    return outcomeOf(caught, "Could not load this project");
+  }
+
+  if (project.workspace_id !== workspaceId) return NOT_FOUND;
+
+  if (!options.mayConfigure) return { kind: "ok", project, profiles: null };
+
+  try {
+    return { kind: "ok", project, profiles: await listModelProfiles(token, workspaceId) };
+  } catch {
+    // Left null on purpose: the form says it cannot offer profiles rather
+    // than claiming the workspace has none.
+    return { kind: "ok", project, profiles: null };
+  }
+}
+
+/**
  * A failed call as an outcome.
  *
  * Only an `ApiError` carrying a 404 becomes `not_found`. Every other
@@ -141,7 +215,7 @@ export async function loadAgentExecutions(
  * host, or a bug in this code - and gets the caller's generic sentence rather
  * than a message assembled from an exception the user cannot act on.
  */
-function outcomeOf(caught: unknown, fallback: string): AgentOverview {
+function outcomeOf(caught: unknown, fallback: string): LoadFailure {
   if (caught instanceof ApiError) {
     if (caught.problem.status === 404) return NOT_FOUND;
     return { kind: "error", message: caught.problem.detail, requestId: caught.requestId };

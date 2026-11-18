@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   DEFAULT_LIMIT,
   MAX_LIMIT,
+  createAgent,
   getAgent,
   getProject,
   listAgents,
@@ -103,13 +104,37 @@ describe("the agents client", () => {
     expect(calls[0]!.init.cache).toBe("no-store");
   });
 
-  it("sends no body and no JSON content type: every call here is a read", async () => {
+  it("sends no body and no JSON content type on a read", async () => {
     const { calls } = captureFetch();
 
     await listRuns("t", "p-1", "a-1");
 
     expect(calls[0]!.init.body).toBeUndefined();
     expect(calls[0]!.init.headers["content-type"]).toBeUndefined();
+  });
+
+  it("posts a create body unchanged, to the project's agents path", async () => {
+    // The one write in this module. What to send is decided in
+    // `lib/agents/create.ts` and tested there; a client that second-guessed
+    // a body would be the bug, so the whole of this is that it does not.
+    const { calls } = captureFetch({});
+
+    await createAgent("t", "p-1", {
+      display_name: "Market Researcher",
+      interaction_mode: "managed",
+      agent_key: "research-bot",
+      labels: { team: "support" },
+    });
+
+    expect(path(calls[0]!.url)).toBe("/v1/projects/p-1/agents");
+    expect(calls[0]!.init.method).toBe("POST");
+    expect(calls[0]!.init.headers["content-type"]).toBe("application/json");
+    expect(JSON.parse(String(calls[0]!.init.body))).toEqual({
+      display_name: "Market Researcher",
+      interaction_mode: "managed",
+      agent_key: "research-bot",
+      labels: { team: "support" },
+    });
   });
 
   it("agrees with the API about its own caps", () => {

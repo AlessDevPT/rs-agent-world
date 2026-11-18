@@ -208,6 +208,50 @@ export function getAgent(token: string, projectId: string, agentId: string): Pro
 }
 
 /**
+ * What `POST /v1/projects/{id}/agents` accepts.
+ *
+ * `display_name` and `interaction_mode` are the only required fields: the
+ * schema gives `interaction_mode` no default, so a body without it is a 422
+ * rather than a managed agent. Everything else is optional, and *omitted*
+ * rather than nulled - `agent_key` falls back to a slug of the display name
+ * only when it is absent, and an empty string would be refused instead.
+ *
+ * `model_profile_id` additionally needs `agent.configure`, which is `admin`:
+ * a body carrying one from a member is a 403 for the whole request. The
+ * fields `heartbeat_ttl_seconds`, and anything about status, heartbeat or
+ * capabilities, are deliberately not here - the first is not on `AgentCreate`
+ * at all, and the rest are folded from events that only the agent produces.
+ *
+ * `model_overrides` and `dispatch` are accepted by the API and left out of
+ * this type: nothing in the dispatch path reads either one, so sending them
+ * would store configuration that has no effect.
+ */
+export interface CreateAgentBody {
+  readonly display_name: string;
+  readonly interaction_mode: AgentInteractionMode;
+  readonly agent_key?: string;
+  readonly role?: string;
+  readonly description?: string;
+  readonly instructions?: string;
+  readonly kind?: string;
+  readonly labels?: Readonly<Record<string, unknown>>;
+  readonly model_profile_id?: string;
+}
+
+/** Register an agent into a project. `member`, or `admin` with a model. */
+export function createAgent(
+  token: string,
+  projectId: string,
+  body: CreateAgentBody,
+): Promise<Agent> {
+  return apiFetch<Agent>(`/v1/projects/${projectId}/agents`, {
+    token,
+    method: "POST",
+    body,
+  });
+}
+
+/**
  * When this agent's status changed, newest first.
  *
  * An agent AgentWorld runs itself has none: a managed agent reports nothing,

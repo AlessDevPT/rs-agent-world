@@ -17,6 +17,8 @@
 import { revalidatePath } from "next/cache";
 import { redirect } from "next/navigation";
 
+import { createFailureField } from "@/lib/agents/create";
+import { createAgent, type CreateAgentBody } from "@/lib/api/agents";
 import { ApiError, type Problem } from "@/lib/api/client";
 import {
   createCredential,
@@ -396,4 +398,51 @@ export async function deleteModelProfileAction(
   }
   revalidatePath(`/w/${workspaceId}/settings/model-profiles`);
   return { ok: true };
+}
+
+// ----------------------------------------------------------------- agents ---
+
+/**
+ * Register an agent into a project.
+ *
+ * **Returns only on failure.** A successful create ends in `redirect` to the
+ * new agent's own page, which is the honest success state: the thing that was
+ * asked for now exists and the person is looking at it. `createWorkspaceAction`
+ * above does the same, for the same reason, and the `redirect` call sits
+ * outside the `try` because it works by throwing - catching around it would
+ * report a completed creation as a failure.
+ *
+ * The body is built by `lib/agents/create.ts` and sent as it arrives. Two
+ * things that would be tempting to do here are deliberately not done: nothing
+ * is filled in on the caller's behalf (a blank optional field was omitted by
+ * the builder and must stay omitted, or it would be stored as an empty
+ * string), and the role is not checked (`agent.create` is `member` and
+ * `agent.configure` is `admin`, both enforced by the endpoint - a form that
+ * hides a control is a convenience, not a boundary).
+ */
+export async function createAgentAction(
+  workspaceId: string,
+  projectId: string,
+  body: CreateAgentBody,
+): Promise<ActionResult> {
+  const { token } = await requireSession();
+
+  let agentId: string;
+  try {
+    const agent = await createAgent(token, projectId, body);
+    agentId = agent.id;
+  } catch (error) {
+    const result = failure(error);
+    if (error instanceof ApiError) {
+      // The API locates only one of this endpoint's refusals. The rest of
+      // the mapping is a rule about statuses, kept in `lib/agents/create.ts`
+      // where it is tested, rather than a sentence matched here.
+      const field = createFailureField(error.problem.status, error.problem.field);
+      if (field !== undefined) return { ...result, field };
+    }
+    return result;
+  }
+
+  revalidatePath(`/w/${workspaceId}/p/${projectId}/agents`);
+  redirect(`/w/${workspaceId}/p/${projectId}/agents/${agentId}`);
 }

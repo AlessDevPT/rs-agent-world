@@ -4,6 +4,7 @@ import { notFound } from "next/navigation";
 import { getProject, listAgents, type Agent } from "@/lib/api/agents";
 import { ApiError } from "@/lib/api/client";
 import type { Project } from "@/lib/api/tenancy";
+import { canCreateAgents } from "@/lib/agents/create";
 import {
   agentsEmptyState,
   livenessLabel,
@@ -40,7 +41,14 @@ export default async function AgentsPage({
   readonly params: Promise<{ workspaceId: string; projectId: string }>;
 }) {
   const { workspaceId, projectId } = await params;
-  const { token } = await requireSession(`/w/${workspaceId}/p/${projectId}/agents`);
+  const { token, me } = await requireSession(`/w/${workspaceId}/p/${projectId}/agents`);
+
+  // `agent.create` is `member` on the API. The link is hidden from a viewer
+  // because a form they cannot post is not worth offering - the endpoint is
+  // what refuses them, and the create page explains itself if they arrive
+  // there by URL anyway.
+  const membership = me.workspaces.find((entry) => entry.workspace.id === workspaceId);
+  const mayCreate = canCreateAgents(membership?.role ?? "viewer");
 
   // **This page authorizes itself, rather than trusting the layout above.**
   // The layout makes the same checks, but a layout and its page execute
@@ -92,6 +100,16 @@ export default async function AgentsPage({
           reported; its heartbeat is a separate signal about whether we are still hearing
           from it.
         </p>
+        {mayCreate && (
+          <p>
+            <Link
+              className="button button--primary"
+              href={`/w/${workspaceId}/p/${projectId}/agents/new`}
+            >
+              New agent
+            </Link>
+          </p>
+        )}
       </div>
 
       {error !== null && (
@@ -107,6 +125,13 @@ export default async function AgentsPage({
           <div className="card">
             <h2 className="card__title">{empty.headline}</h2>
             <p className="muted">{empty.detail}</p>
+            {mayCreate && (
+              <p>
+                <Link href={`/w/${workspaceId}/p/${projectId}/agents/new`}>
+                  Create the first one
+                </Link>
+              </p>
+            )}
           </div>
         ) : (
           <ul className="list">
