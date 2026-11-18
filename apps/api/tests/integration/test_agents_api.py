@@ -157,6 +157,173 @@ def test_null_clears_a_field(client: TestClient, world: World, actor: Actor) -> 
     assert patched.json()["role"] is None
 
 
+# ------------------------------------------------- an explicit null on PATCH ---
+#
+# `AgentUpdate` types every field as optional, which makes `null` a value a
+# caller can send rather than a shape the schema refuses - and the test above
+# is the case where that is exactly right, because `role` is nullable. Six of
+# the columns are `NOT NULL` in migration 0007, and for those a null used to
+# be a 500 by one of two routes:
+#
+# - five reached the `UPDATE` and came back as SQLSTATE `23502`, which
+#   `CONFLICT_SQLSTATES` deliberately excludes, so the integrity handler left
+#   it as an unmodelled error;
+# - `interaction_mode: null` never got that far. It arrived at
+#   `_check_model_mode` as "not managed", so an agent that already had a
+#   profile raised about `model_profile_id` - a field the request never
+#   mentioned - while interpolating `mode.value` on `None`, which is an
+#   `AttributeError`.
+#
+# One `_not_null` call closes both, which is why these are parameterised over
+# the whole set rather than written for the two interesting ones: the point is
+# that no member of the set is missing from the guard.
+
+NOT_NULL_FIELDS = (
+    "display_name",
+    "interaction_mode",
+    "labels",
+    "model_overrides",
+    "dispatch",
+    "heartbeat_ttl_seconds",
+)
+
+#: Nullable in the same migration, and clearing them is a legitimate edit.
+#: Here so that the guard cannot be widened to the whole body without a test
+#: saying so.
+NULLABLE_FIELDS = ("role", "description", "instructions", "kind")
+
+
+@pytest.mark.parametrize("field", NOT_NULL_FIELDS)
+async def test_an_explicit_null_is_refused_for_a_not_null_column(
+    client: TestClient, world: World, actor: Actor, owner_database: Database, field: str
+) -> None:
+    """422 naming the field, the row untouched, and nothing in the audit log.
+
+    The whole view is compared rather than the one field: a guard that
+    refused the request after writing part of it would pass a narrower
+    assertion. For a managed agent that has never reported, every field of
+    `AgentView` is stable between two reads - `liveness` is
+    `not_applicable` and there is no heartbeat to age - so the comparison is
+    deterministic rather than lucky.
+    """
+    created = create_agent(
+        client,
+        world,
+        actor,
+        role="Finds things",
+        labels={"team": "research"},
+        model_overrides={"temperature": 0.2},
+        dispatch={"queue": "research"},
+    ).json()
+    before = client.get(f"{world.agents_url()}/{created['id']}", headers=actor.headers).json()
+
+    refused = client.patch(
+        f"{world.agents_url()}/{created['id']}",
+        json={field: None},
+        headers=actor.headers,
+    )
+
+    assert refused.status_code == 422, refused.text
+    body = refused.json()
+    assert body["field"] == field
+    assert field in body["detail"]
+    after = client.get(f"{world.agents_url()}/{created['id']}", headers=actor.headers).json()
+    assert after == before, "a refused PATCH wrote something"
+    assert (
+        await _rows(
+            owner_database,
+            "SELECT action FROM audit_log WHERE action = 'agent.update'",
+        )
+        == []
+    ), "a refusal was recorded as an edit"
+
+
+@pytest.mark.parametrize("field", NULLABLE_FIELDS)
+def test_a_nullable_field_can_still_be_cleared(
+    client: TestClient, world: World, actor: Actor, field: str
+) -> None:
+    created = create_agent(client, world, actor, **{field: "Something"}).json()
+    assert created[field] == "Something"
+
+    patched = client.patch(
+        f"{world.agents_url()}/{created['id']}",
+        json={field: None},
+        headers=actor.headers,
+    )
+
+    assert patched.status_code == 200, patched.text
+    assert patched.json()[field] is None
+
+
+def test_a_model_profile_can_still_be_detached(
+    client: TestClient, world: World, actor: Actor
+) -> None:
+    """The nullable column the guard would be most tempting to include.
+
+    Detaching leaves an agent a managed turn cannot run - `_plan` refuses it
+    with "has no model profile" - which is a state `create` can produce too,
+    and the edit an operator needs in order to move an agent off a profile
+    they are about to delete.
+    """
+    profile = _profile(client, actor, world.workspace_id)
+    agent = create_agent(client, world, actor, model_profile_id=profile["id"]).json()
+    assert agent["model_profile_id"] == profile["id"]
+
+    patched = client.patch(
+        f"{world.agents_url()}/{agent['id']}",
+        json={"model_profile_id": None},
+        headers=actor.headers,
+    )
+
+    assert patched.status_code == 200, patched.text
+    assert patched.json()["model_profile_id"] is None
+
+
+def test_a_null_beside_a_valid_change_applies_neither(
+    client: TestClient, world: World, actor: Actor
+) -> None:
+    """The same promise the split permission makes, for the same reason: a
+    caller must not have to diff the response to learn which half landed."""
+    created = create_agent(client, world, actor, role="Finds things").json()
+
+    refused = client.patch(
+        f"{world.agents_url()}/{created['id']}",
+        json={"display_name": None, "role": "Senior Researcher"},
+        headers=actor.headers,
+    )
+
+    assert refused.status_code == 422
+    assert refused.json()["field"] == "display_name"
+    reread = client.get(f"{world.agents_url()}/{created['id']}", headers=actor.headers).json()
+    assert reread["role"] == "Finds things"
+    assert reread["display_name"] == "Researcher"
+
+
+async def test_a_member_sending_a_null_configuration_field_is_told_about_the_role(
+    client: TestClient, world: World, actor: Actor, make_actor: Any, owner_database: Database
+) -> None:
+    """Authorization before the body check, deliberately.
+
+    `model_overrides` is a configuration field, so a member may not send it
+    at all - and learning "'model_overrides' cannot be null" would be an
+    answer to a question they are not allowed to ask. A field they *may*
+    edit still gets the validation message, which is what makes the ordering
+    visible rather than incidental.
+    """
+    agent = create_agent(client, world, actor).json()
+    member = make_actor("editor@example.com")
+    await _join(owner_database, world, member.user_id, member.email, "member")
+    url = f"{world.agents_url()}/{agent['id']}"
+
+    configuration = client.patch(url, json={"model_overrides": None}, headers=member.headers)
+    definition = client.patch(url, json={"labels": None}, headers=member.headers)
+
+    assert configuration.status_code == 403
+    assert "null" not in configuration.json()["detail"]
+    assert definition.status_code == 422
+    assert definition.json()["field"] == "labels"
+
+
 # --------------------------------------------- the split permission, up close ---
 
 

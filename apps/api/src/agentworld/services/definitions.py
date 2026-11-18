@@ -545,6 +545,33 @@ class AgentService:
                 # name and may not change the model profile changes neither.
                 authorize(principal, Action.AGENT_CONFIGURE, resource)
 
+            # The six columns `AgentUpdate` types as nullable and migration
+            # 0007 declares `NOT NULL`. A null the caller actually sent is a
+            # statement about the request body and needs no agent to judge,
+            # but it is checked *after* both authorizations: a member who
+            # sends `{"model_overrides": null}` is told about the role,
+            # which is the thing standing between them and this request.
+            #
+            # Before `_check_model_mode` for a sharper reason than tidiness.
+            # An explicit `interaction_mode: null` arrives there as "not
+            # managed", so for an agent that already has a profile it raises
+            # about `model_profile_id` - a field the request never mentioned
+            # - while interpolating `mode.value` on `None`, which is an
+            # `AttributeError` and a 500. The other five reach the statement
+            # and return as `23502`, which is deliberately not in
+            # `CONFLICT_SQLSTATES` and so is a 500 too. Two routes to the
+            # same wrong answer, closed by one guard; nothing about the
+            # integrity mapping changes.
+            _not_null(
+                sent,
+                "display_name",
+                "interaction_mode",
+                "labels",
+                "model_overrides",
+                "dispatch",
+                "heartbeat_ttl_seconds",
+            )
+
             scope = TenantScope(workspace_id, project_id)
             agents = work.agents(scope)
             # `include_archived=True`, so that an archived agent is refused
