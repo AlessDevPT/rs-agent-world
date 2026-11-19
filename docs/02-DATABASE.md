@@ -23,7 +23,7 @@
 > `world_placements`, which became `world_nodes`.
 >
 > `tasks` and `task_dependencies` exist and are unused: no endpoint serves them.
-> Overall status is in [`STATUS-2026-11-17.md`](STATUS-2026-11-17.md).
+> Overall status is in [`STATUS.md`](STATUS.md).
 
 ## 1. Shape of the data
 

@@ -26,7 +26,7 @@
 >   `api:worker`, `api:reaper`, `infra:up`), and CI is three jobs - `api`, `web`,
 >   `compose` - in `.github/workflows/`.
 >
-> Overall status is in [`STATUS-2026-11-17.md`](STATUS-2026-11-17.md).
+> Overall status is in [`STATUS.md`](STATUS.md).
 
 ## 1. Top level
 

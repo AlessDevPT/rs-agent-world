@@ -7,7 +7,7 @@
 > still open. Phase 3's Track B, the island skeleton and the minimal pages, **has not
 > started**: `apps/web/world/` holds a README and no code. Parts of Phase 4's Track A landed
 > early, which that phase's section now records. What is built, what is not and what comes
-> next are in [`docs/STATUS-2026-11-17.md`](../../STATUS-2026-11-17.md), written from the
+> next are in [`docs/STATUS.md`](../../STATUS.md), written from the
 > code rather than from this plan — read that for status and these documents for reasoning.
 >
 > `docs/01`–`05` describe the **previous** product direction. Phases 0–1 were built against

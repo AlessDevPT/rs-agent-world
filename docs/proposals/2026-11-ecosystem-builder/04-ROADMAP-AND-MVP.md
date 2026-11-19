@@ -200,7 +200,7 @@ behaviour changes.
 > live provider call. Track B: **nothing built.** The acceptance ledger below was
 > reconciled against the suites on that date — every tick names the test that earns it
 > and every open box says why it is open. Overall status and the ordered next steps
-> are in [`docs/STATUS-2026-11-17.md`](../../STATUS-2026-11-17.md).
+> are in [`docs/STATUS.md`](../../STATUS.md).
 
 The first phase where something runs, and the first where something is visible.
 

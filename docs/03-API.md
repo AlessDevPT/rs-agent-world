@@ -33,7 +33,7 @@
 >
 > The endpoints as built are in
 > [`proposals/2026-11-ecosystem-builder/03-API-AND-FRONTEND.md`](proposals/2026-11-ecosystem-builder/03-API-AND-FRONTEND.md);
-> overall status is in [`STATUS-2026-11-17.md`](STATUS-2026-11-17.md).
+> overall status is in [`STATUS.md`](STATUS.md).
 
 ## 1. Planes
 

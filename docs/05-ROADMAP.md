@@ -15,7 +15,7 @@
 > the goals and the milestone gates, which still hold.
 >
 > **Where things actually stand, measured from the code, is in**
-> [`STATUS-2026-11-17.md`](STATUS-2026-11-17.md) **(2026-11-17).**
+> [`STATUS.md`](STATUS.md)**.**
 
 ## Ordering principle
 

@@ -3,7 +3,7 @@
 > Status: Revision 1 (2026-10-31), **largely implemented, and partly superseded.**
 
 > [!IMPORTANT]
-> **Read this with [`STATUS-2026-11-17.md`](STATUS-2026-11-17.md) beside it (2026-11-17).**
+> **Read this with [`STATUS.md`](STATUS.md) beside it.**
 >
 > "Design, pre-implementation" has not been true since Phase 0. What this
 > document describes as the core - tenancy and identity, the ingest plane, event
