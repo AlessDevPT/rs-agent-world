@@ -28,6 +28,15 @@ import { revalidatePath } from "next/cache";
 
 import { testAgentAction } from "@/app/actions";
 import { SAMPLE_MAX, testFindingSentence, testRefusal } from "@/lib/agents/test";
+import {
+  beginTest,
+  createPanelStore,
+  finishTest,
+  uncertainFailureMessage,
+  type PanelEvent,
+  type PanelState,
+} from "@/lib/agents/test-panel";
+import { requireSession } from "@/lib/session";
 
 const AGENTS_PATH = "/w/w-1/p/p-1/agents";
 const DETAIL_PATH = `${AGENTS_PATH}/a-1`;
@@ -349,5 +358,265 @@ describe("the structured refusal codes", () => {
     if (result.ok) return;
     expect(result.codes).toBeUndefined();
     expect(result.status).toBeUndefined();
+  });
+});
+
+/**
+ * The panel's sequence driving the real action, over a stubbed `fetch`.
+ *
+ * The closest this environment can get to an integration test: the store and
+ * both halves of the submission from `lib/agents/test-panel.ts` are real, the
+ * server action from `app/actions.ts` is real, and only the network is a
+ * literal. Nothing renders - there is no DOM here - so what this proves is
+ * the wiring the component will carry, not the markup it will carry it in.
+ *
+ * `drive()` is that wiring, and nothing in it is a copy of the production
+ * logic: the guard, the state, the `catch` and the `finally` all belong to
+ * `createPanelStore`, `beginTest` and `finishTest`. It no longer needs to
+ * model React's stale render closure either, which earlier versions of this
+ * file did at some length - the store is read at the moment it is used, so
+ * there is no render-captured snapshot left for a handler to disagree with.
+ * `tests/agent-test-panel.test.ts` covers what that now makes impossible.
+ */
+function drive(sample: string) {
+  const published: PanelState[] = [];
+  const store = createPanelStore((next) => {
+    published.push(next);
+  });
+  const guard = { current: false };
+
+  async function confirm(): Promise<void> {
+    if (!beginTest({ guard, store })) return;
+    await finishTest({
+      guard,
+      store,
+      run: async () => {
+        const result = await testAgentAction("w-1", "p-1", "a-1", sample);
+        return result.ok
+          ? { type: "accepted", executionId: result.execution.id }
+          : { type: "refused", refusal: result };
+      },
+    });
+  }
+
+  return {
+    send(event: PanelEvent) {
+      store.send(event);
+    },
+    confirm,
+    published,
+    get state(): PanelState {
+      return store.current();
+    },
+    get guardHeld(): boolean {
+      return guard.current;
+    },
+  };
+}
+
+describe("the panel sequence against the real action", () => {
+  it("sends one request and lands on the accepted execution", async () => {
+    const { calls } = stubFetch(202, ACCEPTED);
+    const panel = drive(SAMPLE);
+
+    panel.send({ type: "submit" });
+    await panel.confirm();
+
+    expect(calls).toHaveLength(1);
+    expect(path(calls[0]!.url)).toBe("/v1/projects/p-1/agents/a-1/test");
+    expect(panel.state).toEqual({ step: "accepted", executionId: "e-1" });
+  });
+
+  it("makes exactly one request when the confirm button is double-clicked", async () => {
+    // Both calls start before either resolves, which is what a real
+    // double-click does and what `disabled={pending}` cannot catch: the
+    // attribute only applies after React re-renders. There is no
+    // idempotency key on this endpoint, so a second request would be a
+    // second execution and a second provider charge.
+    const { calls } = stubFetch(202, ACCEPTED);
+    const panel = drive(SAMPLE);
+
+    panel.send({ type: "submit" });
+    await Promise.all([panel.confirm(), panel.confirm()]);
+
+    expect(calls).toHaveLength(1);
+    expect(panel.state).toEqual({ step: "accepted", executionId: "e-1" });
+  });
+
+  it("revalidates the detail path exactly once and never the agent list", async () => {
+    stubFetch(202, ACCEPTED);
+    const panel = drive(SAMPLE);
+
+    panel.send({ type: "submit" });
+    await Promise.all([panel.confirm(), panel.confirm()]);
+
+    expect(vi.mocked(revalidatePath).mock.calls).toEqual([[DETAIL_PATH]]);
+    expect(vi.mocked(revalidatePath)).not.toHaveBeenCalledWith(AGENTS_PATH);
+  });
+
+  it("sends nothing at all when the sample is one the rules refuse", async () => {
+    const { calls } = stubFetch(202, ACCEPTED);
+    const panel = drive("   ");
+
+    panel.send({ type: "submit" });
+    await panel.confirm();
+
+    expect(calls).toHaveLength(0);
+    expect(vi.mocked(revalidatePath)).not.toHaveBeenCalled();
+    expect(panel.state).toMatchObject({ step: "refused", field: "input" });
+  });
+
+  it("ends blocked, with the gate's words, when the agent changed underneath the page", async () => {
+    stubFetch(
+      422,
+      problem(422, "This agent cannot be tested", {
+        errors: [
+          {
+            pointer: "/agents/9a1f0c6e-0000-4000-8000-000000000001",
+            code: "agent_archived",
+            detail: "'writer' is archived",
+          },
+        ],
+      }),
+    );
+    const panel = drive(SAMPLE);
+
+    panel.send({ type: "submit" });
+    await panel.confirm();
+
+    expect(panel.state.step).toBe("blocked");
+    if (panel.state.step !== "blocked") return;
+    expect(panel.state.notice.detail).toBe(testFindingSentence("agent_archived")?.detail);
+    expect(panel.state.notice.detail).not.toContain("/agents/");
+    expect(vi.mocked(revalidatePath)).not.toHaveBeenCalled();
+  });
+
+  it("keeps a refusal retryable when it is not about the agent itself", async () => {
+    stubFetch(409, problem(409, "This project already has a workflow with that slug"));
+    const panel = drive(SAMPLE);
+
+    panel.send({ type: "submit" });
+    await panel.confirm();
+
+    expect(panel.state.step).toBe("refused");
+    panel.send({ type: "submit" });
+    expect(panel.state).toEqual({ step: "confirming" });
+  });
+});
+
+/**
+ * The outcome the panel used to have no name for: the action throws.
+ *
+ * A server action can reject rather than return - the connection drops, the
+ * action id is stale after a deploy, the Next server answers 500 - and
+ * neither `failure()` nor the machine sees any of it, because it never
+ * reaches the `catch` inside the action. Two shapes of it are simulated
+ * here, and they are chosen to sit on **opposite sides of the endpoint**:
+ *
+ * - `requireSession` rejecting, which throws before anything is sent;
+ * - `revalidatePath` rejecting, which throws after the API has already
+ *   answered 202 and the execution exists.
+ *
+ * The panel cannot tell them apart, which is the entire reason its sentence
+ * does not claim the test did not start. The second test is the one that
+ * proves the sentence has to be written that way.
+ */
+describe("when the action throws instead of answering", () => {
+  it("leaves pending, says it does not know, and sends nothing more", async () => {
+    const { calls } = stubFetch(202, ACCEPTED);
+    vi.mocked(requireSession).mockRejectedValueOnce(new Error("socket hang up"));
+    const panel = drive(SAMPLE);
+
+    panel.send({ type: "submit" });
+    await panel.confirm();
+
+    expect(panel.state).toEqual({
+      step: "refused",
+      message: uncertainFailureMessage(),
+      field: null,
+      requestId: null,
+    });
+    // Nothing retried on its own. The only request that could exist is the
+    // one that threw, and this one threw before it was made.
+    expect(calls).toHaveLength(0);
+    expect(panel.guardHeld).toBe(false);
+  });
+
+  it("is still uncertain when the throw lands after the API accepted", async () => {
+    // The execution exists. Had the panel said "the test did not start",
+    // this is the run it would have said it about.
+    const { calls } = stubFetch(202, ACCEPTED);
+    vi.mocked(revalidatePath).mockImplementationOnce(() => {
+      throw new Error("revalidation failed");
+    });
+    const panel = drive(SAMPLE);
+
+    panel.send({ type: "submit" });
+    await panel.confirm();
+
+    expect(calls).toHaveLength(1);
+    expect(panel.state.step).toBe("refused");
+    if (panel.state.step !== "refused") return;
+    expect(panel.state.message).toBe(uncertainFailureMessage());
+    expect(panel.state.message).not.toMatch(/did not start|was not started|no execution/i);
+  });
+
+  it("releases the in-flight guard, so a deliberate second attempt goes out", async () => {
+    // **The test that fails if the `finally` is removed.** Without it the
+    // guard stays latched, the second `confirm()` returns at its first line,
+    // and no request is ever made - which is what the panel would do to
+    // somebody who pressed the button again after a dropped connection.
+    const { calls } = stubFetch(202, ACCEPTED);
+    vi.mocked(requireSession).mockRejectedValueOnce(new Error("socket hang up"));
+    const panel = drive(SAMPLE);
+
+    panel.send({ type: "submit" });
+    await panel.confirm();
+    expect(panel.state.step).toBe("refused");
+
+    panel.send({ type: "submit" });
+    expect(panel.state).toEqual({ step: "confirming" });
+    await panel.confirm();
+
+    expect(calls).toHaveLength(1);
+    // And the sample survived the failure intact - it is never cleared, and
+    // the retry asks the agent exactly what the first attempt would have.
+    expect(JSON.parse(String(calls[0]!.init.body))).toEqual({ input: SAMPLE });
+    expect(panel.state).toEqual({ step: "accepted", executionId: "e-1" });
+  });
+
+  it("keeps an ordinary refusal and an ordinary acceptance unchanged", async () => {
+    // The `catch` is not a catch-all for the server saying no: a 403 is
+    // still a refusal with the API's own sentence and its request id.
+    stubFetch(403, problem(403, "This action needs the member role"));
+    const panel = drive(SAMPLE);
+
+    panel.send({ type: "submit" });
+    await panel.confirm();
+
+    expect(panel.state.step).toBe("refused");
+    if (panel.state.step !== "refused") return;
+    expect(panel.state).toEqual({
+      step: "refused",
+      message: "This action needs the member role",
+      field: null,
+      requestId: "req-42",
+    });
+    expect(panel.state.message).not.toBe(uncertainFailureMessage());
+  });
+  it("sends nothing when a cancel has already overtaken the confirmation", async () => {
+    // The same regression the panel tests pin, asserted where it costs
+    // money: the request must not reach the endpoint at all.
+    const { calls } = stubFetch(202, ACCEPTED);
+    const panel = drive(SAMPLE);
+
+    panel.send({ type: "submit" });
+    panel.send({ type: "cancel" });
+    await panel.confirm();
+
+    expect(calls).toHaveLength(0);
+    expect(vi.mocked(revalidatePath)).not.toHaveBeenCalled();
+    expect(panel.state).toEqual({ step: "idle" });
+    expect(panel.guardHeld).toBe(false);
   });
 });

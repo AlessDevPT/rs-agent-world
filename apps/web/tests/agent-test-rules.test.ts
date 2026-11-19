@@ -67,7 +67,19 @@ describe("which agents can be tested", () => {
     expect(outcome.kind).toBe("refused");
     if (outcome.kind !== "refused") return;
     expect(outcome.code).toBe("observed_agent");
-    expect(outcome.notice.detail).toMatch(/reported runs|managed agent/i);
+    expect(outcome.notice.detail).toMatch(/does not run an observed agent/i);
+  });
+
+  it("explains an observed agent without pointing at things that are not there", () => {
+    // Two claims this sentence used to make and must not: there is no runs
+    // view anywhere in `app/` to send somebody to, and changing an agent's
+    // interaction mode is not something this release offers.
+    const outcome = agentTestability(agent("observed"));
+    if (outcome.kind !== "refused") throw new Error("expected a refusal");
+    expect(outcome.notice.detail).not.toMatch(/reported runs|runs view|runs tab/i);
+    expect(outcome.notice.detail).not.toMatch(/change it to|make it managed|switch .* mode/i);
+    // And it still says why, rather than only that it cannot.
+    expect(outcome.notice.detail).toMatch(/reports what it did|no step is ever assigned/i);
   });
 
   it("refuses a dispatchable agent, which this release cannot push work to", () => {

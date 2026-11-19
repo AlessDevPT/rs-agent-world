@@ -155,8 +155,9 @@ export function testFindingSentence(code: string): Sentence | null {
       return {
         headline: "This agent only reports its own activity",
         detail:
-          "An observed agent is never given work by AgentWorld, so there is nothing here " +
-          "to run. Watch its reported runs instead, or change it to a managed agent.",
+          "AgentWorld does not run an observed agent: it works wherever it lives and " +
+          "reports what it did, and no step is ever assigned to it. Testing one would " +
+          "mean giving it work, so there is nothing here to start.",
       };
     case "dispatchable_agent":
       return {

@@ -26,6 +26,7 @@ import { executionStatusLabel, executionTiming } from "@/lib/executions/presenta
 import { requireSession } from "@/lib/session";
 
 import { AgentLifecycle } from "./agent-lifecycle";
+import { AgentTestPanel } from "./agent-test-panel";
 
 export const dynamic = "force-dynamic";
 
@@ -66,6 +67,13 @@ export const metadata = { title: "Agent · AgentWorld" };
  * endpoint to resolve it against, and a bare uuid on a screen is noise. There
  * is no registration timestamp because `AgentView` does not carry one; none is
  * invented here.
+ *
+ * **The test panel is always drawn, and sometimes it is only a sentence.**
+ * Unlike the edit link and the lifecycle card, which are simply absent for
+ * somebody who may not use them, "why can't I test this agent?" has an
+ * answer worth reading - the mode, or the archive, or the role - so the card
+ * carries that instead of leaving a gap. What it decides is
+ * `testPanelView`'s, in `lib/agents/test-panel.ts`.
  *
  * **Editing and the lifecycle are two different permissions and are drawn as
  * two.** `agent.update` is `member`, so the edit link follows that; archiving
@@ -181,6 +189,29 @@ export default async function AgentDetailPage({
         </p>
         <p className="muted">{heartbeat.detail}</p>
       </div>
+
+      {/* Between what the agent is and what it has run, which is where a
+          test belongs: it is started from the configuration above and lands
+          in the list below. The card is always drawn - a viewer, an
+          `observed` agent and an archived one each get the sentence that
+          explains them, rather than a gap that explains nothing.
+
+          Three scalars, never the agent. Props to a client component are
+          serialised into this page's flight payload, so handing it `agent`
+          would have put `instructions`, `labels`, `model_overrides` and
+          `dispatch` - the four this page withholds, four paragraphs up -
+          into the page source for every reader. `hasModelProfile` rather
+          than the id for the same reason: the panel only asks whether
+          there is one. */}
+      <AgentTestPanel
+        workspaceId={workspaceId}
+        projectId={projectId}
+        agentId={agent.id}
+        interactionMode={agent.interaction_mode}
+        archivedAt={agent.archived_at}
+        hasModelProfile={agent.model_profile_id !== null}
+        role={role}
+      />
 
       <div className="card">
         <h2 className="card__title">Executions</h2>
