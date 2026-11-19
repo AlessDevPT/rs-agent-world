@@ -222,3 +222,60 @@ function outcomeOf(caught: unknown, fallback: string): LoadFailure {
   }
   return { kind: "error", message: fallback };
 }
+
+/**
+ * The agent to edit, the project it is in, and the profiles it could name.
+ *
+ * `loadAgentCreation` with an agent, near enough - but built on
+ * `loadAgentOverview` rather than repeating it, because the ordering that
+ * loader documents is the whole reason it exists: project first, workspace
+ * compared, and no agent request made under a workspace the project does not
+ * belong to. An edit form must not be the one path that skips that.
+ *
+ * Profiles are asked for only when the viewer may attach one. Listing them
+ * is `viewer` on the API, so this is not about permission to read: a member
+ * cannot send `model_profile_id` at all, and a picker whose every submission
+ * would 403 is worse than no picker.
+ *
+ * A profile listing that fails costs the picker, not the page - `null`, which
+ * the form renders as "could not be read" rather than as "this workspace has
+ * none". Editing a name must not be blocked by a card about models.
+ */
+export type AgentEditing =
+  | { readonly kind: "not_found" }
+  | {
+      readonly kind: "error";
+      readonly message: string;
+      readonly requestId?: string | undefined;
+    }
+  | {
+      readonly kind: "ok";
+      readonly project: Project;
+      readonly agent: Agent;
+      readonly profiles: readonly ModelProfile[] | null;
+    };
+
+export async function loadAgentEditing(
+  token: string,
+  workspaceId: string,
+  projectId: string,
+  agentId: string,
+  options: { readonly mayConfigure: boolean },
+): Promise<AgentEditing> {
+  const overview = await loadAgentOverview(token, workspaceId, projectId, agentId);
+  if (overview.kind !== "ok") return overview;
+
+  const { project, agent } = overview;
+  if (!options.mayConfigure) return { kind: "ok", project, agent, profiles: null };
+
+  try {
+    return {
+      kind: "ok",
+      project,
+      agent,
+      profiles: await listModelProfiles(token, workspaceId),
+    };
+  } catch {
+    return { kind: "ok", project, agent, profiles: null };
+  }
+}

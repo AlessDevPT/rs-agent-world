@@ -2,6 +2,7 @@ import Link from "next/link";
 import { notFound } from "next/navigation";
 import { Fragment } from "react";
 
+import { agentEditability, canArchiveAgents } from "@/lib/agents/edit";
 import { loadAgentExecutions, loadAgentOverview } from "@/lib/agents/load";
 import {
   executionStatusTone,
@@ -23,6 +24,8 @@ import {
 } from "@/lib/api/agents";
 import { executionStatusLabel, executionTiming } from "@/lib/executions/presentation";
 import { requireSession } from "@/lib/session";
+
+import { AgentLifecycle } from "./agent-lifecycle";
 
 export const dynamic = "force-dynamic";
 
@@ -56,10 +59,20 @@ export const metadata = { title: "Agent · AgentWorld" };
  * `model_overrides` and `labels` are free-form JSON objects. The API gives
  * none of the four a schema, so a deployment may have put anything in any of
  * them - including an endpoint or a token - and every one of them is readable
- * by a `viewer`. `current_task_id` is left out because the API has no task
+ * by a `viewer`. The edit form shows `instructions` and `labels` because it
+ * has to - you cannot change what you cannot see - and it is `member` and
+ * above; that is a narrower audience than this page, which is why they are
+ * still not here. `current_task_id` is left out because the API has no task
  * endpoint to resolve it against, and a bare uuid on a screen is noise. There
  * is no registration timestamp because `AgentView` does not carry one; none is
  * invented here.
+ *
+ * **Editing and the lifecycle are two different permissions and are drawn as
+ * two.** `agent.update` is `member`, so the edit link follows that; archiving
+ * and restoring are `admin`, so the card below does. Both are the API's and
+ * are checked again on the request - hiding a control is a convenience, not a
+ * boundary. The edit link is not drawn for an archived agent, which the API
+ * refuses to change at all.
  */
 export default async function AgentDetailPage({
   params,
@@ -67,9 +80,13 @@ export default async function AgentDetailPage({
   readonly params: Promise<{ workspaceId: string; projectId: string; agentId: string }>;
 }) {
   const { workspaceId, projectId, agentId } = await params;
-  const { token } = await requireSession(
+  const { token, me } = await requireSession(
     `/w/${workspaceId}/p/${projectId}/agents/${agentId}`,
   );
+
+  const membership = me.workspaces.find((entry) => entry.workspace.id === workspaceId);
+  const role = membership?.role ?? "viewer";
+  const mayArchive = canArchiveAgents(role);
 
   const result = await loadAgentOverview(token, workspaceId, projectId, agentId);
 
@@ -97,6 +114,9 @@ export default async function AgentDetailPage({
   }
 
   const { project, agent } = result;
+  // The same rule the edit page itself applies, from the same function, so
+  // a link is never offered to a page that would answer with a notice.
+  const mayEdit = agentEditability(agent, role).kind === "editable";
   // After the overview, not beside it: this list is one card's content, and
   // asking for it before the path is known to be coherent would request an
   // agent's executions for a path the loader is about to refuse.
@@ -120,8 +140,18 @@ export default async function AgentDetailPage({
         </p>
         {archived && (
           <p className="muted">
-            Archived {formatTimestamp(agent.archived_at)}. It is hidden from this
-            project&apos;s agent list.
+            Archived {formatTimestamp(agent.archived_at)}. It is left out of this
+            project&apos;s agent list unless the list is asked for archived agents.
+          </p>
+        )}
+        {mayEdit && (
+          <p>
+            <Link
+              className="button button--quiet"
+              href={`/w/${workspaceId}/p/${projectId}/agents/${agentId}/edit`}
+            >
+              Edit this agent
+            </Link>
           </p>
         )}
       </div>
@@ -242,6 +272,16 @@ export default async function AgentDetailPage({
           )}
         </dl>
       </div>
+
+      {mayArchive && (
+        <AgentLifecycle
+          workspaceId={workspaceId}
+          projectId={projectId}
+          agentId={agent.id}
+          agentKey={agent.agent_key}
+          archived={archived}
+        />
+      )}
     </section>
   );
 }

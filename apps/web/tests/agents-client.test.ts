@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   DEFAULT_LIMIT,
   MAX_LIMIT,
+  archiveAgent,
   createAgent,
   getAgent,
   getProject,
@@ -10,6 +11,8 @@ import {
   listExecutions,
   listRuns,
   listStatusHistory,
+  restoreAgent,
+  updateAgent,
 } from "@/lib/api/agents";
 
 interface Call {
@@ -135,6 +138,60 @@ describe("the agents client", () => {
       agent_key: "research-bot",
       labels: { team: "support" },
     });
+  });
+
+  it("builds the documented paths for the three writes", async () => {
+    // Archiving is a `DELETE` on the agent itself and restoring is a `POST`
+    // to a sub-path: an archive is not a deletion, and a restore is a verb
+    // rather than a field somebody patches back.
+    const { calls } = captureFetch({});
+
+    await updateAgent("t", "p-1", "a-1", { role: "Analyst" });
+    await archiveAgent("t", "p-1", "a-1");
+    await restoreAgent("t", "p-1", "a-1");
+
+    expect(calls.map((call) => `${call.init.method ?? "GET"} ${path(call.url)}`)).toEqual([
+      "PATCH /v1/projects/p-1/agents/a-1",
+      "DELETE /v1/projects/p-1/agents/a-1",
+      "POST /v1/projects/p-1/agents/a-1/restore",
+    ]);
+  });
+
+  it("patches a body unchanged, including the nulls that clear a field", async () => {
+    // What to send is decided in `lib/agents/edit.ts` and tested there. A
+    // client that dropped a null would turn "clear the role" into a request
+    // that says nothing, which is the one mistake this cannot make.
+    const { calls } = captureFetch({});
+
+    await updateAgent("t", "p-1", "a-1", {
+      display_name: "Senior Market Researcher",
+      role: null,
+      labels: { team: "research" },
+      model_profile_id: null,
+    });
+
+    expect(calls[0]!.init.headers["content-type"]).toBe("application/json");
+    expect(JSON.parse(String(calls[0]!.init.body))).toEqual({
+      display_name: "Senior Market Researcher",
+      role: null,
+      labels: { team: "research" },
+      model_profile_id: null,
+    });
+  });
+
+  it("sends no body on either lifecycle call", async () => {
+    // Both are verbs with nothing to say: the id in the path is the whole
+    // of the request, and a JSON content type on a bodyless call is noise.
+    const { calls } = captureFetch({});
+
+    await archiveAgent("t", "p-1", "a-1");
+    await restoreAgent("t", "p-1", "a-1");
+
+    for (const call of calls) {
+      expect(call.init.body).toBeUndefined();
+      expect(call.init.headers["content-type"]).toBeUndefined();
+      expect(call.init.headers["authorization"]).toBe("Bearer t");
+    }
   });
 
   it("agrees with the API about its own caps", () => {

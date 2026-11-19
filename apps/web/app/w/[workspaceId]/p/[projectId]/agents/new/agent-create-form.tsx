@@ -213,8 +213,8 @@ export function AgentCreateForm({
       <div className="card">
         <h2 className="card__title">How AgentWorld works with it</h2>
         <p className="muted">
-          This decides what may be asked of the agent. There is no screen for changing it
-          yet, so it is worth reading the three.
+          This decides what may be asked of the agent. The edit screen does not change it,
+          so it is worth reading the three.
         </p>
 
         {modeChoices().map((choice) => (

@@ -93,11 +93,14 @@ export interface ModeChoice {
  * promises a loop that "may really pause it"; what exists is a single turn.
  *
  * The honesty matters more here than anywhere else on the form: two of the
- * three choices produce an agent no workflow can use yet, and this build has
- * no screen for changing the mode afterwards. (The API does allow it -
+ * three choices produce an agent no workflow can use yet, and nothing in this
+ * build changes the mode afterwards. The agent *editor* exists now and does
+ * not offer it, which is a narrower statement than the one this comment used
+ * to make and the one the form now makes. (The API does allow the change -
  * `interaction_mode` is on `AgentUpdate` and is not one of
- * `CONFIGURATION_FIELDS`, so a `member` may PATCH it - but agent editing is
- * not part of this milestone, so the form says nothing about who could.)
+ * `CONFIGURATION_FIELDS`, so a `member` may PATCH it - but a mode change
+ * moves an agent between "AgentWorld runs it" and "you do", which is a
+ * decision with consequences no screen explains yet.)
  */
 export function modeChoices(): readonly ModeChoice[] {
   return [

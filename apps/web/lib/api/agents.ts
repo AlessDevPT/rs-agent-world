@@ -252,6 +252,118 @@ export function createAgent(
 }
 
 /**
+ * What `PATCH /v1/projects/{id}/agents/{agent_id}` accepts *from this
+ * application*, which is narrower than what the endpoint accepts.
+ *
+ * **Absent means "leave it alone".** `AgentUpdate` distinguishes an absent
+ * field from an explicit `null` by `model_fields_set`, so the optionality
+ * here is load-bearing in the same way `UpdateModelProfileBody`'s is: a
+ * field left out is not touched, and a `null` is a request to clear.
+ *
+ * **Which fields may be null is the migration's answer, not a style
+ * choice.** `role`, `description`, `instructions`, `kind` and
+ * `model_profile_id` are nullable columns in `0007_definition_core`, so
+ * clearing them is an edit. `display_name` and `labels` are `NOT NULL`, and
+ * since `83ec98a` the service refuses a null for either with a 422 naming
+ * the field rather than letting it reach the statement. The types below say
+ * the same thing a step earlier, so the request is never built.
+ *
+ * **Four fields the endpoint takes are deliberately absent here.**
+ * `agent_key` is an identifier other things quote - renaming it is its own
+ * decision, not part of an edit form. `interaction_mode` changes what an
+ * agent *is*, and the model-mode check makes it interact with
+ * `model_profile_id` in ways no current screen explains. `model_overrides`
+ * and `dispatch` are persisted and then read by nothing: the audit found no
+ * consumer in the dispatch path, so offering them would store configuration
+ * that cannot take effect.
+ *
+ * `heartbeat_ttl_seconds` *is* here, unlike the other three, because it is
+ * read: the detail page prints it and `livenessSentence` uses it to decide
+ * what "stale" means for this agent. Like `model_profile_id` it is in the
+ * API's `CONFIGURATION_FIELDS`, so sending it needs `admin`. Its bounds are
+ * the schema's own - `ge=5, le=86_400` - and it is `NOT NULL`.
+ */
+export interface UpdateAgentBody {
+  readonly display_name?: string;
+  readonly role?: string | null;
+  readonly description?: string | null;
+  readonly instructions?: string | null;
+  readonly kind?: string | null;
+  readonly labels?: Readonly<Record<string, unknown>>;
+  readonly model_profile_id?: string | null;
+  readonly heartbeat_ttl_seconds?: number;
+}
+
+/**
+ * Edit or configure an agent. 200 with the agent as it now stands.
+ *
+ * **One endpoint, two permissions.** Everything in `UpdateAgentBody` is
+ * `agent.update`, which is `member` - except `model_profile_id` and
+ * `heartbeat_ttl_seconds`, which are in `CONFIGURATION_FIELDS` and therefore
+ * also `agent.configure`, which is `admin`. Both are checked before anything
+ * is written, so a body that may rename and may not re-point the model
+ * changes neither.
+ *
+ * The refusals worth knowing, all of them the API's: 409 for an archived
+ * agent (restore it first), 409 with `field: model_profile_id` for a
+ * profile deleted mid-request, 422 with the same locator for a profile from
+ * another workspace or for a model on an agent that is not managed.
+ */
+export function updateAgent(
+  token: string,
+  projectId: string,
+  agentId: string,
+  body: UpdateAgentBody,
+): Promise<Agent> {
+  return apiFetch<Agent>(`/v1/projects/${projectId}/agents/${agentId}`, {
+    token,
+    method: "PATCH",
+    body,
+  });
+}
+
+/**
+ * Archive an agent. `admin`, 204, and nothing to parse.
+ *
+ * **`DELETE` is the method; archiving is the effect.** The row stays, with
+ * its runs, its history and its place on the island, and `archived_at` is
+ * set. There is no endpoint that deletes an agent, which is why this client
+ * has no `deleteAgent` to go with it.
+ *
+ * Archiving one that is already archived is a 409 rather than a silent
+ * success - the caller asked for a state the row is already in.
+ */
+export function archiveAgent(token: string, projectId: string, agentId: string): Promise<void> {
+  return apiFetch<void>(`/v1/projects/${projectId}/agents/${agentId}`, {
+    token,
+    method: "DELETE",
+  });
+}
+
+/**
+ * Bring an archived agent back. `admin`, and the agent as it now stands.
+ *
+ * A verb rather than a field, which is why there is no `archived_at` on
+ * `UpdateAgentBody`: the lifecycle is not a column a client may assign.
+ *
+ * **404, not 409, when the agent is not archived.** `AgentRepository.restore`
+ * answers for the archived row or for nothing, and the service turns all
+ * three causes - live agent, wrong project, unknown id - into one "Agent not
+ * found", deliberately: "restore this" about a live agent is a caller who
+ * believes something untrue either way.
+ *
+ * Nothing derived is rewritten. The agent returns with the status and
+ * heartbeat it had when it was archived, so `last_heartbeat_at` is how a
+ * reader judges whether it is really back.
+ */
+export function restoreAgent(token: string, projectId: string, agentId: string): Promise<Agent> {
+  return apiFetch<Agent>(`/v1/projects/${projectId}/agents/${agentId}/restore`, {
+    token,
+    method: "POST",
+  });
+}
+
+/**
  * When this agent's status changed, newest first.
  *
  * An agent AgentWorld runs itself has none: a managed agent reports nothing,

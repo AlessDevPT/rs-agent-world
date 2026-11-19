@@ -7,6 +7,8 @@ import type { Project } from "@/lib/api/tenancy";
 import { canCreateAgents } from "@/lib/agents/create";
 import {
   agentsEmptyState,
+  archivedToggle,
+  includeArchived,
   livenessLabel,
   livenessSentence,
   livenessTone,
@@ -31,16 +33,27 @@ export const metadata = { title: "Agents · AgentWorld" };
  * `presentation.ts` instead of a colour and a word. Nothing here infers health
  * or progress from a heartbeat.
  *
- * Archived agents are not listed: the API excludes them unless asked, and the
- * link that asks arrives in stage 1e. No counts, because the API has no
- * aggregate to count with and a number invented here would read as a fact.
+ * **Archived agents are excluded unless `?archived=1` asks for them**, which
+ * is the API's own default rather than a choice made here: a project's list
+ * should be what it is now, and an archived agent is a record of what it was.
+ * The link that asks is a plain `Link` rather than a control with state - the
+ * filter is in the URL, so it survives a reload and can be sent to somebody.
+ * No counts, because the API has no aggregate to count with and a number
+ * invented here would read as a fact.
+ *
+ * An archived row says so once, on the row, and keeps its status and
+ * liveness pills: those are still what the agent last reported, and blanking
+ * them would be inventing a second claim out of the first.
  */
 export default async function AgentsPage({
   params,
+  searchParams,
 }: {
   readonly params: Promise<{ workspaceId: string; projectId: string }>;
+  readonly searchParams: Promise<Record<string, string | string[] | undefined>>;
 }) {
   const { workspaceId, projectId } = await params;
+  const including = includeArchived((await searchParams)["archived"]);
   const { token, me } = await requireSession(`/w/${workspaceId}/p/${projectId}/agents`);
 
   // `agent.create` is `member` on the API. The link is hidden from a viewer
@@ -83,13 +96,15 @@ export default async function AgentsPage({
   let agents: Agent[] = [];
   if (project !== null) {
     try {
-      agents = await listAgents(token, projectId);
+      agents = await listAgents(token, projectId, { includeArchived: including });
     } catch (caught) {
       error = caught instanceof ApiError ? caught.problem.detail : "Could not load agents";
     }
   }
 
-  const empty = agentsEmptyState(false);
+  const agentsPath = `/w/${workspaceId}/p/${projectId}/agents`;
+  const toggle = archivedToggle(agentsPath, including);
+  const empty = agentsEmptyState(including);
 
   return (
     <section className="stack">
@@ -100,16 +115,18 @@ export default async function AgentsPage({
           reported; its heartbeat is a separate signal about whether we are still hearing
           from it.
         </p>
-        {mayCreate && (
-          <p>
-            <Link
-              className="button button--primary"
-              href={`/w/${workspaceId}/p/${projectId}/agents/new`}
-            >
-              New agent
-            </Link>
-          </p>
-        )}
+        <p>
+          {mayCreate && (
+            <>
+              <Link className="button button--primary" href={`${agentsPath}/new`}>
+                New agent
+              </Link>{" "}
+            </>
+          )}
+          <Link className="button button--quiet" href={toggle.href}>
+            {toggle.label}
+          </Link>
+        </p>
       </div>
 
       {error !== null && (
@@ -125,13 +142,7 @@ export default async function AgentsPage({
           <div className="card">
             <h2 className="card__title">{empty.headline}</h2>
             <p className="muted">{empty.detail}</p>
-            {mayCreate && (
-              <p>
-                <Link href={`/w/${workspaceId}/p/${projectId}/agents/new`}>
-                  Create the first one
-                </Link>
-              </p>
-            )}
+            {mayCreate && <p><Link href={`${agentsPath}/new`}>Create the first one</Link></p>}
           </div>
         ) : (
           <ul className="list">
@@ -143,15 +154,15 @@ export default async function AgentsPage({
                     {/* The row's own link, styled by `a.list__title` - the
                         same rule a project row uses, so the title keeps the
                         row's colour rather than the browser's link blue. */}
-                    <Link
-                      className="list__title"
-                      href={`/w/${workspaceId}/p/${projectId}/agents/${agent.id}`}
-                    >
+                    <Link className="list__title" href={`${agentsPath}/${agent.id}`}>
                       {agent.display_name}
                     </Link>{" "}
                     <span className="muted">
                       <code>{agent.agent_key}</code>
-                    </span>
+                    </span>{" "}
+                    {agent.archived_at !== null && (
+                      <span className={pillClassName("warn")}>archived</span>
+                    )}
                     <p className="muted">{heartbeat.detail}</p>
                   </div>
 

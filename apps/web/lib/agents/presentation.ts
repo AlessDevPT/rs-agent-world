@@ -241,6 +241,39 @@ export function executionsEmptyState(mode: AgentInteractionMode): Sentence {
   };
 }
 
+/**
+ * Whether the agent list was asked to include archived agents.
+ *
+ * One query parameter, `archived=1`, and anything else is false - including
+ * `archived=0`, `archived=false` and a repeated parameter, which Next hands
+ * over as an array. The default is the API's own: `include_archived=false`,
+ * so a plain URL shows the project as it stands rather than as it has ever
+ * been.
+ *
+ * A function rather than a ternary in the page because it is the only part
+ * of the toggle a test can reach: `vitest` here runs in node with no DOM.
+ */
+export function includeArchived(param: string | readonly string[] | undefined): boolean {
+  return param === "1";
+}
+
+/**
+ * The link that flips the archived filter, and what it should say.
+ *
+ * The label names what the reader will get, not what they are looking at -
+ * "Show archived too" while they are hidden, "Hide archived" while they are
+ * not - because a control that names its own current state reads as a status
+ * and gets clicked by mistake.
+ */
+export function archivedToggle(
+  agentsPath: string,
+  including: boolean,
+): { readonly label: string; readonly href: string } {
+  return including
+    ? { label: "Hide archived", href: agentsPath }
+    : { label: "Show archived too", href: `${agentsPath}?archived=1` };
+}
+
 export function agentsEmptyState(includingArchived: boolean): Sentence {
   return includingArchived
     ? {

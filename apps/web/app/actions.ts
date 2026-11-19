@@ -18,7 +18,16 @@ import { revalidatePath } from "next/cache";
 import { redirect } from "next/navigation";
 
 import { createFailureField } from "@/lib/agents/create";
-import { createAgent, type CreateAgentBody } from "@/lib/api/agents";
+import { sentFields, unsupportedField, unsupportedNull } from "@/lib/agents/edit";
+import {
+  archiveAgent,
+  createAgent,
+  restoreAgent,
+  updateAgent,
+  type Agent,
+  type CreateAgentBody,
+  type UpdateAgentBody,
+} from "@/lib/api/agents";
 import { ApiError, type Problem } from "@/lib/api/client";
 import {
   createCredential,
@@ -62,6 +71,20 @@ export interface ActionFailure {
    * `providerSlug`.
    */
   readonly field?: string | undefined;
+  /**
+   * The HTTP status the API answered with, when the failure came from it.
+   *
+   * Absent for a refusal this layer made without asking - an empty PATCH,
+   * a missing name - which is the distinction worth keeping: a caller can
+   * tell "the server said no" from "we did not bother the server".
+   *
+   * Carried because the lifecycle actions have refusals that differ only by
+   * status. Archiving an agent somebody else archived a moment ago is a 409
+   * and arguably a success from the operator's point of view; the same call
+   * from a member is a 403 and is not. The sentences are the API's and are
+   * worth showing either way, but only the status tells them apart reliably.
+   */
+  readonly status?: number | undefined;
 }
 
 /**
@@ -81,6 +104,7 @@ function failure(error: unknown): ActionFailure {
       message: problemMessage(error.problem),
       requestId: error.requestId,
       field: error.problem.field,
+      status: error.problem.status,
     };
   }
   return {
@@ -445,4 +469,156 @@ export async function createAgentAction(
 
   revalidatePath(`/w/${workspaceId}/p/${projectId}/agents`);
   redirect(`/w/${workspaceId}/p/${projectId}/agents/${agentId}`);
+}
+
+// ------------------------------------------------- editing and lifecycle ---
+//
+// **Typed bodies, like the model-profile actions and unlike the credential
+// ones.** Nothing here is a secret that must reach the server without
+// touching client state, and an agent's PATCH body is a decision - which
+// fields moved, and whether an empty box means `null` or "leave it alone".
+// That decision is `agentEdits` in `lib/agents/edit.ts`, where it is tested;
+// these actions carry its answer and add nothing to it.
+//
+// **Two routes are revalidated after every success, never before one.** The
+// agent's own page is the obvious one; the project's list carries the name,
+// the role and the archived state, so an edit or a lifecycle change that
+// refreshed only the detail page would leave the list telling a story the
+// detail page had already corrected. A failed call revalidates neither:
+// discarding cached data for a request that changed nothing is work for no
+// reason, and it implies to the reader that something happened.
+//
+// The roles are the API's. `agent.update` is `member`; naming a model
+// profile is also `agent.configure`, and archiving and restoring are
+// `agent.archive` and `agent.restore` - all three `admin`. A page that hides
+// a button is a convenience, and these actions do not re-implement the
+// boundary: an unauthorised call reaches the endpoint and comes back a 403,
+// which is returned rather than translated.
+
+function agentPaths(workspaceId: string, projectId: string, agentId: string): readonly string[] {
+  const list = `/w/${workspaceId}/p/${projectId}/agents`;
+  return [`${list}/${agentId}`, list];
+}
+
+/**
+ * Change an agent's name, role, description, instructions, kind, labels, or
+ * the two pieces of configuration this milestone offers - its model profile
+ * and its heartbeat limit.
+ *
+ * **An empty body is refused here rather than sent**, exactly as
+ * `updateModelProfileAction` refuses one: `AgentService.update` accepts a
+ * PATCH that writes no column and records an `agent.update` audit row for
+ * it, so forwarding one would leave a trail of edits that never happened.
+ *
+ * **A field outside this milestone's set is refused, not dropped.** The
+ * endpoint would also accept `interaction_mode`, `model_overrides` and
+ * `dispatch`; an action that silently removed them would answer "saved" to a
+ * request it did not carry out. `UpdateAgentBody` keeps them out of the
+ * type, and `unsupportedField` keeps them out of the request, because an
+ * action is reachable with whatever a browser posts.
+ *
+ * The role split is the API's and is not re-implemented here: a member who
+ * sends `model_profile_id` or `heartbeat_ttl_seconds` gets a 403 for the
+ * whole request. The form declines to draw those two for them; this carries
+ * whatever arrives and reports what the endpoint says about it.
+ *
+ * **A `null` for a `NOT NULL` column is refused here too**, with the field
+ * the API would have named. That check is not this layer inventing a rule -
+ * it is the same rule, answered one step earlier, and the body it stops is
+ * one `UpdateAgentBody` already makes unconstructable in TypeScript.
+ *
+ * Everything else the API refuses comes back as it was written: the 403 for
+ * a member naming a model profile, the 409 for an archived agent, the 409
+ * for a profile deleted mid-request and the 422 for one from another
+ * workspace - the last two both carrying `field: model_profile_id`, which
+ * `failure` keeps so a form can put the message on the select.
+ */
+export async function updateAgentAction(
+  workspaceId: string,
+  projectId: string,
+  agentId: string,
+  body: UpdateAgentBody,
+): Promise<ActionResult<{ agent: Agent }>> {
+  const unsupported = unsupportedField(body);
+  if (unsupported !== undefined) {
+    return {
+      ok: false,
+      message: `'${unsupported}' is not a field this form edits`,
+      field: unsupported,
+    };
+  }
+  const nulled = unsupportedNull(body);
+  if (nulled !== undefined) {
+    return { ok: false, message: `'${nulled}' cannot be null`, field: nulled };
+  }
+  if (sentFields(body).length === 0) {
+    return { ok: false, message: "Nothing was changed" };
+  }
+
+  const { token } = await requireSession();
+  try {
+    const agent = await updateAgent(token, projectId, agentId, body);
+    for (const path of agentPaths(workspaceId, projectId, agentId)) revalidatePath(path);
+    return { ok: true, agent };
+  } catch (error) {
+    return failure(error);
+  }
+}
+
+/**
+ * Archive an agent. `admin`.
+ *
+ * Archived, not deleted: the agent keeps its runs, its history and its place
+ * on the island, and `restoreAgentAction` is the way back. There is no
+ * action that deletes one, because there is no endpoint that does.
+ *
+ * **A 409 is returned, not smoothed over.** It means the agent is already
+ * archived - somebody else got there first, or a button was pressed twice -
+ * and the caller decides whether that is worth showing. Turning it into
+ * `{ ok: true }` here would be this layer claiming to have done something it
+ * did not do.
+ */
+export async function archiveAgentAction(
+  workspaceId: string,
+  projectId: string,
+  agentId: string,
+): Promise<ActionResult> {
+  const { token } = await requireSession();
+  try {
+    await archiveAgent(token, projectId, agentId);
+  } catch (error) {
+    return failure(error);
+  }
+  for (const path of agentPaths(workspaceId, projectId, agentId)) revalidatePath(path);
+  return { ok: true };
+}
+
+/**
+ * Restore an archived agent. `admin`.
+ *
+ * The agent comes back with the status and heartbeat it had when it was
+ * archived - nothing derived is rewritten - so the returned agent is worth
+ * handing back to the caller rather than discarding: `liveness` and
+ * `seconds_since_heartbeat` on it are how a reader judges whether it is
+ * really back, and they are measured by the server against the same instant.
+ *
+ * **A 404 here is not necessarily a missing agent.** The service answers one
+ * for a live agent, an agent in another project and an unknown id alike,
+ * deliberately. It is returned as it arrived; a caller that rephrased it as
+ * "this agent does not exist" would be guessing at which of the three.
+ */
+export async function restoreAgentAction(
+  workspaceId: string,
+  projectId: string,
+  agentId: string,
+): Promise<ActionResult<{ agent: Agent }>> {
+  const { token } = await requireSession();
+  let agent: Agent;
+  try {
+    agent = await restoreAgent(token, projectId, agentId);
+  } catch (error) {
+    return failure(error);
+  }
+  for (const path of agentPaths(workspaceId, projectId, agentId)) revalidatePath(path);
+  return { ok: true, agent };
 }
