@@ -19,16 +19,19 @@ import { redirect } from "next/navigation";
 
 import { createFailureField } from "@/lib/agents/create";
 import { sentFields, unsupportedField, unsupportedNull } from "@/lib/agents/edit";
+import { sampleProblem, testRefusal } from "@/lib/agents/test";
 import {
   archiveAgent,
   createAgent,
   restoreAgent,
+  testAgent,
   updateAgent,
   type Agent,
   type CreateAgentBody,
   type UpdateAgentBody,
 } from "@/lib/api/agents";
 import { ApiError, type Problem } from "@/lib/api/client";
+import type { Execution } from "@/lib/api/executions";
 import {
   createCredential,
   deleteCredential,
@@ -85,6 +88,26 @@ export interface ActionFailure {
    * worth showing either way, but only the status tells them apart reliably.
    */
   readonly status?: number | undefined;
+  /**
+   * The `code` of each entry in the problem document's `errors` array, in the
+   * order the API sent them. Absent when there was no array.
+   *
+   * **Why this exists, when `message` already carries the sentences.** A
+   * problem document has no top-level code - `problem()` puts the error's
+   * code only in `type`, as the last segment of a URL - so `status` is the
+   * whole of what a caller can switch on today. That is enough while a
+   * status means one thing per endpoint, and it stops being enough at
+   * `agent.test`: archived, `observed` and `dispatchable` are three
+   * different refusals, all 422, differing only by the `code` inside
+   * `errors[]`. A screen that wants to say "restore it first" rather than
+   * "this agent cannot be tested" has to read them.
+   *
+   * Codes, not the entries. `pointer` is `/agents/<uuid>` here, which is
+   * correct for a machine and unreadable on a screen, and `detail` is
+   * already in `message` by way of `problemMessage`. So the one part that
+   * was being dropped is the one part carried.
+   */
+  readonly codes?: readonly string[] | undefined;
 }
 
 /**
@@ -105,6 +128,7 @@ function failure(error: unknown): ActionFailure {
       requestId: error.requestId,
       field: error.problem.field,
       status: error.problem.status,
+      codes: problemCodes(error.problem),
     };
   }
   return {
@@ -134,6 +158,26 @@ function problemMessage(problem: Problem): string {
   return `${problem.detail}: ${described
     .map((entry) => `${entry.pointer === "" ? "the request" : entry.pointer} ${entry.detail}`)
     .join("; ")}`;
+}
+
+/**
+ * The codes a problem document's `errors` array carries, or nothing.
+ *
+ * `undefined` rather than `[]` for an absent or codeless array, so the
+ * failure object a caller receives is unchanged for every error that has no
+ * findings - which is all of them outside the publish and compile refusals.
+ *
+ * Blank codes are dropped. `errors` is also where FastAPI's own validation
+ * failures land, and those carry a pydantic error type (`string_too_short`,
+ * `missing`) rather than a domain code; they are passed through unfiltered
+ * because this function cannot tell which array it is looking at, and a
+ * caller that only knows three codes will match none of them.
+ */
+function problemCodes(problem: Problem): readonly string[] | undefined {
+  const codes = (problem.errors ?? [])
+    .map((entry) => entry.code)
+    .filter((code) => typeof code === "string" && code !== "");
+  return codes.length === 0 ? undefined : codes;
 }
 
 function text(form: FormData, field: string): string {
@@ -495,9 +539,13 @@ export async function createAgentAction(
 // boundary: an unauthorised call reaches the endpoint and comes back a 403,
 // which is returned rather than translated.
 
+function agentDetailPath(workspaceId: string, projectId: string, agentId: string): string {
+  return `/w/${workspaceId}/p/${projectId}/agents/${agentId}`;
+}
+
 function agentPaths(workspaceId: string, projectId: string, agentId: string): readonly string[] {
   const list = `/w/${workspaceId}/p/${projectId}/agents`;
-  return [`${list}/${agentId}`, list];
+  return [agentDetailPath(workspaceId, projectId, agentId), list];
 }
 
 /**
@@ -621,4 +669,78 @@ export async function restoreAgentAction(
   }
   for (const path of agentPaths(workspaceId, projectId, agentId)) revalidatePath(path);
   return { ok: true, agent };
+}
+
+/**
+ * Run this agent once against a sample input. `member`.
+ *
+ * **What is returned is an acceptance, not a result.** The API answers 202
+ * with an execution whose `status` is `pending` or `running` and whose
+ * `output` is `null`: the row exists, the model has not been asked anything
+ * yet, and the answer arrives later on that execution. So this hands the
+ * execution back rather than a verdict, and a caller that reported "the test
+ * passed" from an `ok: true` here would be describing a turn that has not
+ * happened. The execution is returned precisely so a screen can link to
+ * where the answer will be.
+ *
+ * **A blank sample is refused here rather than sent.** `AgentTestRequest`
+ * has `min_length=1` and does not strip, so `"   "` is a request the API
+ * accepts - it publishes a harness, dispatches a turn and asks a model to
+ * answer three spaces. The judgement is `sampleProblem`'s, in
+ * `lib/agents/test.ts`, where it is tested; this carries its answer. What
+ * reaches the API is the sample **as typed**: trailing newlines and leading
+ * indentation are part of a prompt, and normalising them here would change
+ * the question the agent is asked.
+ *
+ * **Only the agent's own page is revalidated, and only after the API accepts
+ * it** - which is the one place these agent actions differ from the others
+ * beside them. A test writes no status, no liveness and no heartbeat
+ * history: `GET .../status-history` stays empty, and the only reader whose
+ * answer changes is this agent's execution listing. The project's agent list
+ * carries the name, the role, the status and the archived state, none of
+ * which a test can touch, so discarding its cache would be work for no
+ * reason and would imply to the next reader that something there moved.
+ *
+ * Nothing about the mode or the archived state is checked here. The API
+ * refuses an archived, `observed` or `dispatchable` agent with a 422 whose
+ * `errors[]` names which - `agent_archived`, `observed_agent`,
+ * `dispatchable_agent` - and `failure` now carries those codes through as
+ * `codes` so a screen can answer with a remedy. The gate in
+ * `agentTestability` is for drawing the control; the endpoint is the
+ * boundary, and a 403, 404, 409 or 422 comes back as it was written.
+ *
+ * **The one message this action rewrites, and why.** `problemMessage`
+ * appends each `errors[]` entry as `"<pointer> <detail>"`, which is right
+ * for a publish refusal whose pointers are `/steps/0/agent_key` and wrong
+ * for this one, whose pointer is `/agents/<uuid>`: every component renders
+ * `message` directly, so the default would put a raw id on the screen. When
+ * the codes name a refusal this release can explain, its sentence is used
+ * instead - the same words `agentTestability` would have shown had the gate
+ * caught it, so the two routes to the same refusal read the same. Only the
+ * sentence changes; `status`, `field`, `requestId` and `codes` are the
+ * API's, and a refusal with no code this release knows keeps the API's own
+ * message rather than being replaced by a guess.
+ */
+export async function testAgentAction(
+  workspaceId: string,
+  projectId: string,
+  agentId: string,
+  input: string,
+): Promise<ActionResult<{ execution: Execution }>> {
+  const sample = sampleProblem(input);
+  if (!sample.ok) {
+    return { ok: false, message: sample.message, field: sample.field };
+  }
+
+  const { token } = await requireSession();
+  let execution: Execution;
+  try {
+    execution = await testAgent(token, projectId, agentId, { input: sample.sample });
+  } catch (error) {
+    const refused = failure(error);
+    const known = testRefusal(refused.codes);
+    return known === null ? refused : { ...refused, message: known.detail };
+  }
+  revalidatePath(agentDetailPath(workspaceId, projectId, agentId));
+  return { ok: true, execution };
 }

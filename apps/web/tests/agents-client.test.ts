@@ -12,8 +12,10 @@ import {
   listRuns,
   listStatusHistory,
   restoreAgent,
+  testAgent,
   updateAgent,
 } from "@/lib/api/agents";
+import { ApiError } from "@/lib/api/client";
 
 interface Call {
   readonly url: string;
@@ -192,6 +194,94 @@ describe("the agents client", () => {
       expect(call.init.headers["content-type"]).toBeUndefined();
       expect(call.init.headers["authorization"]).toBe("Bearer t");
     }
+  });
+
+  it("posts a test to the project-nested path with the sample as its only field", async () => {
+    // The route is nested under the project like every other agent route -
+    // the flat `/v1/agents/{id}/test` of the design document is not served -
+    // and `AgentTestRequest` is `extra="forbid"`, so one field is not a
+    // minimum here, it is the whole of what may be sent.
+    const { calls } = captureFetch({});
+
+    await testAgent("t", "p-1", "a-1", { input: "Summarise the fintech funding news." });
+
+    expect(path(calls[0]!.url)).toBe("/v1/projects/p-1/agents/a-1/test");
+    expect(calls[0]!.init.method).toBe("POST");
+    expect(calls[0]!.init.headers["content-type"]).toBe("application/json");
+    expect(calls[0]!.init.headers["authorization"]).toBe("Bearer t");
+    expect(JSON.parse(String(calls[0]!.init.body))).toEqual({
+      input: "Summarise the fintech funding news.",
+    });
+  });
+
+  it("returns the accepted execution, which has not answered anything yet", async () => {
+    // The 202 body: the row exists and the turn has not happened. A client
+    // that typed this as a result would be describing a reply that has not
+    // been asked for.
+    const accepted = {
+      id: "e-1",
+      workflow_id: "w-9",
+      workflow_version_id: "v-9",
+      status: "running",
+      initiator_kind: "user",
+      initiator_label: "someone@example.com",
+      input: { input: "Say hello." },
+      output: null,
+      error: null,
+      created_at: "2026-11-19T10:00:00Z",
+      started_at: "2026-11-19T10:00:00Z",
+      finished_at: null,
+    };
+    // 202 explicitly, not the 200 `captureFetch` stubs: the status is the
+    // half of this endpoint's contract that says the turn has not happened.
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => ({ ok: true, status: 202, statusText: "", json: async () => accepted })),
+    );
+
+    const execution = await testAgent("t", "p-1", "a-1", { input: "Say hello." });
+
+    expect(execution).toEqual(accepted);
+    expect(execution.output).toBeNull();
+    expect(execution.finished_at).toBeNull();
+  });
+
+  it("preserves an agent_not_testable problem, findings and all", async () => {
+    // The refusal that matters: three different reasons share one status,
+    // and only `errors[].code` tells them apart. The pointer is carried as
+    // the API wrote it; turning it into a sentence is the action's job.
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => ({
+        ok: false,
+        status: 422,
+        statusText: "",
+        json: async () => ({
+          type: "https://agentworld.dev/problems/agent_not_testable",
+          title: "Agent not testable",
+          status: 422,
+          detail: "This agent cannot be tested",
+          instance: "req-77",
+          errors: [
+            {
+              pointer: "/agents/9a1f0c6e-0000-4000-8000-000000000001",
+              code: "observed_agent",
+              detail: "'watcher' only reports its own activity",
+            },
+          ],
+        }),
+      })),
+    );
+
+    const caught = await testAgent("t", "p-1", "a-1", { input: "Say hello." }).catch(
+      (error: unknown) => error,
+    );
+
+    expect(caught).toBeInstanceOf(ApiError);
+    if (!(caught instanceof ApiError)) return;
+    expect(caught.problem.status).toBe(422);
+    expect(caught.requestId).toBe("req-77");
+    expect(caught.problem.errors?.[0]?.code).toBe("observed_agent");
   });
 
   it("agrees with the API about its own caps", () => {

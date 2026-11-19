@@ -20,6 +20,12 @@
  */
 
 import { apiFetch } from "./client";
+// Type-only, and back along an import this file is already on the other end
+// of: `executions.ts` defines `Execution` *from* `AgentExecution` here, so
+// the two shapes cannot drift. Erased at compile time, so the cycle exists
+// only in the type graph - which is the point of writing it `import type`
+// rather than letting it become a runtime one later.
+import type { Execution } from "./executions";
 import type { Project } from "./tenancy";
 
 export type AgentInteractionMode = "managed" | "dispatchable" | "observed";
@@ -360,6 +366,65 @@ export function restoreAgent(token: string, projectId: string, agentId: string):
   return apiFetch<Agent>(`/v1/projects/${projectId}/agents/${agentId}/restore`, {
     token,
     method: "POST",
+  });
+}
+
+/**
+ * The sample an agent is tested against, and nothing else.
+ *
+ * One field, because the endpoint takes one: `AgentTestRequest` is
+ * `extra="forbid"`, so a body carrying a model, a temperature or a system
+ * prompt is a 422 rather than a request with the extras ignored. That is the
+ * endpoint's answer to a real question - a test runs the agent **as
+ * configured**, and overriding its configuration for one run would answer a
+ * different one - so this type has no room to ask it.
+ *
+ * 1 to 20 000 characters. The API does not strip whitespace, so `"   "` is a
+ * valid request as far as the schema is concerned; `sampleProblem` in
+ * `lib/agents/test.ts` is where that is refused, before money is spent
+ * asking the model nothing.
+ */
+export interface TestAgentBody {
+  readonly input: string;
+}
+
+/**
+ * Run this agent once against a sample input. `member`, and **202**.
+ *
+ * **A real execution, not a preview.** It spends money, it reaches the
+ * provider with the agent's configured model and credential, it produces the
+ * ordinary events, and it appears in `GET /executions`. The first test of an
+ * agent also creates and publishes the one-step workflow it runs; later tests
+ * reuse it.
+ *
+ * **What comes back is an acceptance, not an answer.** The execution row
+ * exists when this resolves and the turn has not happened: `status` is
+ * `pending` or `running` and `output` is `null`. The answer arrives later on
+ * the execution's own `output`, through `getExecution` - there is no second
+ * result endpoint, and a caller that treated this return value as a result
+ * would be reporting a model's reply that has not been asked for yet.
+ *
+ * The return type is `Execution` rather than `AgentExecution` because this
+ * route returns the shared `ExecutionView`: `is_test_harness` is added by the
+ * agent's own listing and by nothing else, so it is not here to be read.
+ *
+ * The refusals, all the API's own: 403 for a viewer; 404 for an unknown agent
+ * or one in another project; 422 for an empty or over-long sample, for an
+ * extra field, and - as `agent_not_testable`, with the reason in `errors[]` -
+ * for an archived, `observed` or `dispatchable` agent; 409 when an authored
+ * workflow already holds the harness's slug. Note the archived case: a 422
+ * here, where `PATCH` gives a 409.
+ */
+export function testAgent(
+  token: string,
+  projectId: string,
+  agentId: string,
+  body: TestAgentBody,
+): Promise<Execution> {
+  return apiFetch<Execution>(`/v1/projects/${projectId}/agents/${agentId}/test`, {
+    token,
+    method: "POST",
+    body,
   });
 }
 
