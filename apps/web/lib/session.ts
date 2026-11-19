@@ -32,6 +32,20 @@ export type SessionState =
    * other indefinitely.
    */
   | { readonly kind: "token-rejected" }
+  /**
+   * A token the API accepts, belonging to somebody it will not serve.
+   *
+   * Kept apart from `api-unreachable` for the same reason `token-rejected` is
+   * kept apart from `signed-out`: they are different facts and they need
+   * different words. Folding a 403 into "the backend is down" told a working
+   * account to go and check a healthy service, and said nothing about the
+   * only thing that resolves it.
+   */
+  | {
+      readonly kind: "forbidden";
+      readonly message: string;
+      readonly requestId?: string | undefined;
+    }
   | {
       readonly kind: "api-unreachable";
       readonly message: string;
@@ -65,7 +79,8 @@ export async function readSession(): Promise<SessionState> {
     return { kind: "signed-in", token, me };
   } catch (error) {
     const status = error instanceof ApiError ? error.problem.status : null;
-    if (kindForApiFailure(status) === "token-rejected") {
+    const kind = kindForApiFailure(status);
+    if (kind === "token-rejected") {
       // A token Supabase still accepts but the API does not - a mismatched
       // audience or issuer, or an API pointed at another Supabase project.
       // Deliberately not `signed-out`: there *is* a session, and saying
@@ -73,11 +88,13 @@ export async function readSession(): Promise<SessionState> {
       // out again on the strength of the cookie that caused this.
       return { kind: "token-rejected" };
     }
-    return {
-      kind: "api-unreachable",
-      message: error instanceof Error ? error.message : "Unknown error",
-      requestId: error instanceof ApiError ? error.requestId : undefined,
-    };
+    // The API's own sentence for a refusal, because it is the one that knows
+    // what was refused; the generic fallback is for a failure that never
+    // reached it.
+    const message = error instanceof Error ? error.message : "Unknown error";
+    const requestId = error instanceof ApiError ? error.requestId : undefined;
+    if (kind === "forbidden") return { kind: "forbidden", message, requestId };
+    return { kind: "api-unreachable", message, requestId };
   }
 }
 

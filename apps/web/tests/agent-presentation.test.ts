@@ -15,6 +15,7 @@ import {
   agentsEmptyState,
   executionStatusTone,
   executionsEmptyState,
+  expectsHeartbeat,
   formatDuration,
   formatSeconds,
   formatSilence,
@@ -109,6 +110,31 @@ describe("the liveness sentence", () => {
     expect(livenessTone("not_applicable")).toBe("neutral");
     // Overdue is worth noticing and is not a failure, so never `bad`.
     expect(livenessTone("stale")).not.toBe("bad");
+  });
+
+  it("expects a heartbeat from everything except an agent the API excused", () => {
+    // The detail page used to decide this for itself, with
+    // `interaction_mode !== "managed"` - the API's own rule, written a second
+    // time. This reads the verdict instead, so the two cannot drift.
+    expect(expectsHeartbeat({ liveness: "fresh" })).toBe(true);
+    expect(expectsHeartbeat({ liveness: "stale" })).toBe(true);
+    expect(expectsHeartbeat({ liveness: "never_reported" })).toBe(true);
+    expect(expectsHeartbeat({ liveness: "not_applicable" })).toBe(false);
+  });
+
+  it("hides the heartbeat figures exactly where the sentence says there are none", () => {
+    // The pairing that matters on the page: the card can never say "no
+    // heartbeat expected" while a TTL and a last-heartbeat time sit under it
+    // inviting the reader to conclude something is late.
+    for (const liveness of LIVENESS) {
+      const excused =
+        livenessSentence({
+          liveness,
+          seconds_since_heartbeat: null,
+          heartbeat_ttl_seconds: 60,
+        }).headline === "No heartbeat expected";
+      expect(expectsHeartbeat({ liveness })).toBe(!excused);
+    }
   });
 });
 

@@ -30,6 +30,8 @@ export default async function StartPage(): Promise<React.ReactElement> {
   switch (session.kind) {
     case "unconfigured":
       return <Unconfigured />;
+    case "forbidden":
+      return <Forbidden message={session.message} requestId={session.requestId} />;
     case "api-unreachable":
       return <ApiDown message={session.message} requestId={session.requestId} />;
     // `return redirect(...)` rather than a bare call: `redirect` is typed
@@ -91,6 +93,54 @@ function Unconfigured() {
           key is not, and AgentWorld never needs it.
         </p>
       </div>
+    </section>
+  );
+}
+
+/**
+ * The API knows who you are and will not serve you.
+ *
+ * Deliberately not the sign-in form and deliberately not "the backend is
+ * down". Signing in again produces the same token and the same refusal, and
+ * the backend answering 403 is a backend that is working - so the only thing
+ * on offer here is the API's own sentence, the request id to quote, and the
+ * fact that somebody else has to act.
+ */
+function Forbidden({
+  message,
+  requestId,
+}: {
+  readonly message: string;
+  readonly requestId?: string | undefined;
+}) {
+  return (
+    <section className="stack stack--narrow">
+      <div>
+        <h1 className="title">This account cannot be served</h1>
+        <p className="muted">
+          You are signed in and the backend is answering - it is refusing this account
+          rather than failing. Signing out and back in would produce the same token and
+          the same answer.
+        </p>
+      </div>
+
+      <div className="card">
+        <h2 className="card__title">What the API said</h2>
+        <p className="muted">{message}</p>
+        {requestId !== undefined && (
+          <p className="muted">
+            Request id <code>{requestId}</code> - quote it when asking for access.
+          </p>
+        )}
+        <p className="muted">
+          Someone with access to this deployment has to grant it; there is nothing to
+          change on this side.
+        </p>
+      </div>
+
+      <p className="muted">
+        <Link href="/">Try again</Link>
+      </p>
     </section>
   );
 }

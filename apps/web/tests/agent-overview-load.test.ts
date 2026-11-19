@@ -92,13 +92,18 @@ function path(url: string): string {
  * rather than on a missing fixture - the difference between proving the order
  * and proving the stub was incomplete.
  */
-function captureFetch(replies: Readonly<Record<string, Reply>>): { paths: string[] } {
+function captureFetch(replies: Readonly<Record<string, Reply>>): {
+  paths: string[];
+  headers: Record<string, string>[];
+} {
   const paths: string[] = [];
+  const headers: Record<string, string>[] = [];
   vi.stubGlobal(
     "fetch",
-    vi.fn(async (url: string) => {
+    vi.fn(async (url: string, init?: { headers?: Record<string, string> }) => {
       const asked = path(url);
       paths.push(asked);
+      headers.push(init?.headers ?? {});
       const reply = replies[asked];
       if (reply === undefined) throw new Error(`unstubbed request: ${asked}`);
       return {
@@ -109,7 +114,7 @@ function captureFetch(replies: Readonly<Record<string, Reply>>): { paths: string
       };
     }),
   );
-  return { paths };
+  return { paths, headers };
 }
 
 afterEach(() => {
@@ -126,6 +131,54 @@ describe("loadAgentOverview", () => {
     // The project first: its workspace is what the path has to match, and
     // nothing agent-scoped may be requested before that is settled.
     expect(paths).toEqual([PROJECT_PATH, AGENT_PATH]);
+  });
+
+  it("forwards the caller's token on every request it makes", async () => {
+    // The loader takes a token and nothing here had ever checked it arrived.
+    // These reads are tenant-scoped by the bearer, so a request that dropped
+    // it would be answered as somebody else - or, more likely, as nobody, and
+    // the page would report a missing agent for one that exists.
+    const { headers } = captureFetch({ [PROJECT_PATH]: ok(PROJECT), [AGENT_PATH]: ok(AGENT) });
+
+    await loadAgentOverview("token-1", WORKSPACE, "p-1", "a-1");
+
+    expect(headers).toHaveLength(2);
+    for (const sent of headers) {
+      expect(sent["authorization"]).toBe("Bearer token-1");
+    }
+  });
+
+  it("treats a malformed project id as not found rather than printing the API's words", async () => {
+    // A path parameter that is not a uuid is rejected by FastAPI's request
+    // validation, whose `detail` is the literal "1 field(s) failed
+    // validation" - true about the request and meaningless to somebody who
+    // followed a mistyped link. An id that cannot name a project is a project
+    // that is not there.
+    const malformed = "/v1/projects/not-a-uuid";
+    const { paths } = captureFetch({
+      [malformed]: problem(422, "1 field(s) failed validation"),
+      [AGENT_PATH]: ok(AGENT),
+    });
+
+    const result = await loadAgentOverview("t", WORKSPACE, "not-a-uuid", "a-1");
+
+    expect(result).toEqual({ kind: "not_found" });
+    // And it stops there: an id that cannot name a project is not a path to
+    // go on asking agent questions about.
+    expect(paths).toEqual([malformed]);
+  });
+
+  it("treats a malformed agent id as not found", async () => {
+    const malformed = "/v1/projects/p-1/agents/not-a-uuid";
+    const { paths } = captureFetch({
+      [PROJECT_PATH]: ok(PROJECT),
+      [malformed]: problem(422, "1 field(s) failed validation"),
+    });
+
+    const result = await loadAgentOverview("t", WORKSPACE, "p-1", "not-a-uuid");
+
+    expect(result).toEqual({ kind: "not_found" });
+    expect(paths).toEqual([PROJECT_PATH, malformed]);
   });
 
   it("refuses a project reached through the wrong workspace, and asks for no agent", async () => {
@@ -238,6 +291,33 @@ describe("loadAgentOverview", () => {
     const result = await loadAgentOverview("t", WORKSPACE, "p-1", "a-1");
 
     expect(result).toEqual({ kind: "error", message: "Could not load this project" });
+  });
+
+  it("has its own sentence when the agent request is the one that dies", async () => {
+    // The second `outcomeOf` call site, which had no test: its fallback names
+    // the agent, not the project, and a copy-paste there would have told
+    // somebody the project could not be loaded on a page whose project had
+    // just loaded fine.
+    let first = true;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => {
+        if (first) {
+          first = false;
+          return {
+            ok: true,
+            status: 200,
+            statusText: "",
+            json: async () => PROJECT,
+          };
+        }
+        throw new TypeError("fetch failed");
+      }),
+    );
+
+    const result = await loadAgentOverview("t", WORKSPACE, "p-1", "a-1");
+
+    expect(result).toEqual({ kind: "error", message: "Could not load this agent" });
   });
 });
 

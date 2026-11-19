@@ -32,6 +32,7 @@ const KINDS = [
   "unconfigured",
   "signed-out",
   "token-rejected",
+  "forbidden",
   "api-unreachable",
   "signed-in",
 ] as const satisfies readonly SessionKind[];
@@ -43,18 +44,35 @@ describe("kindForApiFailure", () => {
     expect(kindForApiFailure(401)).toBe("token-rejected");
   });
 
+  it("calls a 403 forbidden, not an outage", () => {
+    // The API answering 403 is the API working. Reporting that as
+    // `api-unreachable` put "the backend is not answering" in front of an
+    // account whose backend was answering perfectly, and sent whoever read it
+    // to go and check a healthy service.
+    expect(kindForApiFailure(403)).toBe("forbidden");
+  });
+
   it.each([
-    ["a 403, which is authorization and not authentication", 403],
     ["a 404", 404],
     ["a 429", 429],
     ["a 500", 500],
     ["a 503, which is the identity provider's key set being unreachable", 503],
   ])("does not send %s to a sign-in form", (_label, status) => {
     // The constraint this pins: an outage must never be reported as a signed-
-    // out state, and a 403 is the API saying the caller is authenticated and
-    // still not allowed.
+    // out state.
     expect(kindForApiFailure(status)).toBe("api-unreachable");
   });
+
+  it.each([401, 403, 404, 429, 500, 503, null])(
+    "never answers a sign-in form for %s unless the credential is the problem",
+    (status) => {
+      // Only 401 may send somebody to sign in again; everything else is
+      // either an authorization fact or an outage, and a new token fixes
+      // neither.
+      const kind = kindForApiFailure(status);
+      expect(kind === "token-rejected").toBe(status === 401);
+    },
+  );
 
   it("treats a thrown value with no status as an outage", () => {
     // What `fetch` itself throws when there is nothing listening: no problem
@@ -77,6 +95,7 @@ describe("guardDestination", () => {
 
   it.each([
     ["unconfigured", "unconfigured"],
+    ["forbidden", "forbidden"],
     ["api-unreachable", "api-unreachable"],
   ] as const)("sends %s to the start page, which explains it", (_label, kind) => {
     // No `next` on these: the start page is not a sign-in form and has nowhere
@@ -113,6 +132,7 @@ describe("loginDestination", () => {
 
   it.each([
     ["unconfigured", "unconfigured"],
+    ["forbidden", "forbidden"],
     ["api-unreachable", "api-unreachable"],
   ] as const)("sends %s to the start page instead of a form that leads nowhere", (_l, kind) => {
     expect(loginDestination(kind, DEEP)).toEqual({ kind: "redirect", to: "/" });
@@ -195,9 +215,10 @@ function hop(
   if (page === "/login") return login(kind, next);
   switch (kind) {
     case "unconfigured":
+    case "forbidden":
     case "api-unreachable":
-      // The start page renders both of these; it is the page that explains
-      // which environment state the app is in.
+      // The start page renders all three; it is the page that explains which
+      // state the app - or this account - is in.
       return { kind: "render" };
     case "signed-out":
     case "token-rejected":

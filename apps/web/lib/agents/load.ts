@@ -217,7 +217,21 @@ export async function loadAgentCreation(
  */
 function outcomeOf(caught: unknown, fallback: string): LoadFailure {
   if (caught instanceof ApiError) {
-    if (caught.problem.status === 404) return NOT_FOUND;
+    // **422 joins 404 here, and only because of what these calls are.** Every
+    // request routed through this function is a `GET` whose only inputs are
+    // uuids out of the URL, so the single thing FastAPI's request validation
+    // can reject is one of those uuids - and an id that is not a uuid cannot
+    // name a project or an agent. "No such agent" is the honest answer, and
+    // it is the same answer the API gives for a well-formed id that names
+    // nothing, which is what stops a visitor learning anything by guessing.
+    //
+    // The alternative was what this used to do: print `problem.detail`, which
+    // for that handler is the literal sentence "1 field(s) failed validation"
+    // - true, about the request, and meaningless to the person who mistyped
+    // a link. `loadAgentExecutions` keeps its own `catch` and is deliberately
+    // not routed through here, because it sends a `limit` and a 422 about
+    // that would be our bug rather than a missing agent.
+    if (caught.problem.status === 404 || caught.problem.status === 422) return NOT_FOUND;
     return { kind: "error", message: caught.problem.detail, requestId: caught.requestId };
   }
   return { kind: "error", message: fallback };

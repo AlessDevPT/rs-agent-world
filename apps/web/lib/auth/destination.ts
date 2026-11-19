@@ -39,6 +39,16 @@ export type SessionKind =
   | "unconfigured"
   | "signed-out"
   | "token-rejected"
+  /**
+   * The API accepted the token and refused the caller anyway.
+   *
+   * Its own state because the alternative was calling it `api-unreachable`,
+   * which put "the backend is down" on screen for an account that is working
+   * perfectly and simply not allowed - a sentence that sends somebody to
+   * check a service that is fine. Signing out and in again cannot help
+   * either, so it does not go to the sign-in form.
+   */
+  | "forbidden"
   | "api-unreachable"
   | "signed-in";
 
@@ -68,13 +78,22 @@ function toLogin(next: string | null): Redirect {
  * authenticated and still not allowed, which is not a reason to send anybody
  * to a sign-in form; a 503 is the identity provider's key set being
  * unreachable, or the API having no `SUPABASE_JWKS_URL`, and neither is the
- * visitor's problem to fix. Both land on the start page, which explains the
- * state it is in.
+ * visitor's problem to fix. All three land on the start page, which explains
+ * the state it is in.
+ *
+ * **And a 403 is now its own answer rather than being folded into
+ * `api-unreachable`.** The redirect was always right; the word was not. A
+ * caller the API refuses is looking at a working backend, and telling them it
+ * is down sends them to check a service that is fine - while saying nothing
+ * about the only thing that would help, which is somebody granting them
+ * access.
  */
 export function kindForApiFailure(
   status: number | null,
-): "token-rejected" | "api-unreachable" {
-  return status === 401 ? "token-rejected" : "api-unreachable";
+): "token-rejected" | "forbidden" | "api-unreachable" {
+  if (status === 401) return "token-rejected";
+  if (status === 403) return "forbidden";
+  return "api-unreachable";
 }
 
 /**
@@ -93,9 +112,10 @@ export function guardDestination(
     case "token-rejected":
       return toLogin(next);
     case "unconfigured":
+    case "forbidden":
     case "api-unreachable":
-      // Both are states the start page explains properly, and it renders for
-      // them rather than redirecting again - which is what keeps this pair out
+      // All three are states the start page explains properly, and it renders
+      // for them rather than redirecting again - which is what keeps them out
       // of the cycle the sign-in page was in.
       return { kind: "redirect", to: HOME };
   }
@@ -115,10 +135,13 @@ export function loginDestination(kind: SessionKind, next: string | null): Destin
     case "signed-in":
       return { kind: "redirect", to: returnTarget(next) };
     case "unconfigured":
+    case "forbidden":
     case "api-unreachable":
       // Signing in would work - the form talks to Supabase, not to us - and
-      // then every page behind it would fail. The start page says which of the
-      // two it is.
+      // then every page behind it would fail just the same. `forbidden` sits
+      // here for a sharper version of the same reason: the credential is not
+      // what is wrong, so offering a new one would be an invitation to try
+      // the one thing that cannot help. The start page says which it is.
       return { kind: "redirect", to: HOME };
     case "signed-out":
     case "token-rejected":

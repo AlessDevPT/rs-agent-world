@@ -22,6 +22,7 @@
  */
 
 import { createRequire } from "node:module";
+import nextConfig from "../next.config";
 
 import { describe, expect, it } from "vitest";
 
@@ -51,7 +52,19 @@ const { getMiddlewareRouteMatcher } = require(
 };
 
 /** True when middleware would run for this path, by Next's own reckoning. */
-const runsOn = getMiddlewareRouteMatcher(getMiddlewareMatchers(config.matcher, {}));
+/**
+ * Compiled against the app's real `next.config.ts`, not against `{}`.
+ *
+ * `getMiddlewareMatchers` reads `basePath` and `i18n` out of the config it is
+ * handed, so an empty object asks Next to compile the matchers for an app
+ * that is not this one. It agrees today because neither option is set - which
+ * is exactly why the placeholder was invisible, and why the day somebody adds
+ * a `basePath` this test would keep passing while middleware stopped running
+ * on every path below it.
+ */
+const runsOn = getMiddlewareRouteMatcher(
+  getMiddlewareMatchers(config.matcher, nextConfig as unknown as Record<string, unknown>),
+);
 
 const WORKSPACE = "d59e337d-0663-482a-bd97-d0c329a2c9aa";
 const PROJECT = "a3882559-1b0b-4855-abc1-1a9e556c5b59";

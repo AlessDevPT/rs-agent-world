@@ -7,6 +7,7 @@ import { loadAgentExecutions, loadAgentOverview } from "@/lib/agents/load";
 import {
   executionStatusTone,
   executionsEmptyState,
+  expectsHeartbeat,
   formatSeconds,
   formatTimestamp,
   listingNote,
@@ -132,9 +133,8 @@ export default async function AgentDetailPage({
   const heartbeat = livenessSentence(agent);
   const archived = agent.archived_at !== null;
   // A heartbeat TTL and a last-heartbeat time are facts about an agent that is
-  // expected to call in. A managed agent is not, so they would only invite the
-  // reader to conclude something is late.
-  const expectsHeartbeat = agent.interaction_mode !== "managed";
+  // expected to call in, and the API has already decided which those are.
+  const heartbeatExpected = expectsHeartbeat(agent);
 
   return (
     <section className="stack">
@@ -292,7 +292,7 @@ export default async function AgentDetailPage({
             )}
           </dd>
 
-          {expectsHeartbeat && (
+          {heartbeatExpected && (
             <>
               <dt>Heartbeat limit</dt>
               <dd>{formatSeconds(agent.heartbeat_ttl_seconds)}</dd>

@@ -41,10 +41,9 @@ import type {
 /**
  * How loudly to render a pill.
  *
- * `ok` and `bad` have classes in `globals.css` already; `warn` needs
- * `.pill--warn` adding when the first screen lands. `neutral` is the bare
- * `.pill`, which is the right answer for a state that is neither good nor bad
- * - most of them are.
+ * `ok`, `warn` and `bad` all have classes in `globals.css`. `neutral` is the
+ * bare `.pill`, which is the right answer for a state that is neither good
+ * nor bad - most of them are.
  */
 export type Tone = "ok" | "warn" | "bad" | "neutral";
 
@@ -96,6 +95,26 @@ export function livenessSentence(agent: HeartbeatFacts): Sentence {
           "and no silence to measure.",
       };
   }
+}
+
+/**
+ * Whether a heartbeat limit and a last-heartbeat time mean anything here.
+ *
+ * **Read off the server's verdict, never re-derived from the mode.** The rule
+ * is `Agent.liveness` in `domain/entities.py`: a `managed` agent is
+ * `not_applicable`, because AgentWorld runs it itself and there is no outside
+ * worker to hear from. This page used to spell that out again as
+ * `interaction_mode !== "managed"`, which is the same rule in a second place -
+ * two copies that agree today and would disagree the day the API decides a
+ * `dispatchable` agent has nothing to report either.
+ *
+ * What the figures would do if shown anyway is the reason it matters: a TTL
+ * and a "last heartbeat: never" next to each other invite the reader to
+ * conclude that something is late, about an agent that was never going to
+ * call in.
+ */
+export function expectsHeartbeat(agent: Pick<Agent, "liveness">): boolean {
+  return agent.liveness !== "not_applicable";
 }
 
 export function livenessTone(liveness: AgentLiveness): Tone {
