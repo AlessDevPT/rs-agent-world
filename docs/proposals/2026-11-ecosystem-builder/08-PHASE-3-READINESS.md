@@ -583,35 +583,119 @@ Resolve, validate **every** resolved address, pin the connection to it, no redir
 - [ ] A worker writes no execution state directly — only events.
 - [ ] Ten workers against one project produce no duplicated step and no lost step.
 
-### T7 — The managed agent turn
+### T7a — The managed agent turn
+
+> **Split out of T7 on 2026-11-20 (P2).** Three of T7's six criteria needed tool
+> execution, which is T10's, and a `tool_call` step cannot be published at all until a
+> `tools` table exists - `workflow_steps.tool_call_needs_tool` requires a `tool_id`. They
+> are now **T7b**, below. The alternative was marking them "not applicable until T10",
+> which is how a deferred criterion stops being read. The turn loop itself stays in
+> Phase 3.
 
 **Acceptance**
 - [ ] `POST /v1/workflows/{id}/run` on a one-step workflow calls a real provider, writes a
       run trace, and completes — through `curl`, with no frontend.
+      *Needs an `ANTHROPIC_API_KEY` and a person, not code:
+      `apps/api/scripts/live_provider_smoke.py` is the check, kept out of the suite so CI
+      keeps reporting zero skips.*
+- [ ] `max_turns` and the wall clock both terminate the loop.
+      *Neither exists: no `max_turns`, `wall_clock` or `turn_limit` anywhere in
+      `apps/api/`. `services/dispatch.py` performs one model call per step and says the
+      conversation loop is this task's.*
+- [ ] Token counts and durations land in `metric_samples` through the existing metric events
+      — no new plumbing.
+      *The plumbing really does exist: `metric.recorded` is in
+      `domain/protocol/taxonomy.py` and `metric_samples` is a table. Usage is already
+      captured into the step output; what is missing is a dispatch that emits the event.*
+
+### T7b — Tool turns  *(Phase 3a, with T10)*
+
+> **Moved here from T7 on 2026-11-20 (P2).** Every criterion below needs a tool call to
+> exist. `tool.denied` appears today only in API docstrings and `domain/entities.py` and
+> is never emitted, because nothing can invoke a tool.
+
+**Acceptance**
 - [ ] Tool grants are checked **at call time**: a grant revoked mid-run takes effect on the
       next call.
 - [ ] A tool that is not granted produces `tool.denied` and the refusal is fed back to the
       model, not raised.
-- [ ] `max_turns` and the wall clock both terminate the loop.
-- [ ] Token counts and durations land in `metric_samples` through the existing metric events
-      — no new plumbing.
 - [ ] Tool arguments and results are redacted in events.
 
 ### T8 — Retries, timeouts, dead letters, uncertain outcomes
 
+> **Reconciled 2026-11-20.** Six of these nine were already met by T6-T6d and had never
+> been marked; two were amended because the criterion asked for something the design
+> deliberately does not do, and one moved to T11. Every tick names the test that earns
+> it. **What is left of T8 in Phase 3 is `on_failure = 'fail'` and nothing else.**
+
 **Acceptance**
-- [ ] A 429 then success: **one step, two attempts, one output**.
-- [ ] Each row of the classification table is asserted — retryable retries, terminal does
+- [x] A 429 then success: **one step, two attempts, one output**.
+      **Met.** `test_a_rate_limit_then_success_is_one_step_two_attempts_one_output`, which
+      also asserts the accounting: one dispatch row, one step row, one non-null output,
+      `claim_count == 2`, `attempt` unmoved, and the same idempotency token on both
+      requests.
+- [x] Each row of the classification table is asserted — retryable retries, terminal does
       not.
-- [ ] Backoff is jittered; asserted statistically, not by equality.
-- [ ] A consequential dispatch defaults to `max_attempts = 1`.
-- [ ] **A dead dispatch always resolves its step** — `step_failed` is emitted and
-      `on_failure` applies.
-- [ ] A crash after `side_effect_started_at` with no result goes to `needs_review`, never an
+      **Met.** `test_every_failure_member_has_a_retryability_answer` and
+      `test_each_status_is_classified` (`tests/unit/test_providers.py`), with
+      `_will_retry` consulting the classification since the T6 review found a 400 being
+      retried.
+- [x] Backoff is jittered, asserted by **bounds over the whole window** rather than by
+      equality: every draw within `[base, 2·base]`, the window doubling per claim, and no
+      part of it beyond the cap.
+      **Met.** `tests/unit/test_backoff.py` - fifteen tests, among them
+      `test_the_first_retry_waits_between_one_and_two_seconds`,
+      `test_the_window_doubles_with_each_claim` and
+      `test_no_part_of_the_window_exceeds_the_cap`.
+      *(Amended 2026-11-20 (P7). The criterion said "asserted statistically, not by
+      equality". Bounds over the window are deterministic, strictly stronger than a
+      sampled distribution, and already what the suite asserts; a statistical test would
+      be the flakier way to claim less.)*
+- [x] **No dispatch can carry consequential work in this release** — asserted by count.
+      **Met.** `test_a_dispatch_can_never_carry_consequential_work`
+      (`tests/unit/test_advance.py`) and
+      `test_a_consequential_dispatch_is_refused_rather_than_performed`
+      (`tests/integration/test_dispatch_worker.py`).
+      *(Amended 2026-11-20 (P7). The criterion was "a consequential dispatch defaults to
+      `max_attempts = 1`", which presumes one can exist; `advance()` emits no decision
+      whose `side_effect_class` is consequential, so none can until approvals land. The
+      `max_attempts` default moves to **Phase 3a** with them.)*
+- [ ] **A dead dispatch always resolves its step** — `step_failed` is emitted, and
+      `on_failure = 'fail'` applies.
+      **Half met, and the open half is the whole of T8's remaining Phase 3 work.** The
+      settle path writes the terminal status and the step event
+      (`services/dispatch.py`). `on_failure` is read by nothing:
+      `ON_FAILURE = ("fail", "continue", "route")` in `repositories/models.py`, a
+      `on_failure_is_known` check constraint, and one schema test.
+      *(Amended 2026-11-20 (P6). `continue` and `route` move to **Phase 5**, where
+      branches and joins arrive - there is nowhere to route to before then.)*
+- [x] A crash after `side_effect_started_at` with no result goes to `needs_review`, never an
       automatic retry.
-- [ ] A `needs_review` row appears in the project's attention list.
-- [ ] A human retry creates a new dispatch with a **new** `idempotency_token`.
-- [ ] A step that is never reported is resolved by its timeout, not by a hung dispatch.
+      **Met.** `test_a_lease_that_expires_mid_flight_becomes_needs_review`, and
+      `_will_retry` refuses a `needs_review` row outright.
+- [x] A `needs_review` row appears in the project's attention list.
+      **Met (T6b).** `test_the_queue_shows_what_is_stuck_and_why`
+      (`tests/integration/test_review_api.py`), at `viewer`.
+- [x] A human `retry` returns the **same** dispatch to `pending`, keeping its
+      `idempotency_token`, and grants no extra attempt.
+      **Met.** `test_a_retry_carries_the_same_idempotency_token`
+      (`tests/integration/test_dispatch_worker.py`) and
+      `test_a_retry_resolution_does_not_grant_another_attempt`
+      (`tests/integration/test_review_api.py`).
+      *(Amended 2026-11-20 (P1). The criterion asked for a new dispatch with a **new**
+      token. The state being resolved is uncertain - the request went out and nothing came
+      back - so a new token would convert a possible duplicate into a certain one at
+      exactly the receivers capable of suppressing it. The admin's written
+      acknowledgement is the authority for repeating the effect; the stable token is the
+      only mitigation the system still holds. An operator certain nothing happened
+      resolves `failed`, not `retry`.)*
+- [ ] ~~A step that is never reported is resolved by its timeout, not by a hung dispatch.~~
+      **Moved to T11 on 2026-11-20 (P5).** For a *managed* step the guarded client's own
+      30-second total timeout and the lease already bound it; the unbounded case is a
+      **dispatchable** agent that never reports, which is T11's.
+      `workflow_steps.timeout_seconds` exists with a `timeout_is_positive` constraint and
+      is **read by nothing** in Phase 3 - stated here so the next audit does not
+      rediscover it as a defect.
 
 ### T9 — Approvals
 
@@ -655,6 +739,11 @@ Resolve, validate **every** resolved address, pin the connection to it, no redir
 - [ ] No dispatch kind can target an `observed` agent, and `advance()` refuses one.
 - [ ] A `dispatchable` or `observed` agent cannot be saved with a `model_profile_id` — the
       **check constraint**, not a service check.
+- [ ] A step that is never reported is resolved by its timeout, not by a hung dispatch -
+      reading `workflow_steps.timeout_seconds`, which has existed unread since T0.
+      *(Moved here from T8 on 2026-11-20 (P5): this is the case a push to an external
+      agent creates, and the only one the lease and the HTTP timeout do not already
+      bound.)*
 
 ### T12 — Execution reads and reporting
 
@@ -710,7 +799,7 @@ Confirm, or tell me to proceed and track them as known risks.
 
 ### Q3 — Real provider calls in the test suite?
 
-An Anthropic key in CI makes T3 and T7's acceptance criteria genuine but makes the suite
+An Anthropic key in CI makes T3 and T7a's acceptance criteria genuine but makes the suite
 cost money and need network. The alternative is a recorded-cassette suite plus one
 manually-run live test. I lean towards **cassettes in CI, one live smoke test run by hand**
 before each milestone.

@@ -195,12 +195,20 @@ behaviour changes.
 
 ### Phase 3 — Execution core + island skeleton  *(Tracks A and B, 3 w)*
 
-> **Status, 2026-11-17 — not complete.** Track A: T0–T6d are in; what remains is the
-> OpenAI-compatible provider, the event bus with the WebSocket gateway, and the single
-> live provider call. Track B: **nothing built.** The acceptance ledger below was
-> reconciled against the suites on that date — every tick names the test that earns it
-> and every open box says why it is open. Overall status and the ordered next steps
-> are in [`docs/STATUS.md`](../../STATUS.md).
+> **Status, 2026-11-20 — not complete.** Track A: T0–T6d are in, and T8 turned out to be
+> seven-ninths done once it was measured. What remains is **T7a** (the turn loop,
+> `max_turns`, the wall clock, metric emission), **T8's `on_failure = 'fail'`**, **T13**
+> (the second provider and the conformance suite it needs), the **event bus and
+> WebSocket gateway**, and the one **live provider call**, which needs a key rather than
+> code. Track B: **nothing built** - `apps/web/world/` holds a README.
+>
+> The ledger below was reconciled against the suites on 2026-11-17 and again on
+> 2026-11-20, when the realtime criteria were written for the first time: the gateway had
+> been a build bullet with no acceptance criteria at all, which is how the largest open
+> item in the phase became the only one that could not be ticked. Every tick names the
+> test that earns it and every open box says why it is open. The eight reconciliation
+> decisions are P1-P8 in [`07-DECISION-RECORD.md`](07-DECISION-RECORD.md) §6. Overall
+> status and the ordered next steps are in [`docs/STATUS.md`](../../STATUS.md).
 
 The first phase where something runs, and the first where something is visible.
 
@@ -336,7 +344,22 @@ The first phase where something runs, and the first where something is visible.
   deltas, cursors, `resume`, `resync_required`. `api/ws/__init__.py` is an empty
   placeholder package, there is no `ws-ticket` endpoint and no event bus. This is the
   largest piece of Phase 3 still outstanding, and the island's statuses are specified
-  to come from it.
+  to come from it. **Its acceptance criteria are R1-R14 below**, added 2026-11-20; the
+  frames they assert are `03-API-AND-FRONTEND.md` §4, and the seven decisions behind
+  them are P3-P8 in `07-DECISION-RECORD.md` §6. The acceptance run uses the **`redis`**
+  bus (P4): `inprocess` cannot satisfy R13, which is the criterion that proves the bus
+  is a bus.
+- **Open, partly.** **T7a — the managed agent turn.** `services/dispatch.py` performs one
+  model call per step and says so; the loop, `max_turns`, the wall clock and the
+  `metric.recorded` emission are this phase's. The three tool criteria that used to sit
+  beside them are **T7b** now, in Phase 3a with T10 (P2), because a `tool_call` step
+  cannot be published until a `tools` table exists.
+- **Open, nearly closed.** **T8 — retries, timeouts, dead letters, uncertain outcomes.**
+  Seven of its nine criteria are met by T6-T6d and are now marked as such in
+  `08-PHASE-3-READINESS.md`; two were amended there, and the step-timeout criterion moved
+  to T11 (P5). What is left in this phase is **`on_failure = 'fail'`** - the column has
+  existed with a check constraint and no reader since T0. `continue` and `route` go to
+  Phase 5, which is where branches arrive (P6).
 - ~~The two new import-linter contracts, each verified by planting a violation.~~
   **Done (T2, T3).** Eight contracts in `apps/api/pyproject.toml`; the two newest keep
   `httpx` inside `infra/net/` and provider SDKs inside `infra/providers/`, and CI runs
@@ -354,9 +377,11 @@ The first phase where something runs, and the first where something is visible.
 - Click to select → inspector panel → **the real agent form in Simple mode**.
 - Status rendered from live WebSocket deltas.
 - Build / Live toggle, distinct from the start: Build allows select; Live is read-only.
-- Minimal pages: agent list and form, execution detail. **The agent list and the agent
-  detail page landed on 2026-11-15/16; the form and the execution detail page are
-  open.**
+- Minimal pages: agent list and form, execution detail. **All three are closed
+  (2026-11-20).** The list and the agent detail page landed on 2026-11-15/16; the agent
+  form in `9993c6c` and the execution detail page in `16947a5`, on 2026-11-18/19. The
+  edit page and the agent test panel went in beside them, which is more than this bullet
+  asked for. **Nothing else in Track B has started.**
 
 **Acceptance criteria**
 - [ ] `POST /v1/workflows/{id}/run` on a one-step workflow calls a real provider, writes a
@@ -411,14 +436,26 @@ The first phase where something runs, and the first where something is visible.
       **Met.** `test_rewrapping_moves_the_key_and_leaves_the_ciphertext_alone`
       (`tests/unit/test_secrets.py`).
 - [ ] **The island displays real agents** from the backend, with their real statuses, and
-      opens the real configuration form. No mock data path exists in the codebase.
+      opens the real configuration form. No mock data path exists in the codebase —
+      asserted by a source search over `apps/web/world/`, the same shape as
+      `test_no_vendor_is_named_outside_the_provider_package`.
       **Open.** Track B has not started: `apps/web/world/` holds a README and no code.
+      Needs the realtime spine (R1-R14) and a `world/nodes` read API, which does not
+      exist - no route under `api/` matches `world`.
+- [ ] Each rendered status **equals** the status the REST view reports for that agent, and
+      a change arrives as a delta with no reload.
+      **Open. Added 2026-11-20.** The box above says "with their real statuses", which a
+      hard-coded sprite satisfies. Equality against the REST view, and arrival as a delta,
+      is what makes it mean *from the backend*.
 - [ ] An agent going `offline` stays visible and renders shuttered.
       **Open.** Needs Track B, and needs the realtime deltas it would render from.
 - [ ] Deleting `world/phaser/` leaves the backend suite and the non-world web suite green.
       **Not yet meaningful.** There is no `world/phaser/` to delete and Phaser is in no
       `package.json`. The criterion becomes testable the day Track B starts, which is also
       when it is worth running.
+      **Confirmed on 2026-11-20 (P3): these four boxes stay in Phase 3.** Moving I1 to
+      Phase 4 would close this phase sooner and concentrate both island milestones into
+      one - the opposite of why I1 was pulled early - and this box is the G8 gate.
 - [x] Planting `import anthropic` in `services/` fails the new import contract.
       **Met (T3).** Verified by planting one, recorded in `12-T3-PROVIDERS.md`. The
       companion `test_no_vendor_is_named_outside_the_provider_package` covers what no
@@ -461,6 +498,82 @@ The first phase where something runs, and the first where something is visible.
       **Met.** `test_only_a_managed_agent_may_name_a_model_profile`
       (`tests/integration/test_schema.py`), asserted against the database rather than
       through a service, which is what the criterion asked for.
+
+**Acceptance criteria — the realtime spine**
+
+> **Added 2026-11-20.** The event bus and the gateway had a build bullet and no criteria,
+> so the largest open item in the phase was also the only one that could not be ticked.
+> These are its criteria. They assert the frame set in `03-API-AND-FRONTEND.md` §4 rather
+> than inventing one, and the decisions they encode are P3-P8 in
+> `07-DECISION-RECORD.md` §6. The superseded `05-ROADMAP.md` Phase 4 was read as history
+> while writing them, not as authority.
+
+- [ ] **R1 — No ticket, no stream.** A connection with no ticket, a malformed ticket, or a
+      ticket minted for another project is refused before a single frame is sent.
+- [ ] **R2 — Tickets are single-use and expire.** The same ticket twice is refused the
+      second time; a ticket older than its TTL is refused. The issuing route carries a
+      role-matrix row like every other route.
+- [ ] **R3 — Project-scoped and tenant-isolated.** A ticket for project A never yields a
+      frame naming project B, and a non-member is refused. Asserted inside the existing
+      `test_tenant_isolation.py` sweep rather than in a test of its own, so a new table or
+      route cannot miss it.
+- [ ] **R4 — Authorization is an `Action`, not an ad-hoc check.** A new member of
+      `domain/policy.py`'s `Action` with a `ROLE_FLOOR` entry at `viewer` and a row in
+      `test_role_matrix.py` — that test fails on an action with no row, which is the point
+      of putting it there.
+- [ ] **R5 — The first frame is a `snapshot` carrying a cursor.** Type `snapshot`, an
+      integer `cursor`, and the documented `data` keys.
+- [ ] **R6 — Snapshot-then-delta loses nothing and repeats nothing.** Mutate during the
+      handshake; the entity appears **exactly once** across the snapshot and the deltas
+      that follow it.
+- [ ] **R7 — Deltas are whole entities, never patches.** Every delta payload validates
+      against the same view model the REST route returns, so an ordering bug cannot
+      produce a half-applied entity.
+- [ ] **R8 — Definition deltas come from the services that write definitions.** A
+      `PATCH` on an agent produces `agent.updated`. Nothing is added to the event log:
+      `03-API-AND-FRONTEND.md` §4 says config changes are **not** in it, and widening the
+      log would put Phase 2's replay property at risk for presentation's benefit.
+- [ ] **R9 — Execution deltas are folded from the log.** An ingested event produces
+      `execution.updated` and `step.updated`, with a cursor that is monotonic per project.
+- [ ] **R10 — `resume` replays exactly what was missed.** Disconnect, mutate N times,
+      resume from the old cursor: exactly N deltas, in order, no gap and no repeat.
+- [ ] **R11 — Beyond the window, `resync_required`.** A cursor older than the replay
+      window is answered with `resync_required` and nothing else, and the client's only
+      next move is a fresh snapshot.
+- [ ] **R12 — A slow consumer is dropped, not buffered without bound.** A consumer that
+      never reads reaches the configured queue bound and is closed with
+      `resync_required`; server memory stays bounded while it happens.
+- [ ] **R13 — Fan-out crosses processes.** Two gateway instances on the `redis` bus, one
+      mutation, both sockets receiving identical frames with identical cursors. This is
+      the criterion `inprocess` cannot satisfy, and the reason P4 chose `redis` for the
+      acceptance run.
+- [ ] **R14 — No fabricated state.** With no activity there is no synthetic heartbeat,
+      status or delta; every delta traces to a write or to a folded event. The same rule
+      the island's "no mock data path" box states, asserted one layer lower.
+
+**Acceptance criteria — T7a, T8 and T13**
+
+> **Added 2026-11-20.** T7a's first criterion is the live-provider box at the top of this
+> list and is not repeated. T13 had no box in this ledger at all.
+
+- [ ] **`max_turns` and the wall clock both terminate the turn loop** (T7a). Neither
+      exists today: no `max_turns`, `wall_clock` or `turn_limit` anywhere in `apps/api/`.
+- [ ] **Token counts and durations reach `metric_samples`** through `metric.recorded`,
+      with no new plumbing (T7a). The event type and the table both exist; the dispatch
+      emits neither.
+- [ ] **A dead dispatch applies `on_failure = 'fail'`** (T8). `step_failed` is already
+      emitted; the column has had a check constraint and no reader since T0. `continue`
+      and `route` are Phase 5's, per P6.
+- [ ] **Both providers pass one shared conformance suite** (T13), parametrised over the
+      provider builder, with the Anthropic wire-shape test left beside the adapter it
+      describes. No such suite exists yet — "conformance" appears in these documents and
+      nowhere in `apps/api/tests/unit/test_providers.py`.
+- [ ] **The OpenAI-compatible adapter adds no import outside `infra/providers/`** (T13),
+      discharged by the two existing import-linter contracts and the vendor-name source
+      search rather than by reading a diff, which is what `08-PHASE-3-READINESS.md`'s
+      "asserted by diff" was a proxy for.
+- [ ] **Switching a model profile between providers needs no workflow change** (T13) —
+      asserted by running one published workflow against both.
 
 ---
 
@@ -895,6 +1008,8 @@ Hard dependencies, the ones that cannot be reordered:
 | Dependency | Why |
 |------------|-----|
 | B needs A's model and WebSocket | the island renders real objects from the first commit; there is no mock path |
+| I1 needs the realtime spine (R1-R14) | the island's statuses are deltas and R14 forbids a mock path, so the feed exists before the first sprite |
+| I1 needs a `world/nodes` read API | placements are rows in `world_nodes` and no route under `api/` matches `world` |
 | C needs A's definition CRUD and `validate` | the builder is a client of the ordinary services and must not propose what cannot run |
 | C's preview needs B's I2 | a plan shown as a diagram needs a diagram to show it on; without I2 the prototype falls back to the list view, which is a usable degradation |
 | Phase 8 before Phase 9 | the plain workspace must be proved usable before the island gets its polish, or the island becomes load-bearing |

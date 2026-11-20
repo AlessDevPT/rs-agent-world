@@ -374,3 +374,37 @@ candidate for it.
 
 Those were risks in revision 1. They are now mechanisms, which is the distinction this
 document exists to make.
+
+---
+
+## 6. Phase 3 ledger reconciliation (2026-11-20)
+
+Eight decisions taken after a read-only audit found that Phase 3's scope sentence
+(`04-ROADMAP-AND-MVP.md` §2, "this phase is T0–T8 and T13"), its build list, its
+acceptance ledger and the T-criteria in `08-PHASE-3-READINESS.md` did not agree with each
+other or with the code. **Approved by the product owner on 2026-11-20.** No criterion was
+deleted and no phase boundary moved except where a row below says so.
+
+| # | Decision | Why | Where it landed |
+|---|----------|-----|-----------------|
+| **P1** | A human `retry` keeps the **same** dispatch and the **same** `idempotency_token`; the criterion was amended, not the code | The state being resolved is uncertain - the request went out and nothing came back. A new token would convert a *possible* duplicate into a certain one at exactly the receivers capable of suppressing it. The admin's written acknowledgement is the authority for repeating the effect; the stable token is the only mitigation left. An operator certain nothing happened resolves `failed`, not `retry` | `08-…` T8, criterion 8, with both tests named |
+| **P2** | **T7 splits into T7a and T7b.** T7a (turn loop, `max_turns`, wall clock, metrics) stays in Phase 3; T7b (grants at call time, `tool.denied`, redaction) moves to Phase 3a with T10 | Three of T7's six criteria need a tool call to exist, and a `tool_call` step cannot be published until a `tools` table does - `workflow_steps.tool_call_needs_tool` requires a `tool_id`. The alternative was marking them "not applicable until T10", which is how a deferred criterion stops being read | `08-…` T7a / T7b; build bullet in `04-…` Phase 3 |
+| **P3** | **The four island acceptance boxes stay in Phase 3** | Moving I1 to Phase 4 would close this phase sooner and concentrate both island milestones into one - the opposite of why I1 was pulled early - and the `world/phaser/` box is the G8 gate | `04-…` Phase 3 acceptance, island group |
+| **P4** | The realtime acceptance run uses the **`redis`** bus; `inprocess` stays for local dev | R13 - two gateway processes seeing identical frames - is the criterion that proves the bus is a bus, and `inprocess` cannot satisfy it. Both already exist as `EventBusKind` | `04-…` R13 and the event-bus build bullet |
+| **P5** | The **step-timeout** criterion moves from T8 to **T11** | For a managed step the guarded client's 30-second total timeout and the lease already bound it; the unbounded case is a dispatchable agent that never reports, which is T11's. `workflow_steps.timeout_seconds` therefore ships unread in Phase 3, and the ledger says so | `08-…` T8 criterion 9 (struck through) and T11 |
+| **P6** | `on_failure` implements **`fail` only** in Phase 3; `continue` and `route` move to **Phase 5** | `route` needs branch targets, which arrive with Phase 5's branches and joins. There is nowhere to route to before then | `08-…` T8 criterion 5; `04-…` T8 ledger box |
+| **P7** | Two T8 criteria **amended rather than implemented**: backoff "asserted statistically" becomes asserted by bounds over the window; "a consequential dispatch defaults to `max_attempts = 1`" becomes "no dispatch can carry consequential work in this release" | Bounds are deterministic and strictly stronger than a sampled distribution, and are what `tests/unit/test_backoff.py` already asserts. `advance()` emits no consequential decision, so the second criterion presumed something that cannot exist until approvals land; the default moves to Phase 3a with them | `08-…` T8 criteria 3 and 4 |
+| **P8** | **No Phase 3 criterion carries into Phase 4** | Four of Phase 4's own acceptance criteria depend on live deltas, so carrying the spine forward would make Phase 4 unclosable as well. Phase 4 begins when Phase 3's ledger is closed | `docs/STATUS.md` §6 |
+
+**What these decisions did not change.** The scope sentence, the phase boundaries other
+than P2's and P5's single-criterion moves, and every acceptance criterion's substance
+except P1's and P7's two, each of which carries its reasoning on the line itself.
+
+**What they revealed, which is the part worth remembering.** The event bus and the
+WebSocket gateway had been a build bullet since the phase was written and had **no
+acceptance criteria at all** - so the largest open item in Phase 3 was also the only one
+that could not be ticked, and nothing in the ledger would ever have failed because of it.
+T13 had no box either. R1-R14 and the T7a/T8/T13 boxes exist because of that, and the
+lesson is the same one T6d recorded: *"the code exists" and "something runs it" are
+different claims, and the acceptance criteria are where the difference shows up* - to
+which this adds a third, that a criterion nobody wrote cannot fail.
