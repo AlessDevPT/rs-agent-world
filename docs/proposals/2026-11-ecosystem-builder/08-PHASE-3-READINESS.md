@@ -395,6 +395,17 @@ Four rules hold the shape:
    read state the reducers produced. There is no second execution path for the island or the
    builder: both call the same `POST /v1/workflows/{id}/run`.
 
+   **And there is one cursor, settled on 2026-11-20 (P9).** The per-project `events.seq`
+   that `repositories/events.py` allocates under a `FOR UPDATE` lock is the cursor
+   authority for execution **and** definition deltas: a definition change carries a number
+   from that same sequence, is recorded durably in the transaction that makes it, and is
+   published only after that transaction commits. A lightweight transactional outbox is an
+   allowed mechanism and **nothing of the kind exists today** - this is the design the
+   gateway will be built to, not a feature it has. The criteria that measure it, **R8 and
+   R10 in `04-ROADMAP-AND-MVP.md`, stay open**, and the alternatives are closed: no
+   separate definition cursor, and no carrying the last-seen execution cursor without
+   persisting the change it points at.
+
 ### 5.2 Why replay still cannot cause work
 
 The guarantee survives Phase 3 for the same structural reason it holds now. `fold()` returns

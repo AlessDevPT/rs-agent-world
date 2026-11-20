@@ -269,12 +269,18 @@ to "what needs me" rather than three that can disagree.
 Frames extend the designed set rather than replacing it. Snapshot, then deltas carrying a
 monotonic per-project cursor; `resume`, `resync_required`, ping/pong unchanged.
 
+**That cursor is the per-project `events.seq`, and there is only one of it (P9).**
+Definition deltas and execution deltas share a single ordered cursor domain, so a client
+holds one number and `resume` means the same thing for both kinds. The snapshot's `cursor`
+is a value from that same sequence, committed as of the moment the snapshot was taken.
+
 ```jsonc
 { "type": "snapshot", "cursor": 448912, "data": {
     "agents": [], "workflows": [], "connections": [], "integrations": [],
     "executions": [], "approvals": [], "world": { "layout": {}, "placements": [] } } }
 
-// definition deltas — config changes, which are NOT in the event log
+// definition deltas — config changes, which are NOT in the event log,
+// and which carry a cursor from the shared sequence anyway (P9)
 { "type": "agent.updated",       "cursor": 448913, "data": {} }
 { "type": "workflow.updated",    "cursor": 448914, "data": {} }
 { "type": "connection.updated",  "cursor": 448915, "data": {} }
@@ -292,6 +298,15 @@ Deltas stay whole-entity snapshots, not patches, so an ordering bug cannot produ
 half-applied entity. Channels (`agents`, `workflows`, `executions`, `approvals`, `events`,
 `world`) let Build Mode subscribe to definitions and Live Mode add executions and events,
 rather than every tab receiving everything.
+
+**The protocol above is approved; the persistence behind it is not built.** A definition
+change has to be recorded durably in the same transaction as the mutation and published
+only after that transaction commits, or `resume` cannot replay it - a crash between the
+commit and the publish would drop a delta that nothing had recorded. The mechanism is an
+implementation question, and a lightweight transactional outbox is an allowed answer;
+nothing of the kind exists today. The property is not negotiable. See P9 in
+[`07-DECISION-RECORD.md`](07-DECISION-RECORD.md) §6, and R8 and R10 in
+[`04-ROADMAP-AND-MVP.md`](04-ROADMAP-AND-MVP.md).
 
 ## 5. The world: Build Mode and Live Mode
 

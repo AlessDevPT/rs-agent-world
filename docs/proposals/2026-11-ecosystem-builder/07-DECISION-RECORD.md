@@ -379,11 +379,14 @@ document exists to make.
 
 ## 6. Phase 3 ledger reconciliation (2026-11-20)
 
-Eight decisions taken after a read-only audit found that Phase 3's scope sentence
+Nine decisions. P1-P8 were taken after a read-only audit found that Phase 3's scope sentence
 (`04-ROADMAP-AND-MVP.md` §2, "this phase is T0–T8 and T13"), its build list, its
 acceptance ledger and the T-criteria in `08-PHASE-3-READINESS.md` did not agree with each
 other or with the code. **Approved by the product owner on 2026-11-20.** No criterion was
-deleted and no phase boundary moved except where a row below says so.
+deleted and no phase boundary moved except where a row below says so. **P9 was approved
+later the same day**, from the realtime-spine audit that followed: it is the one
+architecture decision R8 and R10 could not be implemented without, and it is detailed
+after the table.
 
 | # | Decision | Why | Where it landed |
 |---|----------|-----|-----------------|
@@ -395,6 +398,7 @@ deleted and no phase boundary moved except where a row below says so.
 | **P6** | `on_failure` implements **`fail` only** in Phase 3; `continue` and `route` move to **Phase 5** | `route` needs branch targets, which arrive with Phase 5's branches and joins. There is nowhere to route to before then | `08-…` T8 criterion 5; `04-…` T8 ledger box |
 | **P7** | Two T8 criteria **amended rather than implemented**: backoff "asserted statistically" becomes asserted by bounds over the window; "a consequential dispatch defaults to `max_attempts = 1`" becomes "no dispatch can carry consequential work in this release" | Bounds are deterministic and strictly stronger than a sampled distribution, and are what `tests/unit/test_backoff.py` already asserts. `advance()` emits no consequential decision, so the second criterion presumed something that cannot exist until approvals land; the default moves to Phase 3a with them | `08-…` T8 criteria 3 and 4 |
 | **P8** | **No Phase 3 criterion carries into Phase 4** | Four of Phase 4's own acceptance criteria depend on live deltas, so carrying the spine forward would make Phase 4 unclosable as well. Phase 4 begins when Phase 3's ledger is closed | `docs/STATUS.md` §6 |
+| **P9** | **The shared per-project `events.seq` is the single cursor authority for both execution and definition deltas**, and a definition change must be recorded durably in the same transaction as the mutation it describes, with publication only after that transaction commits | One ordered cursor domain is what makes `resume` mean the same thing for both kinds of delta; two sequences would put two orderings into a protocol that has one `cursor` field. Durability is the other half: publishing after commit with nothing persisted is at-most-once, and a crash between the commit and the publish loses a delta silently - which `resume` would then never replay, because nothing recorded it. A separate definition cursor is **not** part of the approved design, and carrying the last-seen execution cursor without persisting the change is **not** acceptable, because neither can satisfy exact definition replay | `03-…` §4; `04-…` R8 and R10; `08-…` §5.1 rule 4 |
 
 **What these decisions did not change.** The scope sentence, the phase boundaries other
 than P2's and P5's single-criterion moves, and every acceptance criterion's substance
@@ -408,3 +412,34 @@ T13 had no box either. R1-R14 and the T7a/T8/T13 boxes exist because of that, an
 lesson is the same one T6d recorded: *"the code exists" and "something runs it" are
 different claims, and the acceptance criteria are where the difference shows up* - to
 which this adds a third, that a criterion nobody wrote cannot fail.
+
+### P9 in full — the definition-delta cursor
+
+**Approved, not implemented.** Nothing in the repository allocates a cursor for a
+definition change, records one durably, or publishes one. `infra/event_bus.py` does not
+exist, `api/ws/__init__.py` is a one-line docstring, and the `redis` dependency is
+declared in `pyproject.toml` and never imported. This decision fixes the design that R8
+and R10 will be measured against; **both criteria stay open** until an implementation and
+its acceptance evidence exist. A settled design is not evidence, and neither is approval.
+
+**The mechanism is open, within one constraint.** A lightweight transactional outbox - a
+row written in the same transaction as the mutation, claimed and published after commit -
+is an allowed implementation, and the obvious one, since `services/executions.py` already
+proves the pattern for dispatches. It is **not** a required table design and this decision
+creates nothing. What is required is the property: the delta is durable before it is
+published, and published only after the transaction that produced it has committed.
+
+**The accepted cost, stated plainly.** Allocating from `ProjectEventCursor` means taking
+the same per-project cursor lock `repositories/events.py` takes for ingest, held
+`FOR UPDATE` until the transaction commits. **Configuration writes will therefore contend
+with event ingestion for a project and may serialise behind a batch.** That is accepted
+deliberately, in exchange for one ordered, replayable cursor domain. Two things make the
+trade cheaper than it reads: configuration writes are rare beside ingest, and that same
+lock is what already makes a project's `seq` gapless and commit-ordered - which is the
+property `resume` depends on in the first place.
+
+**What was rejected, and why.** A second per-project sequence for definitions would be
+replayable without touching the ingest lock, but it puts two orderings into a protocol
+with a single `cursor` field. Carrying the last-seen execution cursor on a definition
+delta is cheapest and cannot replay at all, because nothing would persist the change the
+cursor claims to point at.

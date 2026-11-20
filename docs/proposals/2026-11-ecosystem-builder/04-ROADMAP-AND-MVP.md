@@ -529,14 +529,20 @@ The first phase where something runs, and the first where something is visible.
 - [ ] **R7 — Deltas are whole entities, never patches.** Every delta payload validates
       against the same view model the REST route returns, so an ordering bug cannot
       produce a half-applied entity.
-- [ ] **R8 — Definition deltas come from the services that write definitions.** A
-      `PATCH` on an agent produces `agent.updated`. Nothing is added to the event log:
-      `03-API-AND-FRONTEND.md` §4 says config changes are **not** in it, and widening the
-      log would put Phase 2's replay property at risk for presentation's benefit.
+- [ ] **R8 — Definition deltas come from the services that write definitions, and
+      durably.** A `PATCH` on an agent produces `agent.updated`, carrying a cursor from the
+      shared per-project `events.seq` (P9). The change is recorded durably in the **same
+      transaction** as the mutation and published only after that transaction commits, so a
+      crash between the two cannot drop a delta that `resume` would never replay - a
+      fire-and-forget publish does not satisfy this criterion. Nothing is added to the event
+      log: `03-API-AND-FRONTEND.md` §4 says config changes are **not** in it, and widening
+      the log would put Phase 2's replay property at risk for presentation's benefit.
 - [ ] **R9 — Execution deltas are folded from the log.** An ingested event produces
       `execution.updated` and `step.updated`, with a cursor that is monotonic per project.
 - [ ] **R10 — `resume` replays exactly what was missed.** Disconnect, mutate N times,
-      resume from the old cursor: exactly N deltas, in order, no gap and no repeat.
+      resume from the old cursor: exactly N deltas, in order, no gap and no repeat — with
+      the N split across definition and execution changes, since both share one cursor
+      domain (P9), and a definition change replayed from whatever durably recorded it.
 - [ ] **R11 — Beyond the window, `resync_required`.** A cursor older than the replay
       window is answered with `resync_required` and nothing else, and the client's only
       next move is a fresh snapshot.
