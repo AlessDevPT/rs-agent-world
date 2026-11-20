@@ -279,19 +279,24 @@ is a value from that same sequence, committed as of the moment the snapshot was 
     "agents": [], "workflows": [], "connections": [], "integrations": [],
     "executions": [], "approvals": [], "world": { "layout": {}, "placements": [] } } }
 
-// definition deltas — config changes, which are NOT in the event log,
-// and which carry a cursor from the shared sequence anyway (P9)
+// definition deltas — config changes. The FRAME names below are what a client
+// sees; the PERSISTED events behind them are `definition.*` types, which is a
+// non-folding namespace, so a replay can never re-create a definition (P9, P10.1)
 { "type": "agent.updated",       "cursor": 448913, "data": {} }
 { "type": "workflow.updated",    "cursor": 448914, "data": {} }
 { "type": "connection.updated",  "cursor": 448915, "data": {} }
 
-// execution deltas — folded from the event log
-{ "type": "execution.updated",   "cursor": 448916, "data": {} }
-{ "type": "step.updated",        "cursor": 448917, "data": {} }
-{ "type": "approval.updated",    "cursor": 448918, "data": {} }
+// deletion is a tombstone, not an emptied entity (P10.2)
+{ "type": "agent.deleted",       "cursor": 448916, "data": { "id": "…" } }
 
-// the raw event, for the activity feed and for island animation intents
-{ "type": "event",               "cursor": 448919, "data": {} }
+// execution deltas — folded from the event log
+{ "type": "execution.updated",   "cursor": 448917, "data": {} }
+{ "type": "step.updated",        "cursor": 448918, "data": {} }
+{ "type": "approval.updated",    "cursor": 448919, "data": {} }
+
+// the raw event, for the activity feed and for island animation intents.
+// Definition events are NOT delivered here (P10.3)
+{ "type": "event",               "cursor": 448920, "data": {} }
 ```
 
 Deltas stay whole-entity snapshots, not patches, so an ordering bug cannot produce a
@@ -299,13 +304,27 @@ half-applied entity. Channels (`agents`, `workflows`, `executions`, `approvals`,
 `world`) let Build Mode subscribe to definitions and Live Mode add executions and events,
 rather than every tab receiving everything.
 
+**A frame is not the record behind it (P10).** The durable record of a definition change
+is a row in `events` carrying **identity and the operation only**; the whole-entity `data`
+above is read from the definition table when the frame is built. That split is what keeps
+`instructions`, `labels`, `model_overrides` and `dispatch` - free-form fields that may hold
+an endpoint or a token - out of an append-only, retained log, while still serving the
+documented frame to a consumer authorized to read the entity.
+
+**The `event` channel excludes definition events (P10.3).** The raw frame above is the
+activity feed and the island's animation source. Definition events are rows in the same
+table, so without that exclusion configuration history would reach every `viewer` through
+the feed. A definition change reaches a client as a definition delta on its own channel,
+or not at all.
+
 **The protocol above is approved; the persistence behind it is not built.** A definition
 change has to be recorded durably in the same transaction as the mutation and published
 only after that transaction commits, or `resume` cannot replay it - a crash between the
-commit and the publish would drop a delta that nothing had recorded. The mechanism is an
-implementation question, and a lightweight transactional outbox is an allowed answer;
-nothing of the kind exists today. The property is not negotiable. See P9 in
-[`07-DECISION-RECORD.md`](07-DECISION-RECORD.md) §6, and R8 and R10 in
+commit and the publish would drop a delta that nothing had recorded. Publication is
+**at-least-once**: a duplicate after a crash is expected, and a client suppresses it by
+discarding any frame whose `cursor` it has already applied. Nothing here claims
+exactly-once delivery. See P9 and P10 in
+[`07-DECISION-RECORD.md`](07-DECISION-RECORD.md) §6, and R7, R8, R10, R11 and R13 in
 [`04-ROADMAP-AND-MVP.md`](04-ROADMAP-AND-MVP.md).
 
 ## 5. The world: Build Mode and Live Mode

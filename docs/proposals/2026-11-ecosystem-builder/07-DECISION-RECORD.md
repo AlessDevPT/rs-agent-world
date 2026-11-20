@@ -379,14 +379,16 @@ document exists to make.
 
 ## 6. Phase 3 ledger reconciliation (2026-11-20)
 
-Nine decisions. P1-P8 were taken after a read-only audit found that Phase 3's scope sentence
+Ten decisions. P1-P8 were taken after a read-only audit found that Phase 3's scope sentence
 (`04-ROADMAP-AND-MVP.md` §2, "this phase is T0–T8 and T13"), its build list, its
 acceptance ledger and the T-criteria in `08-PHASE-3-READINESS.md` did not agree with each
 other or with the code. **Approved by the product owner on 2026-11-20.** No criterion was
 deleted and no phase boundary moved except where a row below says so. **P9 was approved
 later the same day**, from the realtime-spine audit that followed: it is the one
 architecture decision R8 and R10 could not be implemented without, and it is detailed
-after the table.
+after the table. **P10 followed from the audit of P9's implementation feasibility**: five
+decisions that audit identified and deliberately did not take, three of them protocol
+surface. It is detailed after P9.
 
 | # | Decision | Why | Where it landed |
 |---|----------|-----|-----------------|
@@ -399,6 +401,7 @@ after the table.
 | **P7** | Two T8 criteria **amended rather than implemented**: backoff "asserted statistically" becomes asserted by bounds over the window; "a consequential dispatch defaults to `max_attempts = 1`" becomes "no dispatch can carry consequential work in this release" | Bounds are deterministic and strictly stronger than a sampled distribution, and are what `tests/unit/test_backoff.py` already asserts. `advance()` emits no consequential decision, so the second criterion presumed something that cannot exist until approvals land; the default moves to Phase 3a with them | `08-…` T8 criteria 3 and 4 |
 | **P8** | **No Phase 3 criterion carries into Phase 4** | Four of Phase 4's own acceptance criteria depend on live deltas, so carrying the spine forward would make Phase 4 unclosable as well. Phase 4 begins when Phase 3's ledger is closed | `docs/STATUS.md` §6 |
 | **P9** | **The shared per-project `events.seq` is the single cursor authority for both execution and definition deltas**, and a definition change must be recorded durably in the same transaction as the mutation it describes, with publication only after that transaction commits | One ordered cursor domain is what makes `resume` mean the same thing for both kinds of delta; two sequences would put two orderings into a protocol that has one `cursor` field. Durability is the other half: publishing after commit with nothing persisted is at-most-once, and a crash between the commit and the publish loses a delta silently - which `resume` would then never replay, because nothing recorded it. A separate definition cursor is **not** part of the approved design, and carrying the last-seen execution cursor without persisting the change is **not** acceptable, because neither can satisfy exact definition replay | `03-…` §4; `04-…` R8 and R10; `08-…` §5.1 rule 4 |
+| **P10** | **The five implementation decisions P9 left open**, taken on the P9 audit's recommendation of Option A - the committed `events` row is itself the durable publication record. In outline: a non-folding `definition.*` namespace, registered and `CONTROL_PLANE`; an explicit tombstone for deletion; definition events kept out of the raw activity feed; database-backed per-project publisher progress; and the existing worker as the publisher's host | Each one is narrow, and three of them are protocol surface rather than code style - the namespace, the tombstone and the feed boundary all change what a client sees, so they are recorded here rather than settled in review. Option A needs no new table for the payload: the event row is already durable, already per-project, and already ordered by the cursor the protocol carries | `03-…` §4; `04-…` R7, R8, R10, R11, R13; `08-…` §5.1 rule 4 |
 
 **What these decisions did not change.** The scope sentence, the phase boundaries other
 than P2's and P5's single-criterion moves, and every acceptance criterion's substance
@@ -443,3 +446,85 @@ replayable without touching the ingest lock, but it puts two orderings into a pr
 with a single `cursor` field. Carrying the last-seen execution cursor on a definition
 delta is cheapest and cannot replay at all, because nothing would persist the change the
 cursor claims to point at.
+
+### P10 in full — the five implementation decisions
+
+**Approved architecture. None of it is implemented.** No `definition.*` type is
+registered, nothing allocates a cursor for a definition change, no publisher exists,
+`infra/event_bus.py` does not exist, and the declared `redis` dependency is still never
+imported. R8 and R10 stay open, and nothing below ticks a box.
+
+**P10.1 — the persisted namespace is `definition.*`, registered, and
+`CONTROL_PLANE`.** Every persisted definition-event type is declared in the taxonomy with
+`producer=Producer.CONTROL_PLANE`, and the ingest service must refuse it as externally
+ingestible.
+
+Two findings from the audit make this load-bearing rather than tidy. First, `fold()`
+dispatches on the type's **namespace** - `domain/reducers/fold.py` partitions on the first
+`.` and looks the prefix up in `_REDUCERS`, which holds `agent`, `task`, `run`, `tool`,
+`workflow` and `approval`. The documented *frame* names are `agent.updated` and
+`workflow.updated`, and both of those namespaces fold. A persisted event reusing a frame
+name would therefore be handed to a reducer, and replay would begin re-creating
+definitions - which is exactly what `_agent`'s own docstring says must never happen. A
+`definition.*` namespace misses `_REDUCERS` and folds to nothing, structurally. Second,
+`services/ingest.py` reads the producer from the type's spec and **defaults an unregistered
+type to `Producer.AGENT`, which is ingestible** - so registration is the security control.
+An unregistered `definition.*` type could be forged by any ingest key.
+
+**P10.2 — deletion is an explicit tombstone.** The frame carries project identity, entity
+type, entity id and the shared sequence, and nothing else. No empty or half-populated
+entity is fabricated, and the persisted payload stays identity-and-operation. This is why
+R7 ("deltas are whole entities") needed a deletion carve-out: a tombstone is deliberately
+not an entity, and the alternative - an entity document with its fields blanked - is
+indistinguishable from a real update that cleared them.
+
+**P10.3 — definition events stay out of the raw activity feed.** The frame set has a
+`{ "type": "event" }` channel for the activity feed and island animation intents. Under
+Option A, definition events are rows in the same `events` table, so they would reach that
+channel unless the channel excludes them. It must. The reason is sensitivity, not tidiness:
+`instructions`, `labels`, `model_overrides` and `dispatch` are free-form and may hold an
+endpoint or a token, which is why the agent detail page withholds all four. Keeping the
+persisted payload to identity and operation is the other half of the same protection - the
+whole entity reaches an authorized consumer through the snapshot and delta path, read from
+the definition table at publish time, and never through activity history.
+
+**P10.4 — publisher progress is database-backed, per project.** Redis is the transport and
+never the source of truth for how far publication has got. Recovery reads committed
+`events` rows from the recorded position, so a publisher crash or a Redis outage loses
+nothing, and ordering stays the shared `events.seq`. This introduces **no second public
+cursor**: progress is server-side bookkeeping, not a number any client sees.
+
+**P10.5 — the existing worker hosts the publisher, if it can.** `workers/worker.py`
+already has what this needs: an `asyncio.Event` stop flag with signal handlers, an
+interruptible idle sleep, and a consecutive-error bound. Publication must not run on a
+request-scoped session - `Database` is built with `pool_size=5` and `max_overflow` at twice
+that, so a per-connection session would exhaust the pool at the sixteenth viewer, and the
+RLS context is transaction-local in any case.
+
+**This one is conditional on purpose.** If the worker's lifecycle turns out not to support
+reliable publication - its give-up bound stops the loop after consecutive failures, which
+is right for dispatches and may be wrong for a publisher that must keep trying through a
+Redis outage - then the concrete limitation is to be written down and the hosting left
+**explicitly unresolved**, rather than a third process being invented to avoid saying so.
+
+### What P10 does not claim
+
+Four audit findings survive this decision unchanged, and none of them is closed by it:
+
+- **The reverse lock order between ingestion and orchestration is pre-existing and still
+  open.** Ingest takes the project cursor lock and then writes entity rows; the
+  orchestrator takes the execution row lock and allocates the cursor lazily at append
+  time. That is a deadlock window between an agent reporting a step and `advance_once` on
+  the same execution. P9 and P10 do not solve it. What P10 does require is that a
+  definition mutation take the cursor lock **first**, matching ingest, so definition writes
+  do not join the reverse-order set.
+- **Nothing prunes event partitions**, and there is no operational replay-window policy, so
+  "beyond the replay window" has no definition today. **R11 stays open.**
+- **Redis is in the Compose stack, but the `api` CI job starts Postgres only.** The
+  Redis-dependent acceptance tests cannot run there until that job starts it.
+- **Publication is at-least-once, and exactly-once is not claimed.** A duplicate publish is
+  expected after a crash between publishing and recording progress. Clients stay correct
+  because every frame carries a monotonic `seq`: one that has applied `seq = N` discards
+  anything at or below it, so a duplicate produces no duplicate logical update while
+  ordering stays exact. That is a property the acceptance tests have to assert, not an
+  assumption.

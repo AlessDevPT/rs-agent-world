@@ -528,24 +528,41 @@ The first phase where something runs, and the first where something is visible.
       that follow it.
 - [ ] **R7 — Deltas are whole entities, never patches.** Every delta payload validates
       against the same view model the REST route returns, so an ordering bug cannot
-      produce a half-applied entity.
+      produce a half-applied entity. **Deletion is the one exception, and it is explicit:**
+      a tombstone carries project, entity type, entity id and the cursor, and nothing else
+      (P10.2). An entity document with its fields blanked would be indistinguishable from
+      an update that cleared them.
 - [ ] **R8 — Definition deltas come from the services that write definitions, and
       durably.** A `PATCH` on an agent produces `agent.updated`, carrying a cursor from the
       shared per-project `events.seq` (P9). The change is recorded durably in the **same
       transaction** as the mutation and published only after that transaction commits, so a
       crash between the two cannot drop a delta that `resume` would never replay - a
-      fire-and-forget publish does not satisfy this criterion. Nothing is added to the event
-      log: `03-API-AND-FRONTEND.md` §4 says config changes are **not** in it, and widening
-      the log would put Phase 2's replay property at risk for presentation's benefit.
+      fire-and-forget publish does not satisfy this criterion.
+      **The durable record is a row in `events`, in the non-folding `definition.*`
+      namespace, registered in the taxonomy with `producer=CONTROL_PLANE` and refused by
+      ingest as externally ingestible (P10.1).** An earlier revision of this box said
+      "nothing is added to the event log", which P9's Option A makes untrue: the row is
+      the record. What that sentence was protecting - a replay must never re-create a
+      definition - is preserved by the namespace instead, since `fold()` dispatches on it
+      and `definition` is not a reducer. Registration is the security control, not
+      bookkeeping: an unregistered type defaults to an ingestible producer.
 - [ ] **R9 — Execution deltas are folded from the log.** An ingested event produces
       `execution.updated` and `step.updated`, with a cursor that is monotonic per project.
 - [ ] **R10 — `resume` replays exactly what was missed.** Disconnect, mutate N times,
       resume from the old cursor: exactly N deltas, in order, no gap and no repeat — with
       the N split across definition and execution changes, since both share one cursor
-      domain (P9), and a definition change replayed from whatever durably recorded it.
+      domain (P9), and a definition change replayed from the `events` row that recorded it.
+      **Publication is at-least-once and this criterion does not ask otherwise:** a
+      duplicate publish after a crash is expected, and the assertion is that a client
+      applying frames in `cursor` order produces no duplicate *logical* update, because it
+      discards any cursor it has already applied.
 - [ ] **R11 — Beyond the window, `resync_required`.** A cursor older than the replay
       window is answered with `resync_required` and nothing else, and the client's only
       next move is a fresh snapshot.
+      **The window has no operational definition yet:** `events` is partitioned monthly and
+      **nothing prunes a partition**, so no cursor is currently unreachable. Testing this
+      needs either a configurable window or a dropped partition in the test. Open, and not
+      closed by P9 or P10.
 - [ ] **R12 — A slow consumer is dropped, not buffered without bound.** A consumer that
       never reads reaches the configured queue bound and is closed with
       `resync_required`; server memory stays bounded while it happens.
@@ -553,6 +570,9 @@ The first phase where something runs, and the first where something is visible.
       mutation, both sockets receiving identical frames with identical cursors. This is
       the criterion `inprocess` cannot satisfy, and the reason P4 chose `redis` for the
       acceptance run.
+      **One CI fact to settle first:** Redis is in `infra/compose/docker-compose.yml`, but
+      the `api` job starts Postgres only, so a Redis-dependent test cannot run there until
+      that job starts it. The `compose` job already starts the whole stack.
 - [ ] **R14 — No fabricated state.** With no activity there is no synthetic heartbeat,
       status or delta; every delta traces to a write or to a folded event. The same rule
       the island's "no mock data path" box states, asserted one layer lower.

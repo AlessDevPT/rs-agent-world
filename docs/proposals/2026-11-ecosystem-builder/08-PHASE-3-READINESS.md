@@ -406,6 +406,26 @@ Four rules hold the shape:
    separate definition cursor, and no carrying the last-seen execution cursor without
    persisting the change it points at.
 
+   **How, settled on 2026-11-20 (P10).** The committed `events` row is itself the durable
+   publication record - Option A, so no second table holds the payload. The persisted type
+   lives in a **non-folding `definition.*` namespace**, registered with
+   `producer=CONTROL_PLANE` and refused by ingest, which is what keeps rule 4 above true:
+   `fold()` dispatches on the namespace, and `definition` is not a reducer, so a replay
+   still cannot re-create a definition. Deletion is a tombstone rather than an emptied
+   entity; the raw activity-feed channel excludes definition events, so configuration never
+   reaches a `viewer` through history; publisher progress is database-backed per project
+   with Redis as transport only; and the existing worker hosts the publisher unless its
+   give-up bound proves wrong for one, in which case the limitation is to be written down
+   and the hosting left unresolved.
+
+   **Three things P10 does not fix, stated so they are not read as closed.** The reverse
+   lock order between ingest (cursor, then rows) and the orchestrator (execution row, then
+   cursor at append) is pre-existing and still a deadlock window; P10 only requires that a
+   definition mutation take the cursor lock *first* so it does not join that set. Nothing
+   prunes event partitions, so R11's window has no operational meaning yet. And publication
+   is at-least-once: duplicates are expected and suppressed by the client's cursor, not
+   prevented.
+
 ### 5.2 Why replay still cannot cause work
 
 The guarantee survives Phase 3 for the same structural reason it holds now. `fold()` returns
