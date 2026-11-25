@@ -550,8 +550,21 @@ The first phase where something runs, and the first where something is visible.
       bookkeeping: an unregistered type defaults to an ingestible producer.
       **The eleven types are enumerated in P11**, each with `folds_into=()` and the subject
       `SubjectKind.PROJECT`. Model profiles are out of scope for this criterion: they are
-      workspace-scoped and have no per-project cursor (P11.5). Approved and **not
-      implemented** - nothing registers a type or emits one yet.
+      workspace-scoped and have no per-project cursor (P11.5).
+      **Which services count as "the services that write definitions" is settled by P13**,
+      whose table is the authoritative producer inventory: fourteen approved producers,
+      thirteen of them in `services/definitions.py` and one - **publishing a workflow** - in
+      `services/executions.py`, because `WorkflowRepository.publish` moves
+      `workflows.current_version_id` and that column is in the workflow the API returns. A
+      publish is one operation and emits one event. The test-harness writer in
+      `services/agent_test.py` is **not** a producer: `WorkflowRepository.list_all` filters
+      `test_for_agent_id IS NULL`, so a harness is not in the listing this criterion keeps
+      in sync.
+      **Partly implemented, and this box stays open.** The eleven types are registered and
+      refused to ingest, and one producer emits - `AgentService.update`. The remaining
+      thirteen call sites do not, so no `resume` can yet replay a definition change for any
+      entity but an edited agent, and R10 is open for the same reason. An approved producer
+      is not an implemented one; P13's table says which each is.
 - [ ] **R9 — Execution deltas are folded from the log.** An ingested event produces
       `execution.updated` and `step.updated`, with a cursor that is monotonic per project.
 - [ ] **R10 — `resume` replays exactly what was missed.** Disconnect, mutate N times,

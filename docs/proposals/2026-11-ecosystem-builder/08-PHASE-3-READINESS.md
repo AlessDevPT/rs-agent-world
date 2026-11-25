@@ -426,7 +426,24 @@ Four rules hold the shape:
    the only deletion; archive is an update to an entity that stays addressable. Model
    profiles are **out of scope** for Phase 3, being workspace-scoped with no per-project
    cursor, and a workspace-level domain is left as an open question rather than invented.
-   **None of this is implemented**, and the unknown-event fallback is unchanged.
+   The unknown-event fallback is unchanged.
+
+   **Which producers, settled on 2026-11-25 (P13).** Fourteen approved producers, listed in
+   P13's table: thirteen call sites in `services/definitions.py` and one in
+   `services/executions.py`, because publishing a workflow moves
+   `workflows.current_version_id` and that column is in the workflow the API returns. A
+   publish is **one** operation emitting **one** event, whatever it writes internally. The
+   test-harness writer in `services/agent_test.py` is **not** a producer, because
+   `WorkflowRepository.list_all` filters `test_for_agent_id IS NULL` and a harness is
+   therefore not in the listing snapshot and delta keep in sync - though a direct lookup by
+   id will still return one, so the claim is about the synchronized listing and not about
+   every endpoint.
+
+   **What is implemented, as against approved.** The eleven types are registered and
+   refused to ingest, and exactly one producer emits: `AgentService.update`. The other
+   thirteen do not. **R8 and R10 stay open**, and P13's table is where the two states are
+   told apart - an approved producer is not an implemented one, and a sentence claiming
+   either about all of them at once will be wrong again within a milestone.
 
    **Three things P10 does not fix, stated so they are not read as closed.** The reverse
    lock order between ingest (cursor, then rows) and the orchestrator (execution row, then

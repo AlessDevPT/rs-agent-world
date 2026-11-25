@@ -379,7 +379,7 @@ document exists to make.
 
 ## 6. Phase 3 ledger reconciliation (2026-11-20)
 
-Twelve decisions. P1-P8 were taken after a read-only audit found that Phase 3's scope sentence
+Thirteen decisions. P1-P8 were taken after a read-only audit found that Phase 3's scope sentence
 (`04-ROADMAP-AND-MVP.md` §2, "this phase is T0–T8 and T13"), its build list, its
 acceptance ledger and the T-criteria in `08-PHASE-3-READINESS.md` did not agree with each
 other or with the code. **Approved by the product owner on 2026-11-20.** No criterion was
@@ -394,6 +394,11 @@ types without ever naming them - so the first task that needed them could not st
 **P12 followed from the M3 implementation audit**, which found that P11 had settled every
 field of a definition event except one the database requires and no decision had named:
 `dedup_key`. **Approved by the product owner on 2026-11-25.**
+**P13 followed from the audit of the remaining definition writers**, which found that
+P11's inventory of "sixteen write operations across four services" was complete for
+`services/definitions.py` and not complete for the codebase: publishing a workflow moves
+a client-visible column from `services/executions.py`, and no approved producer covered
+it. **Approved by the product owner on 2026-11-25.**
 
 | # | Decision | Why | Where it landed |
 |---|----------|-----|-----------------|
@@ -409,6 +414,7 @@ field of a definition event except one the database requires and no decision had
 | **P10** | **The five implementation decisions P9 left open**, taken on the P9 audit's recommendation of Option A - the committed `events` row is itself the durable publication record. In outline: a non-folding `definition.*` namespace, registered and `CONTROL_PLANE`; an explicit tombstone for deletion; definition events kept out of the raw activity feed; database-backed per-project publisher progress; and the existing worker as the publisher's host | Each one is narrow, and three of them are protocol surface rather than code style - the namespace, the tombstone and the feed boundary all change what a client sees, so they are recorded here rather than settled in review. Option A needs no new table for the payload: the event row is already durable, already per-project, and already ordered by the cursor the protocol carries | `03-…` §4; `04-…` R7, R8, R10, R11, R13; `08-…` §5.1 rule 4 |
 | **P11** | **The eleven persisted definition event types, and the conventions they follow.** `definition.agent.{created,updated,archived,restored}`, `definition.workflow.{created,updated,archived,restored}` and `definition.connection.{created,updated,deleted}` - each registered with `producer=Producer.CONTROL_PLANE` and `folds_into=()`, subject `SubjectKind.PROJECT`, entity type and uuid in the payload. Model profiles are out of scope for Phase 3 | P10.1 named the namespace and the obligation to register, and the M2 audit found it had never named the types - so M2 could not begin without either inventing protocol surface or stopping. These eleven are what the sixteen definition writes actually produce: `AgentService` and `WorkflowService` have no `delete`, so a deletion type exists for connections alone. And `SubjectKind` has no member for a workflow definition or a connection, while `SubjectKind.AGENT`'s `subject_ref` is the `agent_key` rather than a uuid - so `PROJECT` plus a payload id is what satisfies P10.2 without redefining a convention the reducers already depend on | `03-…` §4; `04-…` R7 and R8; `08-…` §5.1 rule 4 |
 | **P12** | **A definition event's `dedup_key` carries the allocated `seq`**: `def:{entity}:{entity_id}:{operation}:{seq}`. An operation that changes nothing appends no event, and a definition event's resolved reference columns are left NULL | `dedup_key` is `NOT NULL` and uniquely indexed per project per monthly partition, so M3 could not write a row without a convention, and P11 had named none. The obvious one - the orchestrator's `exec:{id}:started` shape, without the `seq` - is wrong twice over for an event that recurs: it collides on the second edit of the same entity in a month, turning every later edit into a 409 whose advice ("try again") can never come true; and because the index is on `dedup_key` alone rather than `(type, dedup_key)`, and `append()` never consults `seen()`, a predictable key is **pre-claimable by any agent ingest key** - a heartbeat carrying `def:agent:<uuid>:updated` would block the control plane from ever editing that agent again. `seq` is allocated under the cursor lock before the append, so it is unique per project by construction and unguessable in advance | `04-…` R8; `08-…` §5.1 rule 4 |
+| **P13** | **`ExecutionService._publish` is an approved producer of the existing `definition.workflow.updated`**, and the test-harness writer in `services/agent_test.py` is excluded. Publishing a workflow is **one** logical operation emitting **one** event, whatever it writes internally. No new event type: the eleven stand | `WorkflowRepository.publish` moves `workflows.current_version_id` - its own docstring says publishing *is* moving that pointer - and that column is in the API view, populated on the workflow response and deciding each version's `is_current`. So publishing changes the definition a client holds, while `_publish` appended nothing and wrote only an audit row: a client's workflow detail would go stale and `resume` would never replay the change, because nothing recorded it. That is the hole R8 exists to close, and closing it needs no protocol surface - `definition.workflow.updated` already exists and `workflow.updated` is already the frame a client needs in order to refetch. The harness writer is excluded because `WorkflowRepository.list_all` filters `test_for_agent_id IS NULL`, so a harness is not a member of the listing that snapshot and delta keep in sync | `04-…` R8; `08-…` §5.1 rule 4 |
 
 **What these decisions did not change.** The scope sentence, the phase boundaries other
 than P2's and P5's single-criterion moves, and every acceptance criterion's substance
@@ -706,3 +712,121 @@ cursor-first ordering introduces no new lock cycle - every existing writer of an
 row either takes the cursor first or never takes it - so M3 does not need this decided.
 A retry policy or a lock timeout is cross-cutting across ingest, the orchestrator and the
 worker, and deserves its own scope.
+
+### P13 in full — the complete producer inventory
+
+**Approved, not implemented.** One producer is implemented (`AgentService.update`, the step
+the decision record calls M3). Everything else below is approved and unwired, and **R8 and
+R10 stay unchecked**.
+
+P11 counted "sixteen write operations across four services" in `services/definitions.py`.
+That count is right about that file. The audit of the remaining writers enumerated every
+write method on `AgentRepository`, `ConnectionRepository` and `WorkflowRepository` and then
+found every caller, which turned up **two writers outside it**. One is excluded with a
+reason; the other is the subject of this decision.
+
+**1. The inventory.** Fourteen approved producers, of which one is implemented: thirteen
+call sites in `services/definitions.py` and one in `services/executions.py`.
+
+| Producer | Event type | State |
+|---|---|---|
+| `AgentService.create` | `definition.agent.created` | approved |
+| `AgentService.update` | `definition.agent.updated` | **implemented** |
+| `AgentService.archive` | `definition.agent.archived` | approved |
+| `AgentService.restore` | `definition.agent.restored` | approved |
+| `ConnectionService.create` | `definition.connection.created` | approved |
+| `ConnectionService.update` | `definition.connection.updated` | approved |
+| `ConnectionService.delete` | `definition.connection.deleted` | approved |
+| `WorkflowService.create` | `definition.workflow.created` | approved |
+| `WorkflowService.compile_delegation` | `definition.workflow.created` | approved, **no production caller** |
+| `WorkflowService.update` | `definition.workflow.updated` | approved |
+| `WorkflowService.save_draft` | `definition.workflow.updated` | approved |
+| `WorkflowService.archive` | `definition.workflow.archived` | approved |
+| `WorkflowService.restore` | `definition.workflow.restored` | approved |
+| **`ExecutionService._publish`** | **`definition.workflow.updated`** | **approved - new in P13** |
+
+So the work remaining after M3 is **twelve operations in `services/definitions.py` plus one
+in `services/executions.py`** - thirteen call sites, producing the ten types M3 did not.
+`ModelProfileService.create`, `update` and `delete` are not producers at all (P11.5).
+
+**An approved producer is not an implemented one**, and the table says which is which on
+purpose. Every earlier revision of this record that said "none of this is implemented" was
+true when written and is not true now; the distinction has to be read off this column
+rather than off a sentence that ages.
+
+**2. Publishing a workflow emits exactly one event.** `ExecutionService._publish` calls
+`WorkflowRepository.publish(...)` and then `next_draft(...)`, and between them they insert
+workflow steps and edges, set `published_at` on the version, move
+`workflows.current_version_id` and open the next draft. That is **one** act - a publish -
+and it emits **one** `definition.workflow.updated`. Counting the internal writes would
+publish several deltas for a change a client experiences once, and would spend several
+cursor positions doing it.
+
+**3. It stays in one transaction.** Sequence reservation, the publication, the next draft,
+the event append and the existing audit write all share `_publish`'s existing transaction,
+with the cursor reserved **before** the first definition write, exactly as P9 and M3's
+pattern require. Nothing about `_publish` becomes a second transaction, and no publish may
+commit with its event unwritten.
+
+**4. The payload is the approved one.** Identity and operation: entity type and entity
+uuid, subject `SubjectKind.PROJECT`, `dedup_key` carrying the allocated `seq` (P12). **No
+new event type, no workflow snapshot, no graph, no step or edge contents, no credentials,
+no instructions, no configuration.** A publish makes a frozen graph live, and that graph is
+exactly the kind of free-form content P10.3 keeps out of an append-only log; the whole
+entity reaches an authorized consumer at publish time from the read model.
+
+**5. The harness writer is excluded, and here is the precise reason.**
+`services/agent_test.py` creates a `workflows` row through
+`WorkflowRepository.find_or_create_test` on an agent's first test, authorizing
+`WORKFLOW_CREATE` and writing an audit row. It is **not** a definition producer, because
+`WorkflowRepository.list_all` filters `test_for_agent_id IS NULL` - so a harness is not a
+member of the workflow listing that snapshot and delta keep synchronized, and a delta for
+it would describe a change to a collection no client holds.
+
+**The limit of that argument, stated so it is not overstated.** `list_all` is one reader.
+`WorkflowService.get` will return a harness by id, and `WorkflowRepository.test_for` reads
+one deliberately. The claim is therefore **"no listing a client subscribes to contains a
+harness"**, not "no endpoint can return one". That is sufficient for snapshot-and-delta
+consistency and is the whole of the exclusion. It is written down because the exclusion is
+currently correct by the behaviour of a filter, and a reader who found the gap without
+finding the filter would reasonably mistake it for an oversight.
+
+**6. `compile_delegation` has no production caller.** Its only caller anywhere is
+`tests/integration/test_delegation_compilation.py`; there is no route and no service
+reaches it. It stays an approved producer and its event should be wired with the rest -
+this is a fact about today's reachability, **not** a reason to omit the wiring, since a
+producer left unwired because nothing calls it is a producer that will be missing on the
+day something does.
+
+### Implementation constraints P13 records for the next step
+
+These came out of the audit. They are **constraints, not work done**.
+
+- **`AgentService.create` is in scope, and it moves M3's test numbers.**
+  `tests/integration/test_definition_events.py` asserts `seq == 1`, `[1, 2]` and that the
+  project has no cursor row, every one of them resting on its own stated premise that
+  creating an agent appends nothing. Wiring `create` makes the creation take `seq 1`. Those
+  assertions must become **relative** - captured after setup - rather than re-baselined to
+  new fixed numbers, or the step after this one moves them again.
+- **Where the mutation is also the existence check, reserve the cursor first and let a
+  not-found roll back.** `AgentService.restore`, `WorkflowService.restore` and
+  `ConnectionService.delete` have no prior read to refuse against, so a 404 will briefly
+  take the project's cursor lock. That is accepted. **Do not add a read-then-write precheck
+  to avoid it**: it costs a query and reintroduces the race the single statement avoids, to
+  buy back a lock held for microseconds by a caller who is already authorized.
+  `AgentService.archive`, `WorkflowService.archive` and the three `update`s read first and
+  so keep M3's property of resolving every refusal before the lock.
+- **The no-op guard is preserved for the `update` operations.** All four definition
+  repositories share the same early return - `if not values: return await self.get(...)` -
+  so P12.2 transfers verbatim to `ConnectionService.update` and `WorkflowService.update`.
+  The other operations always write when they succeed and need no guard; adding one there
+  would be dead code.
+- **`save_draft` always writes**, because `graph` is a required argument. There is no
+  autosave or debounce in `apps/web` today and **none is to be introduced here**. A future
+  graph editor that autosaved would turn each save into an event and a cursor position, and
+  that is that editor's problem to solve, server-side, when it exists.
+- **`connection.delete` carries the approved identity-and-operation payload like every
+  other type.** It is the only hard delete, so it is the one case where the publisher cannot
+  read the entity back - which is exactly why P10.2 asks for a tombstone. **Tombstone
+  construction is a client-frame concern and remains later work**; the persisted event is
+  not special.
