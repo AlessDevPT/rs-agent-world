@@ -379,7 +379,7 @@ document exists to make.
 
 ## 6. Phase 3 ledger reconciliation (2026-11-20)
 
-Eleven decisions. P1-P8 were taken after a read-only audit found that Phase 3's scope sentence
+Twelve decisions. P1-P8 were taken after a read-only audit found that Phase 3's scope sentence
 (`04-ROADMAP-AND-MVP.md` §2, "this phase is T0–T8 and T13"), its build list, its
 acceptance ledger and the T-criteria in `08-PHASE-3-READINESS.md` did not agree with each
 other or with the code. **Approved by the product owner on 2026-11-20.** No criterion was
@@ -391,6 +391,9 @@ decisions that audit identified and deliberately did not take, three of them pro
 surface. It is detailed after P9. **P11 followed from the M2 implementation audit**, which
 found that P10.1 had named the `definition.*` namespace and the obligation to register its
 types without ever naming them - so the first task that needed them could not start.
+**P12 followed from the M3 implementation audit**, which found that P11 had settled every
+field of a definition event except one the database requires and no decision had named:
+`dedup_key`. **Approved by the product owner on 2026-11-25.**
 
 | # | Decision | Why | Where it landed |
 |---|----------|-----|-----------------|
@@ -405,6 +408,7 @@ types without ever naming them - so the first task that needed them could not st
 | **P9** | **The shared per-project `events.seq` is the single cursor authority for both execution and definition deltas**, and a definition change must be recorded durably in the same transaction as the mutation it describes, with publication only after that transaction commits | One ordered cursor domain is what makes `resume` mean the same thing for both kinds of delta; two sequences would put two orderings into a protocol that has one `cursor` field. Durability is the other half: publishing after commit with nothing persisted is at-most-once, and a crash between the commit and the publish loses a delta silently - which `resume` would then never replay, because nothing recorded it. A separate definition cursor is **not** part of the approved design, and carrying the last-seen execution cursor without persisting the change is **not** acceptable, because neither can satisfy exact definition replay | `03-…` §4; `04-…` R8 and R10; `08-…` §5.1 rule 4 |
 | **P10** | **The five implementation decisions P9 left open**, taken on the P9 audit's recommendation of Option A - the committed `events` row is itself the durable publication record. In outline: a non-folding `definition.*` namespace, registered and `CONTROL_PLANE`; an explicit tombstone for deletion; definition events kept out of the raw activity feed; database-backed per-project publisher progress; and the existing worker as the publisher's host | Each one is narrow, and three of them are protocol surface rather than code style - the namespace, the tombstone and the feed boundary all change what a client sees, so they are recorded here rather than settled in review. Option A needs no new table for the payload: the event row is already durable, already per-project, and already ordered by the cursor the protocol carries | `03-…` §4; `04-…` R7, R8, R10, R11, R13; `08-…` §5.1 rule 4 |
 | **P11** | **The eleven persisted definition event types, and the conventions they follow.** `definition.agent.{created,updated,archived,restored}`, `definition.workflow.{created,updated,archived,restored}` and `definition.connection.{created,updated,deleted}` - each registered with `producer=Producer.CONTROL_PLANE` and `folds_into=()`, subject `SubjectKind.PROJECT`, entity type and uuid in the payload. Model profiles are out of scope for Phase 3 | P10.1 named the namespace and the obligation to register, and the M2 audit found it had never named the types - so M2 could not begin without either inventing protocol surface or stopping. These eleven are what the sixteen definition writes actually produce: `AgentService` and `WorkflowService` have no `delete`, so a deletion type exists for connections alone. And `SubjectKind` has no member for a workflow definition or a connection, while `SubjectKind.AGENT`'s `subject_ref` is the `agent_key` rather than a uuid - so `PROJECT` plus a payload id is what satisfies P10.2 without redefining a convention the reducers already depend on | `03-…` §4; `04-…` R7 and R8; `08-…` §5.1 rule 4 |
+| **P12** | **A definition event's `dedup_key` carries the allocated `seq`**: `def:{entity}:{entity_id}:{operation}:{seq}`. An operation that changes nothing appends no event, and a definition event's resolved reference columns are left NULL | `dedup_key` is `NOT NULL` and uniquely indexed per project per monthly partition, so M3 could not write a row without a convention, and P11 had named none. The obvious one - the orchestrator's `exec:{id}:started` shape, without the `seq` - is wrong twice over for an event that recurs: it collides on the second edit of the same entity in a month, turning every later edit into a 409 whose advice ("try again") can never come true; and because the index is on `dedup_key` alone rather than `(type, dedup_key)`, and `append()` never consults `seen()`, a predictable key is **pre-claimable by any agent ingest key** - a heartbeat carrying `def:agent:<uuid>:updated` would block the control plane from ever editing that agent again. `seq` is allocated under the cursor lock before the append, so it is unique per project by construction and unguessable in advance | `04-…` R8; `08-…` §5.1 rule 4 |
 
 **What these decisions did not change.** The scope sentence, the phase boundaries other
 than P2's and P5's single-criterion moves, and every acceptance criterion's substance
@@ -625,3 +629,80 @@ accepted, by the compatibility promise, unless that is separately decided.
 `agent.updated`. The example now shows `connection.deleted`, the only deletion among the
 eleven. Nothing else in the documentation contradicted the type names, the tombstone
 representation or the frame mapping.
+
+### P12 in full — the definition event envelope
+
+**Approved, not implemented. M3 has not started.** P11 settled the type, the producer, the
+folding, the subject and the payload. The M3 audit found it had not settled `dedup_key`,
+which `EventEnvelope` requires as a plain `str` and the `events` table declares `CITEXT NOT
+NULL` - so M3 could not append a row without either inventing a convention or stopping.
+
+**1. The key: `def:{entity}:{entity_id}:{operation}:{seq}`.** For the first writer that is
+`def:agent:{agent_id}:updated:{seq}`, and the pattern generalises to the other ten so that
+M4 repeats a decision rather than taking one. `seq` is the number already allocated from
+the shared per-project cursor (P9) under the cursor lock, immediately before the append.
+
+**Why the `seq` is in the key, and not merely decorative.** Uniqueness on `events` is
+`UNIQUE (project_id, dedup_key)`, enforced by an index on **each monthly partition** rather
+than on the table - the partition key would otherwise have to be part of the constraint,
+which would let one key through twice at different timestamps. Two consequences follow, and
+the convention exists because of both.
+
+- **A recurring event cannot carry a once-per-entity key.** The existing control-plane
+  precedent is `exec:{execution_id}:started` and `exec:{execution_id}:cancelled`, which are
+  correct *because* an execution starts once. An agent is edited repeatedly. A key of
+  `def:agent:{agent_id}:updated` would insert cleanly the first time and raise `23505` every
+  later time within the partition, which `CONFLICT_SQLSTATES` maps to a 409 reading "That
+  change collided with a concurrent change. Try again." - advice that would never come true,
+  for the rest of the month, for that agent.
+- **A predictable key is pre-claimable, and the key space is shared with ingest.** The index
+  covers `dedup_key` alone, not `(type, dedup_key)`; and `EventRepository.append` never
+  consults `seen()` - only `services/ingest.py` does. So a holder of an agent ingest key
+  could post an ordinary `agent.heartbeat` whose `dedup_key` is
+  `def:agent:<uuid>:updated` and thereby make that agent permanently uneditable through the
+  control plane. The definition *type* is refused to an ingest key by P11's producer
+  boundary; the *key* was never reserved. Carrying `seq` closes this, because `seq` is not
+  knowable before the write it belongs to.
+
+**2. An operation that changes nothing appends nothing.** `AgentRepository.update` returns
+the row unchanged, performing no `UPDATE`, when every field arrives `UNSET`, while
+`audit.record` still writes a row. The event log follows the mutation, not the request: an
+empty `PATCH` appends no event and consumes no `seq`. The asymmetry is deliberate and is
+the existing division of labour - **the audit log records that someone asked, the event log
+records that something changed.** A delta describing no change would otherwise reach every
+subscriber and cost a cursor position.
+
+**3. A definition event's resolved reference columns stay NULL.** `events.agent_id`,
+`task_id`, `run_id`, `execution_id` and `execution_step_id` are left unset rather than
+pointing at the entity the payload names. `EventRepository.resolve` matches only the
+subject kinds `agent`, `task`, `run` and `workflow_execution`, so for P11's `PROJECT`
+subject it already returns an all-`None` result - after four lookups that cannot match.
+Passing the empty result directly is therefore equivalent and cheaper. It also keeps
+definition rows off `events_agent_idx`, which is the direction P10.3 requires: definition
+events stay out of the raw activity feed. An authorized consumer reaches the entity through
+the snapshot and delta path, where the whole entity is read from the definition table at
+publish time.
+
+### What P12 does not claim
+
+**It does not fix the pre-claimable keys that already exist.** `exec:{execution_id}:started`
+and `exec:{execution_id}:cancelled` are reservable today by exactly the mechanism described
+above. They are once-per-execution, so the collision cost is bounded differently, but the
+exposure is real and pre-dates this decision. **It is not M3's to absorb** - a fix touches
+the orchestrator's envelope construction and belongs with whoever decides whether
+uniqueness should be scoped `(type, dedup_key)` instead.
+
+**It does not address the partition horizon.** `agentworld_ensure_partitions(2)` is called
+only from migration 0011 and from no schedule, so `INSERT INTO events` has no partition
+roughly two months past the last migration. That is a Phase 2 defect, not a Phase 3
+decision - but M3 raises its severity, because after M3 the symptom is no longer that
+telemetry stops: **it is that no agent can be edited.** Whoever owns the deployment runbook
+owns this.
+
+**It does not decide deadlock retry.** `40P01` is absent from `CONFLICT_SQLSTATES`, raises
+`OperationalError` for which no handler is registered, and so reaches the catch-all as a
+500; no retry exists anywhere, and no `lock_timeout` is set. The M3 audit established that
+cursor-first ordering introduces no new lock cycle - every existing writer of an `agents`
+row either takes the cursor first or never takes it - so M3 does not need this decided.
+A retry policy or a lock timeout is cross-cutting across ingest, the orchestrator and the
+worker, and deserves its own scope.
