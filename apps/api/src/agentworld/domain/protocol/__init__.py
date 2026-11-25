@@ -9,6 +9,7 @@ build an event without standing anything up.
 from agentworld.domain.protocol.envelope import parse_envelope
 from agentworld.domain.protocol.taxonomy import (
     CUSTOM_NAMESPACE,
+    DEFINITION_EVENTS,
     KNOWN_EVENTS,
     KNOWN_NAMESPACES,
     EventSpec,
@@ -31,6 +32,7 @@ from agentworld.domain.protocol.version import (
 
 __all__ = [
     "CUSTOM_NAMESPACE",
+    "DEFINITION_EVENTS",
     "KNOWN_EVENTS",
     "KNOWN_NAMESPACES",
     "PROTOCOL_MAJOR",

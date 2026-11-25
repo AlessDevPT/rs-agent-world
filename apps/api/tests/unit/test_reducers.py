@@ -25,7 +25,12 @@ from agentworld.domain.enums import (
     StepStatus,
     TaskStatus,
 )
-from agentworld.domain.protocol import KNOWN_EVENTS, PROTOCOL_VERSION, parse_envelope
+from agentworld.domain.protocol import (
+    DEFINITION_EVENTS,
+    KNOWN_EVENTS,
+    PROTOCOL_VERSION,
+    parse_envelope,
+)
 from agentworld.domain.reducers import (
     AgentRef,
     AgentStatusRef,
@@ -158,6 +163,25 @@ def test_folding_the_same_event_twice_gives_the_same_mutations() -> None:
 
 
 # ----------------------------------------------------------- folds to nothing ---
+
+
+@pytest.mark.parametrize("event_type", sorted(DEFINITION_EVENTS))
+def test_a_definition_event_folds_into_nothing(event_type: str) -> None:
+    """The isolation M2 rests on, asserted through `fold()` itself.
+
+    `fold()` dispatches on the namespace, and `definition` is not a key in
+    `_REDUCERS` - so this holds however the rest of the name reads. That is
+    the reason the persisted types are **not** `agent.updated` and
+    `workflow.updated`, which are the names the client *frames* use: those
+    namespaces have reducers, and a replay would have begun re-creating
+    definitions (P11.1).
+
+    Folded against a populated agent state rather than an empty one, so a
+    reducer that did fire would have something to change and the assertion
+    would catch it.
+    """
+    assert folded(event_type, "project", "p-1") == ()
+    assert folded(event_type, "project", "p-1", {"status": "working"}) == ()
 
 
 @pytest.mark.parametrize(

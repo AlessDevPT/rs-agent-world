@@ -229,10 +229,57 @@ KNOWN_EVENTS: Final[Mapping[str, EventSpec]] = {
     "approval.expired": _spec(
         SubjectKind.APPROVAL, folds_into=_STEPS, producer=Producer.CONTROL_PLANE
     ),
+    # ---- definition: a config change, recorded so a delta can be replayed -
+    #
+    # `CONTROL_PLANE`, every one, and `folds_into=()`, every one. These exist
+    # so the realtime gateway can replay a definition change from the same
+    # per-project `events.seq` an execution delta carries (P9); they are not
+    # how a definition is applied, which is still a role-gated API call with
+    # an `audit_log` row beside it.
+    #
+    # **The namespace is why replay stays safe.** `fold()` dispatches on the
+    # part before the first `.`, and `definition` is not a key in
+    # `_REDUCERS`, so none of these can reach a reducer however it is named
+    # after that. Putting them in `agent.*` or `workflow.*` - the namespaces
+    # the *client frames* use - would have handed them to `_agent` and
+    # `_workflow`, and a replay would have begun re-creating definitions.
+    #
+    # **And registration is the security boundary, not bookkeeping.**
+    # `services/ingest.py` reads the producer from the spec and defaults an
+    # unregistered type to `Producer.AGENT`, which is ingestible. Until these
+    # eleven were registered, an ingest key could post
+    # `definition.agent.updated` and have it stored, folding into nothing -
+    # and a publisher reading `definition.*` rows would then have published a
+    # forged definition delta.
+    #
+    # The subject is `PROJECT` because `SubjectKind` has no member for a
+    # workflow definition or a connection, and `AGENT`'s `subject_ref` is the
+    # `agent_key` rather than a uuid; the entity type and id travel in the
+    # payload instead (P11.3). There is deliberately no `.deleted` for an
+    # agent or a workflow: neither service has a `delete`, they archive and
+    # restore, and the rows survive.
+    "definition.agent.created": _spec(SubjectKind.PROJECT, producer=Producer.CONTROL_PLANE),
+    "definition.agent.updated": _spec(SubjectKind.PROJECT, producer=Producer.CONTROL_PLANE),
+    "definition.agent.archived": _spec(SubjectKind.PROJECT, producer=Producer.CONTROL_PLANE),
+    "definition.agent.restored": _spec(SubjectKind.PROJECT, producer=Producer.CONTROL_PLANE),
+    "definition.workflow.created": _spec(SubjectKind.PROJECT, producer=Producer.CONTROL_PLANE),
+    "definition.workflow.updated": _spec(SubjectKind.PROJECT, producer=Producer.CONTROL_PLANE),
+    "definition.workflow.archived": _spec(SubjectKind.PROJECT, producer=Producer.CONTROL_PLANE),
+    "definition.workflow.restored": _spec(SubjectKind.PROJECT, producer=Producer.CONTROL_PLANE),
+    "definition.connection.created": _spec(SubjectKind.PROJECT, producer=Producer.CONTROL_PLANE),
+    "definition.connection.updated": _spec(SubjectKind.PROJECT, producer=Producer.CONTROL_PLANE),
+    "definition.connection.deleted": _spec(SubjectKind.PROJECT, producer=Producer.CONTROL_PLANE),
     # ---- log and metric: recorded, never folded into state --------------
     "log.emitted": _spec(SubjectKind.AGENT, SubjectKind.RUN, SubjectKind.PROJECT),
     "metric.recorded": _spec(SubjectKind.AGENT, SubjectKind.PROJECT),
 }
+
+#: The eleven definition types, in one place so a test can iterate them
+#: without restating the list. Derived from the table above rather than
+#: written twice: a type added to the namespace is covered automatically.
+DEFINITION_EVENTS: Final[tuple[str, ...]] = tuple(
+    event_type for event_type in KNOWN_EVENTS if event_type.startswith("definition.")
+)
 
 #: The namespaces the closed part of the taxonomy covers.
 KNOWN_NAMESPACES: Final[frozenset[str]] = frozenset(

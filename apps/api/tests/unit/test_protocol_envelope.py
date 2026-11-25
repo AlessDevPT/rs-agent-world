@@ -16,6 +16,7 @@ import pytest
 from agentworld.domain.enums import EventSeverity
 from agentworld.domain.errors import ValidationFailedError
 from agentworld.domain.protocol import (
+    DEFINITION_EVENTS,
     KNOWN_EVENTS,
     PROTOCOL_VERSION,
     Producer,
@@ -266,18 +267,110 @@ def test_every_known_event_type_is_well_formed() -> None:
         )
 
 
-def test_no_known_event_describes_editing_a_definition() -> None:
-    """Replaying the log must never re-create a definition, so the types that
-    would let it are absent rather than ignored."""
-    forbidden = {"created", "updated", "deleted", "published", "edited", "configured"}
-    offenders = [
-        event_type
-        for event_type in KNOWN_EVENTS
-        if event_type.split(".", 1)[1] in forbidden
-        # `task.created` is a unit of work appearing, not a definition change.
-        and not event_type.startswith("task.")
-    ]
-    assert offenders == []
+#: The eleven definition types P11 approved, written out rather than derived,
+#: so that adding a twelfth to the taxonomy fails here until it is approved
+#: too. `DEFINITION_EVENTS` is the derived view; this is the expectation.
+APPROVED_DEFINITION_EVENTS = frozenset(
+    {
+        "definition.agent.created",
+        "definition.agent.updated",
+        "definition.agent.archived",
+        "definition.agent.restored",
+        "definition.workflow.created",
+        "definition.workflow.updated",
+        "definition.workflow.archived",
+        "definition.workflow.restored",
+        "definition.connection.created",
+        "definition.connection.updated",
+        "definition.connection.deleted",
+    }
+)
+
+#: Suffixes that describe changing a definition rather than reporting work.
+_DEFINITION_VERBS = {"created", "updated", "deleted", "published", "edited", "configured"}
+
+
+def test_no_known_event_can_re_create_a_definition() -> None:
+    """Replay must never re-create a definition.
+
+    Until P11 this was enforced by the types being *absent*, and the
+    assertion read "no known event describes editing a definition". That is
+    no longer true and must not pretend to be: a definition *delta* has to be
+    recordable for the realtime gateway to replay one from the shared
+    `events.seq` (P9, P11).
+
+    So the property moved rather than weakened. For a `definition.*` type the
+    guarantee is what it folds into - nothing - and who may produce it; for
+    every other namespace the original prohibition stands unchanged.
+
+    **The old version of this test would have passed either way**, which is
+    why it is gone. It asked whether `event_type.split(".", 1)[1]` was in the
+    forbidden set, and for `definition.agent.created` that expression is
+    `"agent.created"` - not a verb, so no offender, so green. A guard that
+    cannot fail is worse than no guard, because it occupies the place where a
+    real one would go.
+    """
+    for event_type, spec in KNOWN_EVENTS.items():
+        if event_type.startswith("definition."):
+            # Recordable, but inert and unforgeable. These three are what
+            # replaced "the type is absent".
+            assert spec.folds_into == (), event_type
+            assert spec.producer is Producer.CONTROL_PLANE, event_type
+            assert not spec.producer.is_ingestible, event_type
+            continue
+        if event_type.startswith("task."):
+            # A unit of work appearing, not a definition change.
+            continue
+        assert event_type.split(".", 1)[1] not in _DEFINITION_VERBS, event_type
+
+
+def test_a_definition_event_is_refused_under_a_folding_subject() -> None:
+    """Defence in depth on the namespace claim, and stronger than expected.
+
+    A forged definition event carrying an `agent` subject - the shape that
+    would reach `_agent` if `fold()` dispatched on anything but the namespace
+    - cannot even be constructed: the parser checks the subject kind against
+    the spec, so `definition.agent.created` is refused under an `agent`
+    subject before folding is reached.
+
+    Written after the first version of this assertion was attempted in the
+    reducer suite and could not be built, which is the better answer: the
+    event is rejected rather than merely inert.
+    """
+    for event_type in DEFINITION_EVENTS:
+        with pytest.raises(ValidationFailedError):
+            parse_envelope(event(type=event_type, subject={"kind": "agent", "ref": "researcher"}))
+
+
+def test_the_registered_definition_types_are_exactly_the_approved_eleven() -> None:
+    """A twelfth type is a protocol change and needs approving as one (P11).
+
+    Both directions matter: a type added to the taxonomy without approval
+    fails here, and an approved one quietly dropped fails here too.
+    """
+    assert set(DEFINITION_EVENTS) == APPROVED_DEFINITION_EVENTS
+    assert len(DEFINITION_EVENTS) == 11
+
+
+@pytest.mark.parametrize("event_type", sorted(APPROVED_DEFINITION_EVENTS))
+def test_every_definition_type_is_control_plane_inert_and_project_subjected(
+    event_type: str,
+) -> None:
+    """The three properties M2 exists to establish, per type rather than in
+    aggregate, so a failure names the type that broke.
+
+    `SubjectKind.PROJECT` is the subject because `SubjectKind` has no member
+    for a workflow definition or a connection, and `AGENT`'s `subject_ref` is
+    the `agent_key` rather than a uuid - the entity type and id travel in the
+    payload instead (P11.3).
+    """
+    spec = spec_for(event_type)
+    assert spec is not None, f"{event_type} is not registered"
+    assert spec.producer is Producer.CONTROL_PLANE
+    assert not spec.producer.is_ingestible
+    assert spec.folds_into == ()
+    assert spec.subjects == (SubjectKind.PROJECT,)
+    assert not folds(event_type)
 
 
 def test_log_and_metric_events_fold_into_no_state() -> None:

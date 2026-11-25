@@ -23,7 +23,7 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import text
 
-from agentworld.domain.protocol import PROTOCOL_VERSION
+from agentworld.domain.protocol import DEFINITION_EVENTS, PROTOCOL_VERSION
 from agentworld.infra.db import Database
 from helpers import Actor
 
@@ -428,6 +428,81 @@ async def test_a_running_step_may_still_be_reported(
 
 
 # ------------------------------------------------- the open namespace stays ---
+
+
+async def _events_of_type(database: Database, event_type: str) -> int:
+    """How many rows the log holds for one type. Zero is the assertion."""
+    async with database.session() as session:
+        return int(
+            (
+                await session.execute(
+                    text("SELECT count(*) FROM events WHERE type = :t"), {"t": event_type}
+                )
+            ).scalar_one()
+        )
+
+
+@pytest.mark.parametrize("event_type", sorted(DEFINITION_EVENTS))
+async def test_an_ingest_key_cannot_forge_a_definition_event(
+    event_type: str,
+    client: TestClient,
+    producers: Fixture,
+    world: dict[str, uuid.UUID],
+    owner_database: Database,
+) -> None:
+    """The boundary M2 exists to create, for every one of the eleven.
+
+    Before these types were registered this request **succeeded**: an
+    unregistered type has no spec, `services/ingest.py` defaults it to
+    `Producer.AGENT`, which is ingestible, and the event was stored folding
+    into nothing. A publisher reading `definition.*` rows would then have
+    published a forged definition delta - a configuration change nobody made,
+    arriving at every subscriber as though the control plane had made it.
+
+    Registration is what refuses it, which is why the taxonomy entry is a
+    security control rather than metadata.
+
+    Both halves are asserted. A 403 that still wrote the row would be the
+    real failure, and the status code alone would not show it.
+    """
+    response = post(
+        client,
+        producers,
+        event(
+            type=event_type,
+            subject={"kind": "project", "ref": str(producers.project_id)},
+            payload={"entity": "agent", "id": str(world["researcher"])},
+        ),
+    )
+
+    assert response.status_code == 403, response.text
+    assert await _events_of_type(owner_database, event_type) == 0
+
+
+async def test_the_refusal_names_the_definition_type_rather_than_the_batch(
+    client: TestClient, producers: Fixture, world: dict[str, uuid.UUID], owner_database: Database
+) -> None:
+    """A forged definition event in an otherwise good batch takes the batch
+    down and says which event it was.
+
+    Ingest is all-or-nothing on an authorization failure, so the honest
+    outcome is that the agent's own heartbeat is not stored either - and the
+    operator needs to be told which event cost them the batch.
+    """
+    response = post(
+        client,
+        producers,
+        event(),
+        event(
+            type="definition.agent.updated",
+            subject={"kind": "project", "ref": str(producers.project_id)},
+        ),
+    )
+
+    assert response.status_code == 403, response.text
+    assert "definition.agent.updated" in response.text
+    assert await _events_of_type(owner_database, "definition.agent.updated") == 0
+    assert await _events_of_type(owner_database, "agent.heartbeat") == 0
 
 
 async def test_an_unknown_type_is_still_accepted(
