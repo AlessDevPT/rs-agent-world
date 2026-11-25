@@ -499,12 +499,28 @@ class AgentService:
                 raise ConflictError(
                     f"This project already has an agent with the key '{key}'", agent_key=key
                 )
+
+            # Cursor first, after the key check so a 409 never takes the lock.
+            # The id is the one thing this operation cannot know yet - it is
+            # assigned by the INSERT below - so the reservation and the append
+            # sit either side of it rather than together. `_append_definition_event`
+            # builds the `dedup_key` from both, and both are in hand by then.
+            seq = await _reserve_definition_seq(work, scope)
+
             agent = await agents.create(
                 agent_key=key,
                 display_name=display_name,
                 interaction_mode=interaction_mode,
                 created_by_user_id=principal.user_id,
                 **fields,
+            )
+            await _append_definition_event(
+                work,
+                scope,
+                seq=seq,
+                entity="agent",
+                entity_id=agent.id,
+                operation="created",
             )
             await audit.record(
                 work,
@@ -676,6 +692,17 @@ class AgentService:
             authorize(principal, Action.AGENT_RESTORE, Resource(workspace_id))
             scope = TenantScope(workspace_id, project_id)
             agents = work.agents(scope)
+
+            # Cursor first, which here means *before* the only check there is.
+            # `agents.restore` is both the refusal and the mutation - there is
+            # no prior read to judge against - so unlike `update` and
+            # `archive`, a 404 does briefly hold this project's cursor lock
+            # until the rollback. P13 accepts that: adding a read-then-write
+            # precheck to avoid it would cost a query and reintroduce the race
+            # the single statement avoids, to save a lock held for
+            # microseconds by a caller who is already authorized.
+            seq = await _reserve_definition_seq(work, scope)
+
             if not await agents.restore(agent_id):
                 # Not archived, not in this project, or not there at all -
                 # one 404, because "restore this" about a live agent is a
@@ -684,6 +711,15 @@ class AgentService:
             agent = await agents.get(agent_id)
             if agent is None:  # pragma: no cover - the update returned a row
                 raise NotFoundError("Agent not found", agent_id=str(agent_id))
+
+            await _append_definition_event(
+                work,
+                scope,
+                seq=seq,
+                entity="agent",
+                entity_id=agent_id,
+                operation="restored",
+            )
             await audit.record(
                 work,
                 principal,
@@ -718,8 +754,25 @@ class AgentService:
             if existing is None:
                 raise NotFoundError("Agent not found", agent_id=str(agent_id))
             already_archived(existing, kind="agent")
+
+            # Cursor first, and after both refusals, so this keeps `update`'s
+            # property: a 404 and an already-archived 409 are resolved before
+            # the project's cursor is touched. An archive is an `.archived`
+            # event rather than a deletion, matching the row - the agent stays
+            # readable by id, so the client frame is `agent.updated` (P11.4).
+            seq = await _reserve_definition_seq(work, scope)
+
             if not await agents.archive(agent_id):  # pragma: no cover - read above
                 raise NotFoundError("Agent not found", agent_id=str(agent_id))
+
+            await _append_definition_event(
+                work,
+                scope,
+                seq=seq,
+                entity="agent",
+                entity_id=agent_id,
+                operation="archived",
+            )
             await audit.record(
                 work,
                 principal,

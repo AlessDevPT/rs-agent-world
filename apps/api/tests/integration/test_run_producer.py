@@ -598,7 +598,16 @@ async def test_a_batch_refused_part_way_writes_neither_event_nor_run(
     async with owner_database.session() as session:
         stored = (
             await session.execute(
-                text("SELECT count(*) FROM events WHERE project_id = :p"),
+                # Ingest's own events only. The `agent` fixture above creates
+                # its agent through the API, and since M4 that writes a
+                # `definition.agent.created` row - a control-plane event, in
+                # this project, that has nothing to do with whether the
+                # refused batch left anything behind. Counting every row would
+                # make this assertion fail for a reason it is not about.
+                text(
+                    "SELECT count(*) FROM events "
+                    "WHERE project_id = :p AND type NOT LIKE 'definition.%'"
+                ),
                 {"p": ingest.project_id},
             )
         ).scalar_one()
