@@ -286,8 +286,10 @@ is a value from that same sequence, committed as of the moment the snapshot was 
 { "type": "workflow.updated",    "cursor": 448914, "data": {} }
 { "type": "connection.updated",  "cursor": 448915, "data": {} }
 
-// deletion is a tombstone, not an emptied entity (P10.2)
-{ "type": "agent.deleted",       "cursor": 448916, "data": { "id": "…" } }
+// deletion is a tombstone, not an emptied entity (P10.2). Connections are
+// the only definition entity that is deleted; agents and workflows are
+// archived, and an archive is an `.updated` frame (P11.4)
+{ "type": "connection.deleted",  "cursor": 448916, "data": { "id": "…" } }
 
 // execution deltas — folded from the event log
 { "type": "execution.updated",   "cursor": 448917, "data": {} }
@@ -303,6 +305,13 @@ Deltas stay whole-entity snapshots, not patches, so an ordering bug cannot produ
 half-applied entity. Channels (`agents`, `workflows`, `executions`, `approvals`, `events`,
 `world`) let Build Mode subscribe to definitions and Live Mode add executions and events,
 rather than every tab receiving everything.
+
+**The eleven persisted types are enumerated in P11**, in the `definition.*` namespace,
+each with `folds_into=()` and the subject `SubjectKind.PROJECT` carrying the entity type and
+uuid in its payload. Agent and workflow archive and restore are `.updated` frames, because
+an archived entity stays addressable; only `definition.connection.deleted` produces a
+tombstone. Model profiles are **out of scope** for Phase 3 definition deltas: they are
+workspace-scoped and have no per-project cursor to carry (P11.5).
 
 **A frame is not the record behind it (P10).** The durable record of a definition change
 is a row in `events` carrying **identity and the operation only**; the whole-entity `data`

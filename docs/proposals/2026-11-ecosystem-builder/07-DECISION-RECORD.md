@@ -379,7 +379,7 @@ document exists to make.
 
 ## 6. Phase 3 ledger reconciliation (2026-11-20)
 
-Ten decisions. P1-P8 were taken after a read-only audit found that Phase 3's scope sentence
+Eleven decisions. P1-P8 were taken after a read-only audit found that Phase 3's scope sentence
 (`04-ROADMAP-AND-MVP.md` §2, "this phase is T0–T8 and T13"), its build list, its
 acceptance ledger and the T-criteria in `08-PHASE-3-READINESS.md` did not agree with each
 other or with the code. **Approved by the product owner on 2026-11-20.** No criterion was
@@ -388,7 +388,9 @@ later the same day**, from the realtime-spine audit that followed: it is the one
 architecture decision R8 and R10 could not be implemented without, and it is detailed
 after the table. **P10 followed from the audit of P9's implementation feasibility**: five
 decisions that audit identified and deliberately did not take, three of them protocol
-surface. It is detailed after P9.
+surface. It is detailed after P9. **P11 followed from the M2 implementation audit**, which
+found that P10.1 had named the `definition.*` namespace and the obligation to register its
+types without ever naming them - so the first task that needed them could not start.
 
 | # | Decision | Why | Where it landed |
 |---|----------|-----|-----------------|
@@ -402,6 +404,7 @@ surface. It is detailed after P9.
 | **P8** | **No Phase 3 criterion carries into Phase 4** | Four of Phase 4's own acceptance criteria depend on live deltas, so carrying the spine forward would make Phase 4 unclosable as well. Phase 4 begins when Phase 3's ledger is closed | `docs/STATUS.md` §6 |
 | **P9** | **The shared per-project `events.seq` is the single cursor authority for both execution and definition deltas**, and a definition change must be recorded durably in the same transaction as the mutation it describes, with publication only after that transaction commits | One ordered cursor domain is what makes `resume` mean the same thing for both kinds of delta; two sequences would put two orderings into a protocol that has one `cursor` field. Durability is the other half: publishing after commit with nothing persisted is at-most-once, and a crash between the commit and the publish loses a delta silently - which `resume` would then never replay, because nothing recorded it. A separate definition cursor is **not** part of the approved design, and carrying the last-seen execution cursor without persisting the change is **not** acceptable, because neither can satisfy exact definition replay | `03-…` §4; `04-…` R8 and R10; `08-…` §5.1 rule 4 |
 | **P10** | **The five implementation decisions P9 left open**, taken on the P9 audit's recommendation of Option A - the committed `events` row is itself the durable publication record. In outline: a non-folding `definition.*` namespace, registered and `CONTROL_PLANE`; an explicit tombstone for deletion; definition events kept out of the raw activity feed; database-backed per-project publisher progress; and the existing worker as the publisher's host | Each one is narrow, and three of them are protocol surface rather than code style - the namespace, the tombstone and the feed boundary all change what a client sees, so they are recorded here rather than settled in review. Option A needs no new table for the payload: the event row is already durable, already per-project, and already ordered by the cursor the protocol carries | `03-…` §4; `04-…` R7, R8, R10, R11, R13; `08-…` §5.1 rule 4 |
+| **P11** | **The eleven persisted definition event types, and the conventions they follow.** `definition.agent.{created,updated,archived,restored}`, `definition.workflow.{created,updated,archived,restored}` and `definition.connection.{created,updated,deleted}` - each registered with `producer=Producer.CONTROL_PLANE` and `folds_into=()`, subject `SubjectKind.PROJECT`, entity type and uuid in the payload. Model profiles are out of scope for Phase 3 | P10.1 named the namespace and the obligation to register, and the M2 audit found it had never named the types - so M2 could not begin without either inventing protocol surface or stopping. These eleven are what the sixteen definition writes actually produce: `AgentService` and `WorkflowService` have no `delete`, so a deletion type exists for connections alone. And `SubjectKind` has no member for a workflow definition or a connection, while `SubjectKind.AGENT`'s `subject_ref` is the `agent_key` rather than a uuid - so `PROJECT` plus a payload id is what satisfies P10.2 without redefining a convention the reducers already depend on | `03-…` §4; `04-…` R7 and R8; `08-…` §5.1 rule 4 |
 
 **What these decisions did not change.** The scope sentence, the phase boundaries other
 than P2's and P5's single-criterion moves, and every acceptance criterion's substance
@@ -528,3 +531,97 @@ Four audit findings survive this decision unchanged, and none of them is closed 
   anything at or below it, so a duplicate produces no duplicate logical update while
   ordering stays exact. That is a property the acceptance tests have to assert, not an
   assumption.
+
+### P11 in full — the definition event types
+
+**Approved, not implemented. M2 is not complete.** No type below is registered, nothing
+emits one, and R8 and R10 stay open. What P11 settles is the protocol surface M2 needs in
+order to be a mechanical change rather than an architectural one.
+
+**1. The eleven types, and the operations that produce them.** Taken from the definition
+services as they stand, not invented: `services/definitions.py` holds sixteen write
+operations across four services.
+
+| Entity | Types | Produced by |
+|---|---|---|
+| agent | `definition.agent.created` · `.updated` · `.archived` · `.restored` | `AgentService.create` · `update` · `archive` · `restore` |
+| workflow | `definition.workflow.created` · `.updated` · `.archived` · `.restored` | `WorkflowService.create` and `compile_delegation` · `update` and `save_draft` · `archive` · `restore` |
+| connection | `definition.connection.created` · `.updated` · `.deleted` | `ConnectionService.create` · `update` · `delete` |
+
+**There is deliberately no `definition.agent.deleted` or `definition.workflow.deleted`.**
+Neither service has a `delete`: an agent and a workflow are archived and restored, and the
+rows survive. `ConnectionService.delete` is the only hard delete among the three entities
+in scope.
+
+**2. Producer and folding.** Every one of the eleven is registered explicitly with
+`producer=Producer.CONTROL_PLANE` and `folds_into=()` - recorded and folding into nothing.
+None of them enters the `agent`, `workflow`, `task`, `run`, `tool` or `approval` reducers,
+because `fold()` dispatches on the namespace and `definition` is not a key in `_REDUCERS`.
+**No reducer changes, and no new reducer**: the M2 audit established that the separation is
+structural and needs no code.
+
+**The unknown-event fallback is untouched.** An unregistered type still resolves to no
+spec, still defaults to `Producer.AGENT`, and is still accepted and stored and folded into
+nothing. That is the first compatibility promise and P11 does not narrow it;
+`test_an_unknown_type_is_still_accepted` keeps pinning it.
+
+**3. The subject convention: `SubjectKind.PROJECT`, with entity type and uuid in the
+payload.** Two reasons, both from the existing protocol rather than from preference.
+`SubjectKind` has eight members - `AGENT`, `TASK`, `RUN`, `WORKFLOW_EXECUTION`,
+`EXECUTION_STEP`, `APPROVAL`, `TOOL_CALL`, `PROJECT` - and **none of them names a workflow
+definition, a connection or a model profile**; `WORKFLOW_EXECUTION` is an execution.
+Adding members would be protocol surface of its own. And `SubjectKind.AGENT`'s
+`subject_ref` is the **`agent_key`** by a convention the reducers read directly, so using
+it would put a key where P10.2 asks for an entity **ID**. `PROJECT` as the subject with the
+type and uuid in the payload satisfies P10.2 and **does not redefine
+`SubjectKind.AGENT.subject_ref`**, which keeps its existing meaning.
+
+**4. Operations, frames, and what archive means.**
+
+| Persisted | Client frame |
+|---|---|
+| `definition.agent.created` · `.updated` · `.archived` · `.restored` | `agent.updated` |
+| `definition.workflow.created` · `.updated` · `.archived` · `.restored` | `workflow.updated` |
+| `definition.connection.created` · `.updated` | `connection.updated` |
+| `definition.connection.deleted` | the tombstone of P10.2 |
+
+**Archive is not deletion.** An archived agent is still readable by id - the detail
+endpoint asks for archived rows on purpose, and the page renders one with its archive date
+- so an archive is an *update* to an entity that remains addressable through its normal
+read model, not a removal from it. The same holds for a workflow.
+
+Persisted payloads carry **only the identity and the operation**, per P10.3; the
+whole-entity `data` of a client frame is assembled at publish time from the authorized read
+model, which is what keeps `instructions`, `labels`, `model_overrides` and `dispatch` out of
+an append-only log.
+
+**5. Scope boundary: model profiles are excluded from Phase 3 definition deltas.**
+`model_profiles` carries a `workspace_id` and **no `project_id`**, while `events` is
+per-project and the cursor is `ProjectEventCursor`. A model-profile change therefore has no
+per-project `events.seq` to carry, and three of the sixteen writes
+(`ModelProfileService.create`, `update`, `delete`) are outside definition deltas for this
+phase.
+
+**A workspace-level cursor or event domain is an open architectural question.** P9 does not
+cover it, P11 does not invent one, and nothing here should be read as deciding it. Whoever
+needs workspace-scoped deltas - credentials are in the same position - opens that decision
+then.
+
+**6. Security boundary.** Registration is the boundary, not metadata. `services/ingest.py`
+reads the producer from the type's spec and **defaults an unregistered type to
+`Producer.AGENT`, which is ingestible**. So today an ingest key could post
+`definition.agent.updated` and have it accepted and stored - the same path that
+deliberately accepts `future.namespace_from_a_later_release` in
+`test_an_unknown_type_is_still_accepted`. A publisher reading `definition.*` rows would
+then publish a forged definition delta. Registering these eleven with `CONTROL_PLANE`
+closes that for these eleven **and for nothing else**: unrelated unknown types stay
+accepted, by the compatibility promise, unless that is separately decided.
+
+### One contradiction P11 corrected
+
+`03-API-AND-FRONTEND.md` §4 illustrated the tombstone as
+`{ "type": "agent.deleted", … }`, added with P10.2 as an example. Under P11 that frame
+**cannot occur**: an agent is archived, never deleted, and an agent archive maps to
+`agent.updated`. The example now shows `connection.deleted`, the only deletion among the
+eleven. Nothing else in the documentation contradicted the type names, the tombstone
+representation or the frame mapping.

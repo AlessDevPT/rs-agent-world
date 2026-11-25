@@ -531,7 +531,9 @@ The first phase where something runs, and the first where something is visible.
       produce a half-applied entity. **Deletion is the one exception, and it is explicit:**
       a tombstone carries project, entity type, entity id and the cursor, and nothing else
       (P10.2). An entity document with its fields blanked would be indistinguishable from
-      an update that cleared them.
+      an update that cleared them. **Only `definition.connection.deleted` produces one
+      (P11.4):** agents and workflows are archived rather than deleted and stay readable by
+      id, so an archive is an `.updated` frame.
 - [ ] **R8 — Definition deltas come from the services that write definitions, and
       durably.** A `PATCH` on an agent produces `agent.updated`, carrying a cursor from the
       shared per-project `events.seq` (P9). The change is recorded durably in the **same
@@ -546,6 +548,10 @@ The first phase where something runs, and the first where something is visible.
       definition - is preserved by the namespace instead, since `fold()` dispatches on it
       and `definition` is not a reducer. Registration is the security control, not
       bookkeeping: an unregistered type defaults to an ingestible producer.
+      **The eleven types are enumerated in P11**, each with `folds_into=()` and the subject
+      `SubjectKind.PROJECT`. Model profiles are out of scope for this criterion: they are
+      workspace-scoped and have no per-project cursor (P11.5). Approved and **not
+      implemented** - nothing registers a type or emits one yet.
 - [ ] **R9 — Execution deltas are folded from the log.** An ingested event produces
       `execution.updated` and `step.updated`, with a cursor that is monotonic per project.
 - [ ] **R10 — `resume` replays exactly what was missed.** Disconnect, mutate N times,

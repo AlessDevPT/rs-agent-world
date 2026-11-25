@@ -418,6 +418,16 @@ Four rules hold the shape:
    give-up bound proves wrong for one, in which case the limitation is to be written down
    and the hosting left unresolved.
 
+   **Which types, settled on 2026-11-25 (P11).** Eleven, enumerated there:
+   `definition.agent.{created,updated,archived,restored}`,
+   `definition.workflow.{created,updated,archived,restored}` and
+   `definition.connection.{created,updated,deleted}`, each with `folds_into=()` and the
+   subject `SubjectKind.PROJECT`. Agents and workflows have no `delete`, so connections are
+   the only deletion; archive is an update to an entity that stays addressable. Model
+   profiles are **out of scope** for Phase 3, being workspace-scoped with no per-project
+   cursor, and a workspace-level domain is left as an open question rather than invented.
+   **None of this is implemented**, and the unknown-event fallback is unchanged.
+
    **Three things P10 does not fix, stated so they are not read as closed.** The reverse
    lock order between ingest (cursor, then rows) and the orchestrator (execution row, then
    cursor at append) is pre-existing and still a deadlock window; P10 only requires that a
