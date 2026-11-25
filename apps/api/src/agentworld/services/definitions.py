@@ -77,11 +77,13 @@ from agentworld.domain.orchestration import (
 from agentworld.domain.orchestration import validate as domain_validate
 from agentworld.domain.policy import Action, Condition, Resource, authorize
 from agentworld.domain.principals import UserPrincipal
+from agentworld.domain.protocol import PROTOCOL_VERSION, parse_envelope
 from agentworld.domain.slugs import validated as validated_slug
 from agentworld.infra.providers import available as available_providers
 from agentworld.repositories.base import TenantScope
 from agentworld.repositories.credentials import CredentialRepository
 from agentworld.repositories.definitions import UNSET, ModelProfileRepository
+from agentworld.repositories.events import ResolvedRefs
 from agentworld.repositories.unit_of_work import UnitOfWork, UnitOfWorkFactory
 from agentworld.services import audit
 from agentworld.services.context import CallContext
@@ -601,9 +603,33 @@ class AgentService:
             if "model_profile_id" in sent and profile is not None:
                 await _owned_profile(work.model_profiles(TenantScope(workspace_id)), profile)
 
+            # The first definition writer. See `_reserve_definition_seq` for
+            # why the reservation is here rather than beside the append, and
+            # why moving it below the write is a deadlock rather than a
+            # refactor.
+            #
+            # `if sent` is P12.2, and it is the same condition the repository
+            # already applies: `AgentRepository.update` filters `UNSET` and
+            # returns the row untouched when nothing is left, so an empty
+            # `PATCH` writes no row. The event log follows the mutation, which
+            # is why no event and no `seq` are spent on one - while the audit
+            # row below is still written, because the audit log answers "who
+            # asked" and this one answers "what changed".
+            seq = await _reserve_definition_seq(work, scope) if sent else None
+
             agent = await agents.update(agent_id, **sent)
             if agent is None:  # pragma: no cover - the row was read above
                 raise NotFoundError("Agent not found", agent_id=str(agent_id))
+
+            if seq is not None:
+                await _append_definition_event(
+                    work,
+                    scope,
+                    seq=seq,
+                    entity="agent",
+                    entity_id=agent_id,
+                    operation="updated",
+                )
 
             await audit.record(
                 work,
@@ -1687,6 +1713,105 @@ def definition_for_execution(
 
 def _text(value: Any) -> str | None:
     return value.strip() if isinstance(value, str) and value.strip() else None
+
+
+async def _reserve_definition_seq(work: UnitOfWork, scope: TenantScope) -> int:
+    """Take this project's cursor lock and reserve this change's sequence number.
+
+    **Call this before writing the definition row, never after.** The position
+    is the lock order, not a convenience, and it is the reason this is a
+    separate function from `_append_definition_event` rather than one call at
+    the end.
+
+    `next_seq` opens with `SELECT … FOR UPDATE` on the project's cursor row
+    (`EventRepository._ensure_cursor`), held until the transaction ends. So
+    whichever statement comes first decides the order in which a definition
+    write takes the project cursor and the entity's own row, and:
+
+    - **Cursor first** is the order `services/ingest.py` already uses - it
+      locks the cursor, then folds events into `agents`, `tasks`, `runs` and
+      the rest. A definition write that does the same adds no new edge to the
+      lock graph.
+    - **Cursor last** - reserving the number just before the append, after the
+      row has been written - would be `agents → cursor`, the reverse of
+      ingest's `cursor → agents`, and an ordinary heartbeat batch landing at
+      the same moment would deadlock against an agent edit. PostgreSQL would
+      abort one of them with `40P01`, which is absent from
+      `api.errors.CONFLICT_SQLSTATES`, raises `OperationalError` for which no
+      handler is registered, and so reaches the caller as a 500. Nothing
+      retries it.
+
+    `test_definition_events.py` pins the order by capturing statements, and the
+    mutation that must fail it is moving this call below the write.
+
+    A rollback does not consume the number: `next_seq` advances the cursor with
+    an ordinary `UPDATE` of a table row rather than a sequence object, so the
+    allocation is undone with everything else. That is what keeps the per-
+    project sequence gapless, which is the whole premise of P9's shared cursor.
+    """
+    return await work.events(scope).next_seq()
+
+
+async def _append_definition_event(
+    work: UnitOfWork,
+    scope: TenantScope,
+    *,
+    seq: int,
+    entity: str,
+    entity_id: UUID,
+    operation: str,
+) -> None:
+    """Record one definition change, in the caller's transaction. P9, P11, P12.
+
+    The event is the durable publication record: Option A of the P9 audit, so
+    there is no outbox and no second table. Publication happens after this
+    transaction commits, reading committed rows from the shared `events.seq` -
+    which is why the number comes from `_reserve_definition_seq` above and not
+    from here.
+
+    Three conventions, none of them chosen here:
+
+    - **`definition.{entity}.{operation}`** with `producer=CONTROL_PLANE` and
+      `folds_into=()` (P11). `fold()` dispatches on the namespace and
+      `definition` is not a reducer key, so replay cannot re-create a
+      definition. The names are deliberately *not* `agent.updated` - that is
+      the client *frame*, and those namespaces have reducers.
+    - **Subject `project`, identity in the payload** (P11.3). `SubjectKind` has
+      no member for a workflow definition or a connection, and
+      `SubjectKind.AGENT`'s `subject_ref` is the `agent_key` rather than a
+      uuid. The payload carries the entity type and id and nothing else:
+      `instructions`, `labels`, `model_overrides` and `dispatch` are free-form
+      and may hold an endpoint or a token, so the whole entity is assembled at
+      publish time from the authorized read model (P10.3).
+    - **`dedup_key` carries `seq`** (P12). Not decoration. Uniqueness is
+      `(project_id, dedup_key)` on each monthly partition, so a key like
+      `def:agent:{id}:updated` would insert once and then raise `23505` for
+      every later edit that month - a 409 telling the caller to try again,
+      which would never come true. And because the index covers `dedup_key`
+      alone rather than `(type, dedup_key)`, and `append` never consults
+      `seen()`, a predictable key is pre-claimable: an agent ingest key could
+      post a heartbeat carrying this exact string and make the agent
+      permanently uneditable. `seq` is allocated under the cursor lock
+      immediately above, so it is unique per project by construction and
+      cannot be guessed in advance.
+
+    `refs` is empty rather than resolved. `EventRepository.resolve` matches only
+    the `agent`, `task`, `run` and `workflow_execution` subject kinds, so for a
+    `project` subject it returns an all-`None` result after four lookups that
+    cannot match; passing it directly is equivalent and cheaper. It also keeps
+    these rows off `events_agent_idx`, which is the direction P10.3 wants.
+    """
+    envelope = parse_envelope(
+        {
+            "dedup_key": f"def:{entity}:{entity_id}:{operation}:{seq}",
+            "type": f"definition.{entity}.{operation}",
+            "protocol_version": PROTOCOL_VERSION,
+            "occurred_at": dt.datetime.now(dt.UTC).isoformat(),
+            "subject": {"kind": "project", "ref": str(scope.require_project())},
+            "payload": {"entity": entity, "id": str(entity_id)},
+        }
+    )
+    await work.events(scope).append(envelope, seq=seq, refs=ResolvedRefs())
 
 
 async def _workspace_of(work: UnitOfWork, project_id: UUID) -> UUID:
