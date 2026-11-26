@@ -440,10 +440,15 @@ Four rules hold the shape:
    every endpoint.
 
    **What is implemented, as against approved.** The eleven types are registered and
-   refused to ingest, and exactly one producer emits: `AgentService.update`. The other
-   thirteen do not. **R8 and R10 stay open**, and P13's table is where the two states are
-   told apart - an approved producer is not an implemented one, and a sentence claiming
-   either about all of them at once will be wrong again within a milestone.
+   refused to ingest, and as of 2026-11-26 **all fourteen approved producers emit**, each
+   appending its `events` row inside its own mutation's transaction. **R8 and R10 stay
+   open even so**: the durable record is written, while publication after commit, the
+   client frame and replay belong to the event bus and the gateway, which do not exist.
+   One producer carries a condition - `publish_test_harness` writes no event (P13 §5,
+   amended 2026-11-26), for the listing reason stated above, and the harness is still
+   published and executed. P13's table remains where producer states are told apart - an
+   approved producer is not an implemented one, and a sentence claiming either about all
+   of them at once will be wrong again within a milestone.
 
    **Three things P10 does not fix, stated so they are not read as closed.** The reverse
    lock order between ingest (cursor, then rows) and the orchestrator (execution row, then

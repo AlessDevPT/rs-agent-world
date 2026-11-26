@@ -288,10 +288,17 @@ class ExecutionService:
             # a harness is in no listing a client subscribes to, so a delta for
             # one would describe a change to a collection nobody holds. P13 §5
             # argues that about the *creation* of a harness and does not reach
-            # its publication, which `agent.test` performs on every test run
-            # through `publish_test_harness` - but the reason transfers intact,
-            # and emitting here would put a stream of updates for invisible
-            # workflows into every project that tests an agent.
+            # its publication, which `agent.test` performs through
+            # `publish_test_harness` - but the reason transfers intact, because
+            # it is about the entity and not about the writer.
+            #
+            # That publication is conditional and normally happens **once per
+            # agent**: `AgentTestService._harness` returns
+            # `harness.current_version_id is None` as its publish-first
+            # predicate, so the first test publishes and every later test is a
+            # run, not a republish. It can recur only if an earlier publish
+            # failed and left no version pointer. So this is not a volume
+            # argument - it rests on the listing and nothing else.
             #
             # The discriminator is the row, not `refuse_harness`: that argument
             # says which entry point was used, while this asks what the

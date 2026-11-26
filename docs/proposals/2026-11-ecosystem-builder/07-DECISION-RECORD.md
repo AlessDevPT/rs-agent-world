@@ -715,9 +715,14 @@ worker, and deserves its own scope.
 
 ### P13 in full — the complete producer inventory
 
-**Approved, not implemented.** One producer is implemented (`AgentService.update`, the step
-the decision record calls M3). Everything else below is approved and unwired, and **R8 and
-R10 stay unchecked**.
+**Implemented, 2026-11-26.** All fourteen producers are wired, tested and committed:
+`AgentService.update` with the step this record calls M3 (`deeb86c`), and the other
+thirteen with M4, in the four commits ending `d70eb5d`. **R8 and R10 stay unchecked even so**, and the reason is
+worth stating precisely, because "the producers are done" is not the same claim as "the
+criterion is met". What is implemented is the *durable record* - each change appends its
+`events` row inside the transaction that makes the change. What R8 also asks for is
+publication after that transaction commits, and what R10 asks for is replay; both belong
+to the event bus and the WebSocket gateway, and neither exists.
 
 P11 counted "sixteen write operations across four services" in `services/definitions.py`.
 That count is right about that file. The audit of the remaining writers enumerated every
@@ -725,29 +730,31 @@ write method on `AgentRepository`, `ConnectionRepository` and `WorkflowRepositor
 found every caller, which turned up **two writers outside it**. One is excluded with a
 reason; the other is the subject of this decision.
 
-**1. The inventory.** Fourteen approved producers, of which one is implemented: thirteen
-call sites in `services/definitions.py` and one in `services/executions.py`.
+**1. The inventory.** Fourteen approved producers, all now implemented: thirteen call
+sites in `services/definitions.py` and one in `services/executions.py`. The inventory
+itself is unchanged by implementation - no producer was added, removed or retyped.
 
 | Producer | Event type | State |
 |---|---|---|
-| `AgentService.create` | `definition.agent.created` | approved |
+| `AgentService.create` | `definition.agent.created` | **implemented** |
 | `AgentService.update` | `definition.agent.updated` | **implemented** |
-| `AgentService.archive` | `definition.agent.archived` | approved |
-| `AgentService.restore` | `definition.agent.restored` | approved |
-| `ConnectionService.create` | `definition.connection.created` | approved |
-| `ConnectionService.update` | `definition.connection.updated` | approved |
-| `ConnectionService.delete` | `definition.connection.deleted` | approved |
-| `WorkflowService.create` | `definition.workflow.created` | approved |
-| `WorkflowService.compile_delegation` | `definition.workflow.created` | approved, **no production caller** |
-| `WorkflowService.update` | `definition.workflow.updated` | approved |
-| `WorkflowService.save_draft` | `definition.workflow.updated` | approved |
-| `WorkflowService.archive` | `definition.workflow.archived` | approved |
-| `WorkflowService.restore` | `definition.workflow.restored` | approved |
-| **`ExecutionService._publish`** | **`definition.workflow.updated`** | **approved - new in P13** |
+| `AgentService.archive` | `definition.agent.archived` | **implemented** |
+| `AgentService.restore` | `definition.agent.restored` | **implemented** |
+| `ConnectionService.create` | `definition.connection.created` | **implemented** |
+| `ConnectionService.update` | `definition.connection.updated` | **implemented** |
+| `ConnectionService.delete` | `definition.connection.deleted` | **implemented** |
+| `WorkflowService.create` | `definition.workflow.created` | **implemented** |
+| `WorkflowService.compile_delegation` | `definition.workflow.created` | **implemented**, **no production caller** |
+| `WorkflowService.update` | `definition.workflow.updated` | **implemented** |
+| `WorkflowService.save_draft` | `definition.workflow.updated` | **implemented** |
+| `WorkflowService.archive` | `definition.workflow.archived` | **implemented** |
+| `WorkflowService.restore` | `definition.workflow.restored` | **implemented** |
+| **`ExecutionService._publish`** | **`definition.workflow.updated`** | **implemented - new in P13** |
 
-So the work remaining after M3 is **twelve operations in `services/definitions.py` plus one
-in `services/executions.py`** - thirteen call sites, producing the ten types M3 did not.
-`ModelProfileService.create`, `update` and `delete` are not producers at all (P11.5).
+The work that remained after M3 was **twelve operations in `services/definitions.py` plus
+one in `services/executions.py`** - thirteen call sites, producing the ten types M3 did
+not. All thirteen were wired in M4. `ModelProfileService.create`, `update` and `delete`
+are not producers at all (P11.5).
 
 **An approved producer is not an implemented one**, and the table says which is which on
 purpose. Every earlier revision of this record that said "none of this is implemented" was
@@ -790,6 +797,36 @@ harness"**, not "no endpoint can return one". That is sufficient for snapshot-an
 consistency and is the whole of the exclusion. It is written down because the exclusion is
 currently correct by the behaviour of a filter, and a reader who found the gap without
 finding the filter would reasonably mistake it for an oversight.
+
+**Amended 2026-11-26: the exclusion follows the harness, not the writer.** As first
+written, §5 excluded one *writer* - `WorkflowRepository.find_or_create_test`, called from
+`services/agent_test.py` - and said nothing about what happens when that harness is
+**published**. `ExecutionService.publish_test_harness` is a second entry point into the
+same `_publish` body with the harness refusal lifted, so without this amendment §2 and §3
+would read as requiring an event there. They do not. **`publish_test_harness` appends no
+`definition.workflow.updated`**, reserves no sequence number and takes no cursor lock, and
+that is intentional.
+
+The reason is §5's own, unchanged: `WorkflowRepository.list_all` filters
+`test_for_agent_id IS NULL`, so a harness is not a member of the workflow listing that
+snapshot and delta are specified to keep synchronized, and a delta for it would describe a
+change to a collection no client holds. That argument is about the *entity*, so it reaches
+the harness's publication exactly as it reaches its creation. The discriminator in the code
+is therefore the row - `workflow.is_test_harness` - and not which entry point was used: an
+ordinary `publish` of a client-visible workflow emits, as §2 requires, and a harness does
+not, whichever verb reached it.
+
+**What this does not say.** It is not a volume argument, and it would be a weak one: a
+harness is published **once**, on an agent's first test, because `AgentTestService._harness`
+returns `harness.current_version_id is None` as its publish-first predicate - so a later
+test is a run, not a republish, and the only way it recurs is an earlier publish that
+failed and left no version pointer. The exclusion rests on the listing and nothing else. Nor is
+anything else about a harness excluded: **a harness is still published and still executed**,
+it still writes its `workflow.publish` audit row, and `agent.test` depends on all of that.
+Only the realtime definition event is withheld. And the producer inventory is untouched -
+`ExecutionService._publish` remains the fourteenth approved producer, carrying one
+conditional inside it; the writer excluded from the inventory is still `find_or_create_test`,
+which is not a producer at all.
 
 **6. `compile_delegation` has no production caller.** Its only caller anywhere is
 `tests/integration/test_delegation_compilation.py`; there is no route and no service

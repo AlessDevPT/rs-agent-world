@@ -1832,9 +1832,11 @@ async def test_the_cursor_lock_is_taken_before_the_draft_row_is_written(
 # exactly one event for an act that writes steps, edges, `published_at`, the
 # pointer and the next draft (P13 section 2).
 #
-# It is also the only producer with a condition on it: a test harness publishes
-# through `publish_test_harness` on every `agent.test` run, and a harness is in
-# no listing a client subscribes to.
+# It is also the only producer with a condition on it: a harness is in no
+# listing a client subscribes to. `agent.test` publishes one through
+# `publish_test_harness`, conditionally - normally on an agent's first test
+# only, since `current_version_id` being absent is the publish-first predicate,
+# and again only if an earlier publish failed and left no pointer.
 
 
 @pytest_asyncio.fixture
@@ -2065,8 +2067,10 @@ async def test_publishing_a_harness_writes_no_event_and_takes_no_lock(
     harness is in no listing a client subscribes to, so a delta for one
     describes a change to a collection nobody holds. P13 argues that about
     creating a harness and is silent on publishing one, which `agent.test`
-    does on every test run - this test fixes the reading that the exclusion
-    follows the entity rather than the entry point.
+    does conditionally - on an agent's first test, when the harness has no
+    `current_version_id`, and again only if an earlier publish failed. This
+    test fixes the reading that the exclusion follows the entity rather than
+    the entry point.
 
     The publication itself must still happen: `agent.test` depends on it.
     """

@@ -559,12 +559,19 @@ The first phase where something runs, and the first where something is visible.
       publish is one operation and emits one event. The test-harness writer in
       `services/agent_test.py` is **not** a producer: `WorkflowRepository.list_all` filters
       `test_for_agent_id IS NULL`, so a harness is not in the listing this criterion keeps
-      in sync.
-      **Partly implemented, and this box stays open.** The eleven types are registered and
-      refused to ingest, and one producer emits - `AgentService.update`. The remaining
-      thirteen call sites do not, so no `resume` can yet replay a definition change for any
-      entity but an edited agent, and R10 is open for the same reason. An approved producer
-      is not an implemented one; P13's table says which each is.
+      in sync. **The same exclusion covers publishing one** (P13 §5, amended 2026-11-26):
+      `ExecutionService.publish_test_harness` emits nothing, for that same reason. The
+      harness is still published and still executed; only the event is withheld.
+      **The producers are implemented; this box stays open on publication.** The eleven
+      types are registered and refused to ingest, and as of 2026-11-26 **all fourteen
+      approved P13 producers emit** - each appending its `events` row in the **same
+      transaction** as the mutation, which is the durability half of this criterion and the
+      half that could be built without a gateway. What is still missing is the rest of the
+      sentence above: a delta **published after that transaction commits**. That needs
+      `infra/event_bus.py` and the WebSocket gateway, neither of which exists, so this box
+      stays open. **R10 stays open for its own reason**, now a narrower one than before: the
+      rows a `resume` would replay are being written for every definition change, and there
+      is still nothing that can replay them. Producer writes alone do not close either box.
 - [ ] **R9 — Execution deltas are folded from the log.** An ingested event produces
       `execution.updated` and `step.updated`, with a cursor that is monotonic per project.
 - [ ] **R10 — `resume` replays exactly what was missed.** Disconnect, mutate N times,
