@@ -1236,12 +1236,31 @@ class WorkflowService:
                     f"This project already has a workflow with the slug '{resolved}'",
                     slug=resolved,
                 )
+            # Cursor first, after the slug conflict - which is a read, so a
+            # caller refused by it never takes this project's lock. The id
+            # arrives with the INSERT, so the reservation and the append sit
+            # either side of it, the same shape as `AgentService.create`.
+            seq = await _reserve_definition_seq(work, scope)
+
             workflow, draft = await workflows.create(
                 slug=resolved,
                 name=name,
                 description=description,
                 created_by_user_id=principal.user_id,
                 graph=graph,
+            )
+            # One event, though two rows were written. P13: a producer is a
+            # logical operation, and creating a workflow *is* creating it with
+            # its first draft - `create` has no meaning that stops short of
+            # the draft. Counting rows here would make a client fetch twice
+            # for one change.
+            await _append_definition_event(
+                work,
+                scope,
+                seq=seq,
+                entity="workflow",
+                entity_id=workflow.id,
+                operation="created",
             )
             await audit.record(
                 work,
@@ -1294,9 +1313,27 @@ class WorkflowService:
             not_a_test_harness(existing, doing="edited")
             not_archived(existing, kind="workflow", doing="edited")
 
+            # Cursor first, and after all four refusals - the 404, the
+            # harness and the archived check are reads, so none of them costs
+            # a lock. `if sent` is P12.2: `WorkflowRepository.update` has the
+            # same empty-values early return as the agent's and the
+            # connection's, so an empty request writes no row and therefore
+            # describes no change.
+            seq = await _reserve_definition_seq(work, scope) if sent else None
+
             workflow = await workflows.update(workflow_id, **sent)
             if workflow is None:  # pragma: no cover - the row was read above
                 raise NotFoundError("Workflow not found", workflow_id=str(workflow_id))
+
+            if seq is not None:
+                await _append_definition_event(
+                    work,
+                    scope,
+                    seq=seq,
+                    entity="workflow",
+                    entity_id=workflow_id,
+                    operation="updated",
+                )
 
             await audit.record(
                 work,
@@ -1409,12 +1446,28 @@ class WorkflowService:
                     f"This project already has a workflow with the slug '{compiled.slug}'",
                     slug=compiled.slug,
                 )
+            # The same placement as `create`, because this ends where
+            # `create` ends: a workflow and its first draft. P13 approves this
+            # producer although nothing in production calls it yet - a path
+            # that writes a workflow without announcing it would be a hole in
+            # `resume` the day a caller appears, and wiring it now costs one
+            # event rather than a later audit to find it.
+            seq = await _reserve_definition_seq(work, scope)
+
             workflow, draft = await workflows.create(
                 slug=compiled.slug,
                 name=compiled.name,
                 description=compiled.description,
                 created_by_user_id=principal.user_id,
                 graph=compiled.graph,
+            )
+            await _append_definition_event(
+                work,
+                scope,
+                seq=seq,
+                entity="workflow",
+                entity_id=workflow.id,
+                operation="created",
             )
             await audit.record(
                 work,
@@ -1461,11 +1514,33 @@ class WorkflowService:
                 raise NotFoundError("Workflow not found", workflow_id=str(workflow_id))
             not_a_test_harness(existing, doing="edited")
             not_archived(existing, kind="workflow", doing="edited")
+            # Unguarded, unlike `update`: `graph` is required and
+            # `save_draft` has no empty-values early return, so reaching here
+            # always writes. The remaining refusal is a workflow with no open
+            # draft, which `save_draft` answers with None rather than a read -
+            # so that case takes the lock and gives it back on the rollback,
+            # the trade-off P13 accepted for `restore` and the connection
+            # delete.
+            seq = await _reserve_definition_seq(work, scope)
+
             draft = await workflows.save_draft(workflow_id, graph=graph)
             if draft is None:
                 raise NotFoundError(
                     "This workflow has no draft to edit", workflow_id=str(workflow_id)
                 )
+            # The workflow's id, not the draft's. P11.3 fixes the payload as
+            # the entity a client holds, and a client holds workflows; the
+            # draft is reached through one. `definition.workflow.updated` is
+            # also what P13 gives the publish, so a client's response to a
+            # graph change and to a publish is the same refetch.
+            await _append_definition_event(
+                work,
+                scope,
+                seq=seq,
+                entity="workflow",
+                entity_id=workflow_id,
+                operation="updated",
+            )
             await audit.record(
                 work,
                 principal,
@@ -1509,6 +1584,13 @@ class WorkflowService:
                 raise NotFoundError("Workflow not found", workflow_id=str(workflow_id))
             not_a_test_harness(existing, doing="restored")
 
+            # Cursor first, which here means before the refusal: the
+            # statement's `archived_at IS NOT NULL` is both the check and the
+            # mutation, so restoring a live workflow takes the lock and gives
+            # it back on the rollback. `AgentService.restore` makes the same
+            # trade for the same reason.
+            seq = await _reserve_definition_seq(work, scope)
+
             if not await workflows.restore(workflow_id):
                 # Readable, not a harness, and not archived: "restore this"
                 # about a live workflow is the same 404 a second `archive`
@@ -1517,6 +1599,14 @@ class WorkflowService:
             workflow = await workflows.get(workflow_id)
             if workflow is None:  # pragma: no cover - the update returned a row
                 raise NotFoundError("Workflow not found", workflow_id=str(workflow_id))
+            await _append_definition_event(
+                work,
+                scope,
+                seq=seq,
+                entity="workflow",
+                entity_id=workflow_id,
+                operation="restored",
+            )
             await audit.record(
                 work,
                 principal,
@@ -1549,8 +1639,20 @@ class WorkflowService:
             # found" would be a lie about two of them.
             not_a_test_harness(existing, doing="archived")
             already_archived(existing, kind="workflow")
+            # After all three read-based refusals, so none of them costs a
+            # lock; before the UPDATE, like the other five.
+            seq = await _reserve_definition_seq(work, scope)
+
             if not await workflows.archive(workflow_id):  # pragma: no cover - read above
                 raise NotFoundError("Workflow not found", workflow_id=str(workflow_id))
+            await _append_definition_event(
+                work,
+                scope,
+                seq=seq,
+                entity="workflow",
+                entity_id=workflow_id,
+                operation="archived",
+            )
             await audit.record(
                 work,
                 principal,

@@ -4,9 +4,13 @@ Every test here is about one claim: **the agent row and the event describing it
 are written together or not at all**, and the number the event carries comes
 from the shared per-project cursor (P9) allocated before the row is touched.
 
-Seven producers from P13's inventory: `AgentService.create`, `update`,
-`archive` and `restore`, then `ConnectionService.create`, `update` and
-`delete`. `AgentService.update` came with M3; the other six with M4.
+Thirteen producers from P13's inventory: `AgentService.create`, `update`,
+`archive` and `restore`; `ConnectionService.create`, `update` and `delete`;
+and `WorkflowService.create`, `compile_delegation`, `update`, `save_draft`,
+`archive` and `restore`. `AgentService.update` came with M3, the rest with M4.
+
+The fourteenth, `ExecutionService._publish`, is not here: it lives in another
+service and is the next step rather than this one.
 
 **No assertion here hard-codes a sequence number.** It did until M4, on the
 premise that setting a project up appended nothing - and wiring `create` made
@@ -25,6 +29,11 @@ These tests drive the services rather than the HTTP routes, because several
 need a repository to fail mid-transaction and six need to watch the statements
 go past. The routes have one caller each and no logic of their own, and
 `test_agents_api.py` and `test_workflows_api.py` already cover them.
+
+**No assertion counts every event in the project.** Three entities now write
+definition events during ordinary setup, so a count that did would break on
+the next producer; `_definition_log` and the per-type readers below are what
+the lifecycle assertions use instead.
 """
 
 from __future__ import annotations
@@ -49,7 +58,11 @@ from agentworld.repositories.audit import AuditLogRepository
 from agentworld.repositories.events import EventRepository
 from agentworld.repositories.unit_of_work import UnitOfWorkFactory
 from agentworld.services.context import CallContext
-from agentworld.services.definitions import AgentService, ConnectionService
+from agentworld.services.definitions import (
+    AgentService,
+    ConnectionService,
+    WorkflowService,
+)
 from helpers import Actor
 
 pytestmark = pytest.mark.integration
@@ -61,6 +74,10 @@ RESTORED = "definition.agent.restored"
 CONNECTION_CREATED = "definition.connection.created"
 CONNECTION_UPDATED = "definition.connection.updated"
 CONNECTION_DELETED = "definition.connection.deleted"
+WORKFLOW_CREATED = "definition.workflow.created"
+WORKFLOW_UPDATED = "definition.workflow.updated"
+WORKFLOW_ARCHIVED = "definition.workflow.archived"
+WORKFLOW_RESTORED = "definition.workflow.restored"
 
 
 class World:
@@ -1324,3 +1341,475 @@ async def test_the_cursor_lock_is_taken_before_the_connection_row_is_deleted(
         statements, lambda s: s.startswith("DELETE FROM connections"), "deleted the connection"
     )
     assert cursor_lock < deletion, "the cursor must be locked before the connection row is deleted"
+
+
+# ================================================================= workflows ===
+#
+# The third and last entity of P13's inventory inside `services/definitions.py`.
+# Six producers, more than either group before it, and two shapes neither had:
+# `create` writes two rows for one event, and `save_draft` writes a row in a
+# different table from the one the event names.
+#
+# `ExecutionService._publish` is P13's fourteenth producer and is deliberately
+# not here: it lives in another service and is the next step, not this one.
+
+
+@pytest_asyncio.fixture
+async def workflows(factory: UnitOfWorkFactory) -> WorkflowService:
+    return WorkflowService(factory)
+
+
+def _graph(step_key: str = "research") -> dict[str, Any]:
+    return {"steps": [{"step_key": step_key, "kind": "agent_task", "agent_key": "researcher"}]}
+
+
+async def _make_workflow(
+    workflows: WorkflowService,
+    world: World,
+    *,
+    name: str = "Nightly digest",
+    description: str | None = None,
+    graph: dict[str, Any] | None = None,
+) -> Any:
+    workflow, _ = await workflows.create(
+        world.principal,
+        _context(),
+        world.project_id,
+        name=name,
+        description=description,
+        graph=graph if graph is not None else _graph(),
+    )
+    return workflow
+
+
+async def _workflow_exists(database: Database, *, slug: str) -> bool:
+    async with database.session() as session:
+        return (
+            await session.execute(text("SELECT 1 FROM workflows WHERE slug = :s"), {"s": slug})
+        ).scalar_one_or_none() is not None
+
+
+async def _draft_count(database: Database, workflow_id: uuid.UUID) -> int:
+    async with database.session() as session:
+        return int(
+            (
+                await session.execute(
+                    text("SELECT count(*) FROM workflow_versions WHERE workflow_id = :w"),
+                    {"w": workflow_id},
+                )
+            ).scalar_one()
+        )
+
+
+async def test_a_workflow_create_writes_one_created_event(
+    workflows: WorkflowService, world: World, owner_database: Database, baseline: int
+) -> None:
+    workflow = await _make_workflow(workflows, world)
+
+    rows = await _events(owner_database, WORKFLOW_CREATED)
+    assert len(rows) == 1
+    _assert_shape(
+        rows[0],
+        event_type=WORKFLOW_CREATED,
+        project_id=world.project_id,
+        agent_id=workflow.id,
+        seq=baseline,
+        entity="workflow",
+    )
+
+
+async def test_creating_a_workflow_writes_one_event_for_two_rows(
+    workflows: WorkflowService, world: World, owner_database: Database
+) -> None:
+    """P13's "one logical operation, one event", where it actually bites.
+
+    `WorkflowRepository.create` writes the `workflows` row *and* its first
+    `workflow_versions` draft, because a workflow without a draft is not a
+    thing this application can produce. A per-row rule would emit two events
+    and make a client fetch twice for one change; the rule is per operation,
+    so this asserts both rows exist and exactly one event describes them.
+    """
+    workflow = await _make_workflow(workflows, world)
+
+    assert await _draft_count(owner_database, workflow.id) == 1
+    assert len(await _events(owner_database, WORKFLOW_CREATED)) == 1
+
+
+async def test_the_workflow_event_carries_no_graph_only_identity(
+    workflows: WorkflowService, world: World, owner_database: Database
+) -> None:
+    """A workflow's graph is the largest thing any of the eleven could leak.
+
+    It names steps, agents and expressions, and a description is free text a
+    person wrote. An append-only log cannot be redacted, so the payload is the
+    identity and the operation and nothing else. The whole stored row is
+    searched, not just the payload, because `labels` and `correlation` would
+    carry the same string out just as well.
+    """
+    workflow = await _make_workflow(
+        workflows,
+        world,
+        description="SENTINEL-DESCRIPTION",
+        graph=_graph("SENTINEL-STEP"),
+    )
+
+    row = (await _events(owner_database, WORKFLOW_CREATED))[0]
+    assert row["payload"] == {"entity": "workflow", "id": str(workflow.id)}
+    serialised = json.dumps(row, default=str)
+    assert "SENTINEL-DESCRIPTION" not in serialised
+    assert "SENTINEL-STEP" not in serialised
+
+
+async def test_a_compiled_delegation_writes_one_created_event(
+    workflows: WorkflowService,
+    connections: ConnectionService,
+    world: World,
+    client: TestClient,
+    owner_database: Database,
+) -> None:
+    """P13's one approved producer with no production caller, wired anyway.
+
+    `compile_delegation` ends where `create` ends - a workflow and its first
+    draft - so it is a definition write like any other, and a path that wrote
+    a workflow without announcing it would be a hole in `resume` the day a
+    caller appears. The number is captured after the delegate connection is
+    made, because creating that connection is itself a definition change now.
+    """
+    writer = world.add_agent(client, "Writer")
+    connection = await connections.create(
+        world.principal,
+        _context(),
+        world.project_id,
+        kind=ConnectionKind.DELEGATE,
+        source_kind="agent",
+        source_id=world.agent_id,
+        target_kind="agent",
+        target_id=uuid.UUID(writer["id"]),
+        config=None,
+    )
+    after_setup = await _next_seq(owner_database, world.project_id)
+
+    workflow, draft = await workflows.compile_delegation(
+        world.principal, _context("r2"), world.project_id, connection.id
+    )
+
+    assert draft.version == 1
+    rows = await _events(owner_database, WORKFLOW_CREATED)
+    assert len(rows) == 1
+    _assert_shape(
+        rows[0],
+        event_type=WORKFLOW_CREATED,
+        project_id=world.project_id,
+        agent_id=workflow.id,
+        seq=after_setup,
+        entity="workflow",
+    )
+
+
+async def test_a_workflow_update_writes_one_updated_event(
+    workflows: WorkflowService, world: World, owner_database: Database
+) -> None:
+    workflow = await _make_workflow(workflows, world)
+    after_create = await _next_seq(owner_database, world.project_id)
+
+    await workflows.update(
+        world.principal, _context("r2"), world.project_id, workflow.id, name="Renamed"
+    )
+
+    rows = await _events(owner_database, WORKFLOW_UPDATED)
+    assert len(rows) == 1
+    _assert_shape(
+        rows[0],
+        event_type=WORKFLOW_UPDATED,
+        project_id=world.project_id,
+        agent_id=workflow.id,
+        seq=after_create,
+        entity="workflow",
+    )
+
+
+async def test_an_empty_workflow_update_appends_no_event_and_spends_no_number(
+    workflows: WorkflowService, world: World, owner_database: Database
+) -> None:
+    """P12.2 on the third entity, and the only one of these six that needs it.
+
+    `WorkflowRepository.update` has the same empty-values early return as the
+    agent's and the connection's, so an empty request writes no row. The other
+    five producers always write when they reach their mutation, which is why
+    only this one carries the guard.
+    """
+    workflow = await _make_workflow(workflows, world)
+    after_create = await _next_seq(owner_database, world.project_id)
+
+    await workflows.update(world.principal, _context("r2"), world.project_id, workflow.id)
+
+    assert await _events(owner_database, WORKFLOW_UPDATED) == []
+    assert await _next_seq(owner_database, world.project_id) == after_create
+
+
+async def test_a_draft_save_writes_one_updated_event_naming_the_workflow(
+    workflows: WorkflowService, world: World, owner_database: Database
+) -> None:
+    """The event names the workflow, though the row written was the draft's.
+
+    `save_draft` updates `workflow_versions`, not `workflows`. P11.3 fixes the
+    payload as the entity a client holds, and a client holds workflows - the
+    draft is reached through one. So the payload carries the workflow id, and
+    this test exists because the draft's id is the one closest to hand in that
+    method and would be the easy mistake.
+    """
+    workflow = await _make_workflow(workflows, world)
+    after_create = await _next_seq(owner_database, world.project_id)
+
+    draft = await workflows.save_draft(
+        world.principal, _context("r2"), world.project_id, workflow.id, graph=_graph("rewritten")
+    )
+
+    rows = await _events(owner_database, WORKFLOW_UPDATED)
+    assert len(rows) == 1
+    assert rows[0]["payload"] == {"entity": "workflow", "id": str(workflow.id)}
+    assert str(draft.id) not in json.dumps(rows[0], default=str)
+    _assert_shape(
+        rows[0],
+        event_type=WORKFLOW_UPDATED,
+        project_id=world.project_id,
+        agent_id=workflow.id,
+        seq=after_create,
+        entity="workflow",
+    )
+
+
+async def test_an_edit_and_a_draft_save_write_two_distinct_updated_events(
+    workflows: WorkflowService, world: World, owner_database: Database
+) -> None:
+    """Two producers share one event type, so their keys must still differ.
+
+    P13 gives `update` and `save_draft` the same `definition.workflow.updated`,
+    and P12.1 puts the allocated seq in the `dedup_key` - which is what keeps
+    two changes to the same workflow in the same month from colliding on the
+    partition's unique index. This is the case that convention exists for.
+    """
+    workflow = await _make_workflow(workflows, world)
+    after_create = await _next_seq(owner_database, world.project_id)
+
+    await workflows.update(
+        world.principal, _context("r2"), world.project_id, workflow.id, name="Renamed"
+    )
+    await workflows.save_draft(
+        world.principal, _context("r3"), world.project_id, workflow.id, graph=_graph("rewritten")
+    )
+
+    rows = await _events(owner_database, WORKFLOW_UPDATED)
+    assert [row["seq"] for row in rows] == [after_create, after_create + 1]
+    assert len({row["dedup_key"] for row in rows}) == 2
+
+
+async def test_a_workflow_archive_writes_one_archived_event(
+    workflows: WorkflowService, world: World, owner_database: Database
+) -> None:
+    workflow = await _make_workflow(workflows, world)
+    after_create = await _next_seq(owner_database, world.project_id)
+
+    await workflows.archive(world.principal, _context("r2"), world.project_id, workflow.id)
+
+    rows = await _events(owner_database, WORKFLOW_ARCHIVED)
+    assert len(rows) == 1
+    _assert_shape(
+        rows[0],
+        event_type=WORKFLOW_ARCHIVED,
+        project_id=world.project_id,
+        agent_id=workflow.id,
+        seq=after_create,
+        entity="workflow",
+    )
+
+
+async def test_a_workflow_restore_writes_one_restored_event(
+    workflows: WorkflowService, world: World, owner_database: Database
+) -> None:
+    workflow = await _make_workflow(workflows, world)
+    await workflows.archive(world.principal, _context("r2"), world.project_id, workflow.id)
+    after_archive = await _next_seq(owner_database, world.project_id)
+
+    await workflows.restore(world.principal, _context("r3"), world.project_id, workflow.id)
+
+    rows = await _events(owner_database, WORKFLOW_RESTORED)
+    assert len(rows) == 1
+    _assert_shape(
+        rows[0],
+        event_type=WORKFLOW_RESTORED,
+        project_id=world.project_id,
+        agent_id=workflow.id,
+        seq=after_archive,
+        entity="workflow",
+    )
+
+
+async def test_restoring_a_live_workflow_takes_the_lock_and_spends_no_number(
+    workflows: WorkflowService, world: World, owner_database: Database, database: Database
+) -> None:
+    """The refusal that the statement makes rather than a read.
+
+    `WorkflowRepository.restore` carries `archived_at IS NOT NULL`, so for a
+    live workflow the UPDATE *is* the refusal - there is no earlier read to
+    turn into a 404. The lock is therefore taken and handed back on the
+    rollback, exactly as for `AgentService.restore` and the connection delete.
+    Asserted rather than left in a comment, because the unchanged cursor below
+    would hold either way.
+    """
+    workflow = await _make_workflow(workflows, world)
+    after_create = await _next_seq(owner_database, world.project_id)
+
+    with _recording(database) as statements, pytest.raises(NotFoundError):
+        await workflows.restore(world.principal, _context("r2"), world.project_id, workflow.id)
+
+    assert any(_locked_the_cursor(s) for s in statements), (
+        "the refusal is the UPDATE itself, so the cursor lock is taken before it"
+    )
+    assert await _events(owner_database, WORKFLOW_RESTORED) == []
+    assert await _next_seq(owner_database, world.project_id) == after_create
+    assert await _audit_count(owner_database, "workflow.restore") == 0
+
+
+async def test_updating_an_unknown_workflow_takes_no_lock(
+    workflows: WorkflowService, world: World, owner_database: Database, database: Database
+) -> None:
+    """The opposite case to the restore above: this 404 comes from a read."""
+    with _recording(database) as statements, pytest.raises(NotFoundError):
+        await workflows.update(
+            world.principal, _context(), world.project_id, uuid.uuid4(), name="Nothing"
+        )
+
+    assert not any(_locked_the_cursor(s) for s in statements)
+    assert await _events(owner_database, WORKFLOW_UPDATED) == []
+
+
+async def test_a_viewer_may_not_rename_a_workflow_and_takes_no_lock(
+    workflows: WorkflowService, world: World, owner_database: Database, database: Database
+) -> None:
+    """`workflow.update` is granted at `member`, so the refusal is a viewer's.
+
+    Read from `policy.py` rather than assumed: the three write verbs here sit
+    at two different ranks, and using the wrong principal would make a
+    refusal test pass for the wrong reason.
+    """
+    workflow = await _make_workflow(workflows, world)
+    after_create = await _next_seq(owner_database, world.project_id)
+
+    with _recording(database) as statements, pytest.raises(PermissionDeniedError):
+        await workflows.update(
+            world.viewer(), _context("r2"), world.project_id, workflow.id, name="Renamed"
+        )
+
+    assert not any(_locked_the_cursor(s) for s in statements)
+    assert await _events(owner_database, WORKFLOW_UPDATED) == []
+    assert await _audit_count(owner_database, "workflow.update") == 0
+    assert await _next_seq(owner_database, world.project_id) == after_create
+
+
+async def test_a_member_may_not_archive_a_workflow_and_takes_no_lock(
+    workflows: WorkflowService, world: World, owner_database: Database, database: Database
+) -> None:
+    """Archiving is `admin`, unlike renaming - so here `member` is refused."""
+    workflow = await _make_workflow(workflows, world)
+    after_create = await _next_seq(owner_database, world.project_id)
+
+    with _recording(database) as statements, pytest.raises(PermissionDeniedError):
+        await workflows.archive(world.member(), _context("r2"), world.project_id, workflow.id)
+
+    assert not any(_locked_the_cursor(s) for s in statements)
+    assert await _events(owner_database, WORKFLOW_ARCHIVED) == []
+    assert await _audit_count(owner_database, "workflow.archive") == 0
+    assert await _next_seq(owner_database, world.project_id) == after_create
+
+
+async def test_a_failing_append_rolls_back_the_workflow_and_its_first_draft(
+    workflows: WorkflowService,
+    world: World,
+    owner_database: Database,
+    baseline: int,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Both rows go back, not just the one the event names.
+
+    `create` writes the workflow and its draft, so "together or not at all"
+    has to cover the pair. If the draft survived a failed append there would
+    be a `workflow_versions` row belonging to no workflow - which the schema
+    would refuse anyway, making this the test that says the transaction, not
+    the foreign key, is what the guarantee rests on.
+    """
+
+    async def explode(*_: Any, **__: Any) -> None:
+        raise RuntimeError("the append failed")
+
+    monkeypatch.setattr(EventRepository, "append", explode)
+
+    with pytest.raises(RuntimeError):
+        await _make_workflow(workflows, world, name="Nightly digest")
+
+    assert not await _workflow_exists(owner_database, slug="nightly-digest")
+    assert await _events(owner_database, WORKFLOW_CREATED) == []
+    assert await _audit_count(owner_database, "workflow.create") == 0
+    assert await _next_seq(owner_database, world.project_id) == baseline
+
+
+async def test_the_workflow_lifecycle_writes_one_ordered_gapless_run(
+    workflows: WorkflowService, world: World, owner_database: Database, baseline: int
+) -> None:
+    """All five verbs on one workflow: consecutive, in order, one each.
+
+    Asserted across the producers at once because a per-operation test cannot
+    see an ordering bug between them, and ordering is the whole of what
+    `resume` relies on. The draft save sits between the edit and the archive
+    deliberately: it is the one that writes to another table, and a seq
+    allocated out of step would show up here as a swap.
+    """
+    workflow = await _make_workflow(workflows, world)
+    await workflows.update(
+        world.principal, _context("r2"), world.project_id, workflow.id, name="Renamed"
+    )
+    await workflows.save_draft(
+        world.principal, _context("r3"), world.project_id, workflow.id, graph=_graph("rewritten")
+    )
+    await workflows.archive(world.principal, _context("r4"), world.project_id, workflow.id)
+    await workflows.restore(world.principal, _context("r5"), world.project_id, workflow.id)
+
+    log = await _definition_log(owner_database, world.project_id)
+    assert log[-5:] == [
+        (baseline, WORKFLOW_CREATED),
+        (baseline + 1, WORKFLOW_UPDATED),
+        (baseline + 2, WORKFLOW_UPDATED),
+        (baseline + 3, WORKFLOW_ARCHIVED),
+        (baseline + 4, WORKFLOW_RESTORED),
+    ]
+
+
+async def test_the_cursor_lock_is_taken_before_the_draft_row_is_written(
+    workflows: WorkflowService, world: World, database: Database
+) -> None:
+    """Lock order for the producer that writes a different table.
+
+    The other five touch `workflows`; `save_draft` touches
+    `workflow_versions`. Nothing in the codebase takes an explicit row lock on
+    either table, and every cursor-taking path - ingest, dispatch, the
+    orchestrator, review - only reads them, so cursor-first adds no edge here
+    any more than it did for agents. This pins the order that keeps it true.
+    """
+    workflow = await _make_workflow(workflows, world)
+
+    with _recording(database) as statements:
+        await workflows.save_draft(
+            world.principal,
+            _context("r2"),
+            world.project_id,
+            workflow.id,
+            graph=_graph("rewritten"),
+        )
+
+    cursor_lock = _first(statements, _locked_the_cursor, "locked the project cursor")
+    draft_write = _first(
+        statements,
+        lambda s: s.startswith("UPDATE workflow_versions"),
+        "wrote the draft",
+    )
+    assert cursor_lock < draft_write, "the cursor must be locked before the draft is written"
