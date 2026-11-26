@@ -4,13 +4,16 @@ Every test here is about one claim: **the agent row and the event describing it
 are written together or not at all**, and the number the event carries comes
 from the shared per-project cursor (P9) allocated before the row is touched.
 
-Thirteen producers from P13's inventory: `AgentService.create`, `update`,
-`archive` and `restore`; `ConnectionService.create`, `update` and `delete`;
-and `WorkflowService.create`, `compile_delegation`, `update`, `save_draft`,
-`archive` and `restore`. `AgentService.update` came with M3, the rest with M4.
+**All fourteen producers of P13's inventory.** `AgentService.create`,
+`update`, `archive` and `restore`; `ConnectionService.create`, `update` and
+`delete`; `WorkflowService.create`, `compile_delegation`, `update`,
+`save_draft`, `archive` and `restore`; and `ExecutionService._publish`, the
+only one outside `services/definitions.py`. `AgentService.update` came with
+M3, the other thirteen with M4.
 
-The fourteenth, `ExecutionService._publish`, is not here: it lives in another
-service and is the next step rather than this one.
+Thirteen of them emit unconditionally. The publish is the exception: it writes
+no event when the workflow is a test harness, for the reason P13 section 5
+gives about harnesses not appearing in any listing a client subscribes to.
 
 **No assertion here hard-codes a sequence number.** It did until M4, on the
 premise that setting a project up appended nothing - and wiring `create` made
@@ -51,7 +54,12 @@ from fastapi.testclient import TestClient
 from sqlalchemy import event, text
 
 from agentworld.domain.enums import AgentInteractionMode, ConnectionKind, MemberRole
-from agentworld.domain.errors import ConflictError, NotFoundError, PermissionDeniedError
+from agentworld.domain.errors import (
+    ConflictError,
+    DomainError,
+    NotFoundError,
+    PermissionDeniedError,
+)
 from agentworld.domain.principals import UserPrincipal
 from agentworld.infra.db import Database
 from agentworld.repositories.audit import AuditLogRepository
@@ -63,6 +71,7 @@ from agentworld.services.definitions import (
     ConnectionService,
     WorkflowService,
 )
+from agentworld.services.executions import ExecutionService
 from helpers import Actor
 
 pytestmark = pytest.mark.integration
@@ -1350,8 +1359,8 @@ async def test_the_cursor_lock_is_taken_before_the_connection_row_is_deleted(
 # `create` writes two rows for one event, and `save_draft` writes a row in a
 # different table from the one the event names.
 #
-# `ExecutionService._publish` is P13's fourteenth producer and is deliberately
-# not here: it lives in another service and is the next step, not this one.
+# `ExecutionService._publish` is P13's fourteenth producer; it emits the same
+# `definition.workflow.updated` and has its own section at the end of this file.
 
 
 @pytest_asyncio.fixture
@@ -1813,3 +1822,338 @@ async def test_the_cursor_lock_is_taken_before_the_draft_row_is_written(
         "wrote the draft",
     )
     assert cursor_lock < draft_write, "the cursor must be locked before the draft is written"
+
+
+# =================================================== the publish, P13's last ===
+#
+# `ExecutionService._publish` is the fourteenth producer and the only one
+# outside `services/definitions.py`. It emits `definition.workflow.updated`
+# because publishing *is* moving `workflows.current_version_id`, and it emits
+# exactly one event for an act that writes steps, edges, `published_at`, the
+# pointer and the next draft (P13 section 2).
+#
+# It is also the only producer with a condition on it: a test harness publishes
+# through `publish_test_harness` on every `agent.test` run, and a harness is in
+# no listing a client subscribes to.
+
+
+@pytest_asyncio.fixture
+async def executions(factory: UnitOfWorkFactory) -> ExecutionService:
+    return ExecutionService(factory)
+
+
+def _publishable_graph(step_key: str = "research") -> dict[str, Any]:
+    """Two steps and an edge, shaped like `test_executions_api`'s.
+
+    The agent step names `researcher`, which is the key the world's own agent
+    gets from the display name `Researcher` - a graph naming an agent that is
+    not there is refused by validation rather than published.
+    """
+    return {
+        "steps": [
+            {"step_key": step_key, "kind": "agent_task", "agent_key": "researcher"},
+            {
+                "step_key": "shape",
+                "kind": "transform",
+                "input_mapping": {"found": f"$.steps.{step_key}.output.count"},
+            },
+        ],
+        "edges": [{"from": step_key, "to": "shape"}],
+    }
+
+
+async def _current_version(database: Database, workflow_id: uuid.UUID) -> uuid.UUID | None:
+    async with database.session() as session:
+        return (
+            await session.execute(
+                text("SELECT current_version_id FROM workflows WHERE id = :w"),
+                {"w": workflow_id},
+            )
+        ).scalar_one_or_none()
+
+
+async def _step_count(database: Database, workflow_id: uuid.UUID) -> int:
+    async with database.session() as session:
+        return int(
+            (
+                await session.execute(
+                    text(
+                        "SELECT count(*) FROM workflow_steps s "
+                        "JOIN workflow_versions v ON v.id = s.workflow_version_id "
+                        "WHERE v.workflow_id = :w"
+                    ),
+                    {"w": workflow_id},
+                )
+            ).scalar_one()
+        )
+
+
+async def _make_harness(database: Database, workflow_id: uuid.UUID, agent_id: uuid.UUID) -> None:
+    """Mark an existing workflow as an agent's test harness.
+
+    Written as the owner rather than through `agent.test`, which would need a
+    model profile, a credential and a compiled harness graph to reach the same
+    one-column state. `workflows_test_for_agent_key` is partial on
+    `test_for_agent_id`, so one harness per agent is all this can make.
+    """
+    async with database.session() as session:
+        await session.execute(
+            text("UPDATE workflows SET test_for_agent_id = :a WHERE id = :w"),
+            {"a": agent_id, "w": workflow_id},
+        )
+        await session.commit()
+
+
+async def test_publishing_a_workflow_writes_one_updated_event(
+    workflows: WorkflowService,
+    executions: ExecutionService,
+    world: World,
+    owner_database: Database,
+) -> None:
+    """One event for an act that writes five things (P13 section 2).
+
+    `publish` inserts the steps and the edges, sets `published_at`, moves
+    `workflows.current_version_id` and opens the next draft. A client
+    experiences that once, so counting the internal writes would publish
+    several deltas and spend several cursor positions on one change.
+    """
+    workflow = await _make_workflow(workflows, world, graph=_publishable_graph())
+    after_create = await _next_seq(owner_database, world.project_id)
+
+    version_id, published_at = await executions.publish(
+        world.principal, _context("r2"), world.project_id, workflow.id
+    )
+
+    assert published_at is not None
+    assert await _current_version(owner_database, workflow.id) == version_id
+
+    rows = await _events(owner_database, WORKFLOW_UPDATED)
+    assert len(rows) == 1
+    _assert_shape(
+        rows[0],
+        event_type=WORKFLOW_UPDATED,
+        project_id=world.project_id,
+        agent_id=workflow.id,
+        seq=after_create,
+        entity="workflow",
+    )
+
+
+async def test_the_publish_event_carries_no_graph_and_not_the_version(
+    workflows: WorkflowService,
+    executions: ExecutionService,
+    world: World,
+    owner_database: Database,
+) -> None:
+    """P13 section 4: no snapshot, no graph, no step contents.
+
+    A publish is the moment a graph becomes live, so it is the producer most
+    tempting to attach one to. The version id is checked too: it is the one
+    identifier `publish` returns and would be the natural thing to smuggle in,
+    and the payload rule is the entity a client holds - the workflow.
+    """
+    workflow = await _make_workflow(workflows, world, graph=_publishable_graph("SENTINEL-STEP"))
+
+    version_id, _ = await executions.publish(
+        world.principal, _context("r2"), world.project_id, workflow.id
+    )
+
+    row = (await _events(owner_database, WORKFLOW_UPDATED))[0]
+    assert row["payload"] == {"entity": "workflow", "id": str(workflow.id)}
+    serialised = json.dumps(row, default=str)
+    assert "SENTINEL-STEP" not in serialised
+    assert str(version_id) not in serialised
+
+
+async def test_an_unpublishable_draft_takes_no_lock(
+    workflows: WorkflowService,
+    executions: ExecutionService,
+    world: World,
+    owner_database: Database,
+    database: Database,
+) -> None:
+    """Validation refuses before the cursor, so a bad draft costs no lock.
+
+    The graph names an agent that does not exist, which `_validated` turns
+    into a refusal - and every refusal in `_publish` is resolved above the
+    reservation, which is what this asserts rather than assumes.
+    """
+    workflow = await _make_workflow(
+        workflows,
+        world,
+        graph={
+            "steps": [{"step_key": "a", "kind": "agent_task", "agent_key": "nobody-at-all"}],
+            "edges": [],
+        },
+    )
+    after_create = await _next_seq(owner_database, world.project_id)
+
+    with _recording(database) as statements, pytest.raises(DomainError):
+        await executions.publish(world.principal, _context("r2"), world.project_id, workflow.id)
+
+    assert not any(_locked_the_cursor(s) for s in statements), (
+        "a draft refused by validation must not have taken this project's lock"
+    )
+    assert await _events(owner_database, WORKFLOW_UPDATED) == []
+    assert await _next_seq(owner_database, world.project_id) == after_create
+    assert await _current_version(owner_database, workflow.id) is None
+
+
+async def test_a_viewer_may_not_publish_and_takes_no_lock(
+    workflows: WorkflowService,
+    executions: ExecutionService,
+    world: World,
+    owner_database: Database,
+    database: Database,
+) -> None:
+    """`workflow.publish` is granted at `member`, so the refusal is a viewer's."""
+    workflow = await _make_workflow(workflows, world, graph=_publishable_graph())
+    after_create = await _next_seq(owner_database, world.project_id)
+
+    with _recording(database) as statements, pytest.raises(PermissionDeniedError):
+        await executions.publish(world.viewer(), _context("r2"), world.project_id, workflow.id)
+
+    assert not any(_locked_the_cursor(s) for s in statements)
+    assert await _events(owner_database, WORKFLOW_UPDATED) == []
+    assert await _next_seq(owner_database, world.project_id) == after_create
+
+
+async def test_a_failing_append_rolls_back_the_whole_publication(
+    workflows: WorkflowService,
+    executions: ExecutionService,
+    world: World,
+    owner_database: Database,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Everything the publish wrote goes back, not only the pointer.
+
+    P13 section 3: no publish may commit with its event unwritten. A publish
+    that committed its frozen steps and lost its event would leave a version
+    live that no client was ever told about - and `resume` would never replay
+    it, because nothing recorded it.
+    """
+    workflow = await _make_workflow(workflows, world, graph=_publishable_graph())
+    after_create = await _next_seq(owner_database, world.project_id)
+
+    async def explode(*_: Any, **__: Any) -> None:
+        raise RuntimeError("the append failed")
+
+    monkeypatch.setattr(EventRepository, "append", explode)
+
+    with pytest.raises(RuntimeError):
+        await executions.publish(world.principal, _context("r2"), world.project_id, workflow.id)
+
+    assert await _current_version(owner_database, workflow.id) is None
+    assert await _step_count(owner_database, workflow.id) == 0
+    assert await _draft_count(owner_database, workflow.id) == 1
+    assert await _events(owner_database, WORKFLOW_UPDATED) == []
+    assert await _audit_count(owner_database, "workflow.publish") == 0
+    assert await _next_seq(owner_database, world.project_id) == after_create
+
+
+async def test_publishing_a_harness_writes_no_event_and_takes_no_lock(
+    workflows: WorkflowService,
+    executions: ExecutionService,
+    world: World,
+    owner_database: Database,
+    database: Database,
+) -> None:
+    """The one producer with a condition on it, and the reason.
+
+    P13 section 5 excludes the harness writer because
+    `WorkflowRepository.list_all` filters `test_for_agent_id IS NULL`: a
+    harness is in no listing a client subscribes to, so a delta for one
+    describes a change to a collection nobody holds. P13 argues that about
+    creating a harness and is silent on publishing one, which `agent.test`
+    does on every test run - this test fixes the reading that the exclusion
+    follows the entity rather than the entry point.
+
+    The publication itself must still happen: `agent.test` depends on it.
+    """
+    workflow = await _make_workflow(workflows, world, graph=_publishable_graph())
+    await _make_harness(owner_database, workflow.id, world.agent_id)
+    after_create = await _next_seq(owner_database, world.project_id)
+
+    with _recording(database) as statements:
+        version_id, _ = await executions.publish_test_harness(
+            world.principal, _context("r2"), world.project_id, workflow.id
+        )
+
+    # It published.
+    assert await _current_version(owner_database, workflow.id) == version_id
+    assert await _step_count(owner_database, workflow.id) == 2
+    # And announced nothing, having taken no number and no lock.
+    assert await _events(owner_database, WORKFLOW_UPDATED) == []
+    assert await _next_seq(owner_database, world.project_id) == after_create
+    assert not any(_locked_the_cursor(s) for s in statements)
+    # The audit row is still written: the exclusion is about the realtime
+    # stream, not about whether anybody can tell what happened.
+    assert await _audit_count(owner_database, "workflow.publish") == 1
+
+
+async def test_edit_draft_and_publish_write_three_distinct_updated_events(
+    workflows: WorkflowService,
+    executions: ExecutionService,
+    world: World,
+    owner_database: Database,
+    baseline: int,
+) -> None:
+    """Three producers, one event type, one workflow, consecutive numbers.
+
+    `update`, `save_draft` and now the publish all emit
+    `definition.workflow.updated`. P12.1 puts the allocated seq in the
+    `dedup_key`, which is the whole reason three changes to one workflow in
+    one month do not collide on the partition's unique index.
+    """
+    workflow = await _make_workflow(workflows, world, graph=_publishable_graph())
+    await workflows.update(
+        world.principal, _context("r2"), world.project_id, workflow.id, name="Renamed"
+    )
+    await workflows.save_draft(
+        world.principal,
+        _context("r3"),
+        world.project_id,
+        workflow.id,
+        graph=_publishable_graph("rewritten"),
+    )
+    await executions.publish(world.principal, _context("r4"), world.project_id, workflow.id)
+
+    log = await _definition_log(owner_database, world.project_id)
+    assert log[-4:] == [
+        (baseline, WORKFLOW_CREATED),
+        (baseline + 1, WORKFLOW_UPDATED),
+        (baseline + 2, WORKFLOW_UPDATED),
+        (baseline + 3, WORKFLOW_UPDATED),
+    ]
+    rows = await _events(owner_database, WORKFLOW_UPDATED)
+    assert len({row["dedup_key"] for row in rows}) == 3
+
+
+async def test_the_cursor_lock_is_taken_before_the_first_step_row_is_frozen(
+    workflows: WorkflowService,
+    executions: ExecutionService,
+    world: World,
+    database: Database,
+) -> None:
+    """Lock order for the producer with the most writes behind it.
+
+    The publish inserts steps and edges, updates `workflow_versions` and
+    updates `workflows` - four statements the cursor must precede. Neither
+    `current_version_id` nor `published_at` is an indexed column of any unique
+    index on its table, so both updates take `FOR NO KEY UPDATE`, which does
+    not conflict with the `FOR KEY SHARE` that starting a run holds on the
+    workflow row before it takes the cursor. That is why cursor-first adds no
+    cycle here even though a run reaches these tables in the other order.
+    """
+    workflow = await _make_workflow(workflows, world, graph=_publishable_graph())
+
+    with _recording(database) as statements:
+        await executions.publish(world.principal, _context("r2"), world.project_id, workflow.id)
+
+    cursor_lock = _first(statements, _locked_the_cursor, "locked the project cursor")
+    first_freeze = _first(
+        statements,
+        lambda s: s.startswith("INSERT INTO workflow_steps"),
+        "froze the first step",
+    )
+    assert cursor_lock < first_freeze, "the cursor must be locked before the graph is frozen"

@@ -75,6 +75,8 @@ from agentworld.repositories.unit_of_work import UnitOfWork, UnitOfWorkFactory
 from agentworld.services import audit
 from agentworld.services.context import CallContext
 from agentworld.services.definitions import (
+    _append_definition_event,
+    _reserve_definition_seq,
     definition_for_execution,
     facts_and_effects,
     not_a_test_harness,
@@ -269,10 +271,52 @@ class ExecutionService:
                 }
                 for edge in definition.edges
             ]
+            # P13's fourteenth producer, and the last of the inventory.
+            # Publishing emits `definition.workflow.updated` because publishing
+            # *is* moving `workflows.current_version_id` - the column the API
+            # view carries and each version's `is_current` reads - so a client
+            # holding a workflow has gone stale and `workflow.updated` is
+            # already the frame that tells it to refetch.
+            #
+            # Cursor first, and after every refusal: the 404, the harness
+            # check, `not_archived`, the missing draft and `_validated` are all
+            # resolved above, and the step and edge assembly below them is
+            # pure. So a caller refused for any reason takes no lock.
+            #
+            # **Not for a harness.** P13 §5 excludes the harness writer because
+            # `WorkflowRepository.list_all` filters `test_for_agent_id IS NULL`:
+            # a harness is in no listing a client subscribes to, so a delta for
+            # one would describe a change to a collection nobody holds. P13 §5
+            # argues that about the *creation* of a harness and does not reach
+            # its publication, which `agent.test` performs on every test run
+            # through `publish_test_harness` - but the reason transfers intact,
+            # and emitting here would put a stream of updates for invisible
+            # workflows into every project that tests an agent.
+            #
+            # The discriminator is the row, not `refuse_harness`: that argument
+            # says which entry point was used, while this asks what the
+            # workflow is. They agree whenever `refuse_harness` is true, since
+            # `not_a_test_harness` has already raised by then.
+            seq = None if workflow.is_test_harness else await _reserve_definition_seq(work, scope)
+
             published_at = await workflows.publish(
                 workflow_id, version_id=draft.id, steps=steps, edges=edges
             )
             await workflows.next_draft(workflow_id, after=draft.version)
+
+            # One event for the whole publish. P13 §2: the two calls above
+            # insert the steps and edges, set `published_at` and move the
+            # pointer, and that is one act a client experiences once - counting
+            # the internal writes would spend several cursor positions on it.
+            if seq is not None:
+                await _append_definition_event(
+                    work,
+                    scope,
+                    seq=seq,
+                    entity="workflow",
+                    entity_id=workflow_id,
+                    operation="updated",
+                )
 
             await audit.record(
                 work,
