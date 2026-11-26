@@ -4,8 +4,9 @@ Every test here is about one claim: **the agent row and the event describing it
 are written together or not at all**, and the number the event carries comes
 from the shared per-project cursor (P9) allocated before the row is touched.
 
-Four producers, all of `AgentService`: `create`, `update`, `archive` and
-`restore` (P13's inventory). `update` came with M3; the other three with M4.
+Seven producers from P13's inventory: `AgentService.create`, `update`,
+`archive` and `restore`, then `ConnectionService.create`, `update` and
+`delete`. `AgentService.update` came with M3; the other six with M4.
 
 **No assertion here hard-codes a sequence number.** It did until M4, on the
 premise that setting a project up appended nothing - and wiring `create` made
@@ -16,21 +17,23 @@ setup, so the next producer wired into this file moves no numbers.
 The properties that are *not* here are deliberate. That the eleven types are
 `CONTROL_PLANE`, fold into nothing and cannot be forged with an ingest key is
 M2's, pinned by `test_producer_authority.py`, `test_protocol_envelope.py` and
-`test_reducers.py` - the first of those parametrised over all eleven, so these
-three are covered there. Repeating it would make this file look like the
-boundary when it is not.
+`test_reducers.py` - the first of those parametrised over all eleven, so the
+seven wired here are covered there. Repeating it would make this file look
+like the boundary when it is not.
 
-These tests drive `AgentService` rather than the HTTP routes, because several
-need a repository to fail mid-transaction and two need to watch the statements
+These tests drive the services rather than the HTTP routes, because several
+need a repository to fail mid-transaction and six need to watch the statements
 go past. The routes have one caller each and no logic of their own, and
-`test_agents_api.py` already covers them.
+`test_agents_api.py` and `test_workflows_api.py` already cover them.
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import uuid
+from collections.abc import Iterator
 from typing import Any
 
 import pytest
@@ -38,7 +41,7 @@ import pytest_asyncio
 from fastapi.testclient import TestClient
 from sqlalchemy import event, text
 
-from agentworld.domain.enums import AgentInteractionMode, MemberRole
+from agentworld.domain.enums import AgentInteractionMode, ConnectionKind, MemberRole
 from agentworld.domain.errors import ConflictError, NotFoundError, PermissionDeniedError
 from agentworld.domain.principals import UserPrincipal
 from agentworld.infra.db import Database
@@ -46,7 +49,7 @@ from agentworld.repositories.audit import AuditLogRepository
 from agentworld.repositories.events import EventRepository
 from agentworld.repositories.unit_of_work import UnitOfWorkFactory
 from agentworld.services.context import CallContext
-from agentworld.services.definitions import AgentService
+from agentworld.services.definitions import AgentService, ConnectionService
 from helpers import Actor
 
 pytestmark = pytest.mark.integration
@@ -55,6 +58,9 @@ CREATED = "definition.agent.created"
 UPDATED = "definition.agent.updated"
 ARCHIVED = "definition.agent.archived"
 RESTORED = "definition.agent.restored"
+CONNECTION_CREATED = "definition.connection.created"
+CONNECTION_UPDATED = "definition.connection.updated"
+CONNECTION_DELETED = "definition.connection.deleted"
 
 
 class World:
@@ -122,6 +128,20 @@ class World:
             user_id=self.actor.user_id,
             email=self.actor.email,
             memberships={self.workspace_id: MemberRole.MEMBER},
+        )
+
+    def viewer(self) -> UserPrincipal:
+        """The same person at `viewer`, for the one refusal `member` cannot give.
+
+        The policy grants `connection.delete` at `member` and declares no
+        consequential variant of it, unlike create and update - so a member
+        may delete any connection, and the refusal this file needs for the
+        hard delete is one rank lower.
+        """
+        return UserPrincipal(
+            user_id=self.actor.user_id,
+            email=self.actor.email,
+            memberships={self.workspace_id: MemberRole.VIEWER},
         )
 
 
@@ -252,26 +272,35 @@ async def _archived(database: Database, agent_id: uuid.UUID) -> bool:
 
 
 def _assert_shape(
-    row: dict[str, Any], *, event_type: str, project_id: uuid.UUID, agent_id: uuid.UUID, seq: int
+    row: dict[str, Any],
+    *,
+    event_type: str,
+    project_id: uuid.UUID,
+    agent_id: uuid.UUID,
+    seq: int,
+    entity: str = "agent",
 ) -> None:
     """Every field of the envelope, against the decision that fixed it.
 
-    One helper rather than four copies, because the shape is identical across
-    the lifecycle and a difference between the types would be a bug rather
-    than a feature.
+    One helper rather than seven copies, because the shape is identical across
+    both entities and the whole lifecycle - a difference between the types
+    would be a bug rather than a feature. `entity` defaults to `agent` so the
+    agent group's calls read as they did before connections arrived; the
+    parameter named `agent_id` is the entity's id whichever entity it is.
     """
     # P11.1: the persisted name, *not* the `agent.updated` client frame - that
     # namespace has a reducer.
     assert row["type"] == event_type
     # P11.3: subject is the project; the entity travels in the payload, because
-    # `SubjectKind.AGENT.subject_ref` is the agent_key rather than a uuid.
+    # `SubjectKind.AGENT.subject_ref` is the agent_key rather than a uuid, and
+    # `SubjectKind` has no member for a connection at all.
     assert row["subject_kind"] == "project"
     assert row["subject_ref"] == str(project_id)
-    assert row["payload"] == {"entity": "agent", "id": str(agent_id)}
+    assert row["payload"] == {"entity": entity, "id": str(agent_id)}
     # P12.1: the key carries the allocated seq, so a second event about the
-    # same agent in the same month cannot collide with this one.
+    # same entity in the same month cannot collide with this one.
     operation = event_type.rsplit(".", 1)[1]
-    assert row["dedup_key"] == f"def:agent:{agent_id}:{operation}:{seq}"
+    assert row["dedup_key"] == f"def:{entity}:{agent_id}:{operation}:{seq}"
     assert row["seq"] == seq
     # P12.3: the resolved reference columns stay NULL, which keeps the row off
     # `events_agent_idx` and so out of the raw activity feed (P10.3).
@@ -826,6 +855,30 @@ def _first(statements: list[str], predicate: Any, what: str) -> int:
     raise AssertionError(f"no statement {what} in:\n" + "\n".join(statements))
 
 
+def _locked_the_cursor(statement: str) -> bool:
+    return "project_event_cursors" in statement and "FOR UPDATE" in statement
+
+
+@contextlib.contextmanager
+def _recording(database: Database) -> Iterator[list[str]]:
+    """Every statement this engine issues while the block runs.
+
+    The connection group asserts the *absence* of the cursor lock as well as
+    its position, and absence is only assertable by watching: `_next_seq`
+    cannot see it, because `next_seq` advances a row rather than a sequence
+    object, so a rollback un-consumes the number wherever the reservation
+    sat. The two agent lock tests predate this helper and stay inline.
+    """
+    statements: list[str] = []
+    record = _statement_recorder(statements)
+    engine = database.engine.sync_engine
+    event.listen(engine, "before_cursor_execute", record)
+    try:
+        yield statements
+    finally:
+        event.remove(engine, "before_cursor_execute", record)
+
+
 async def test_the_cursor_lock_is_taken_before_the_agent_row_is_written(
     service: AgentService, world: World, database: Database
 ) -> None:
@@ -905,3 +958,369 @@ async def test_the_cursor_lock_is_taken_before_the_agent_row_is_inserted(
     )
 
     assert cursor_lock < agent_insert, "the cursor must be locked before the agent row is inserted"
+
+
+# =============================================================== connections ===
+#
+# The second entity of P13's inventory. The shape is the agent group's, with
+# one operation that has no counterpart there: `delete` is a **hard** delete,
+# the only one among the eleven, and its event is the only one that has to mean
+# something after the row it describes is gone.
+
+
+@pytest_asyncio.fixture
+async def connections(factory: UnitOfWorkFactory) -> ConnectionService:
+    return ConnectionService(factory)
+
+
+async def _make_connection(
+    connections: ConnectionService, world: World, *, config: dict[str, Any] | None = None
+) -> Any:
+    """A tool grant from the world's agent. Non-consequential by default.
+
+    `side_effect: read` keeps the grant inside `member` authority, so the
+    elevation rule is not what any of these tests happens to be exercising.
+    """
+    return await connections.create(
+        world.principal,
+        _context(),
+        world.project_id,
+        kind=ConnectionKind.GRANT_TOOL,
+        source_kind="agent",
+        source_id=world.agent_id,
+        target_kind="tool",
+        target_id=uuid.uuid4(),
+        config=config if config is not None else {"tool_name": "web_search", "side_effect": "read"},
+    )
+
+
+async def _connection_exists(database: Database, connection_id: uuid.UUID) -> bool:
+    async with database.session() as session:
+        return (
+            await session.execute(
+                text("SELECT 1 FROM connections WHERE id = :i"), {"i": connection_id}
+            )
+        ).scalar_one_or_none() is not None
+
+
+async def test_a_connection_create_writes_one_created_event(
+    connections: ConnectionService, world: World, owner_database: Database, baseline: int
+) -> None:
+    connection = await _make_connection(connections, world)
+
+    rows = await _events(owner_database, CONNECTION_CREATED)
+    assert len(rows) == 1
+    _assert_shape(
+        rows[0],
+        event_type=CONNECTION_CREATED,
+        project_id=world.project_id,
+        agent_id=connection.id,
+        seq=baseline,
+        entity="connection",
+    )
+
+
+async def test_the_connection_event_carries_no_config_only_identity(
+    connections: ConnectionService, world: World, owner_database: Database
+) -> None:
+    """The payload rule matters more here than anywhere else in the inventory.
+
+    A connection's `config` is the whole of what the grant permits, and for a
+    `grant_tool` it can name an endpoint. An append-only log cannot be
+    redacted, so a config that reached one would be there for good.
+
+    The whole stored row is searched rather than only the payload, because
+    `labels` and `correlation` would leak the same string just as well.
+    """
+    connection = await _make_connection(
+        connections,
+        world,
+        config={
+            "tool_name": "web_search",
+            "side_effect": "read",
+            "endpoint": "https://SENTINEL-HOST.example/hook",
+            "token": "SENTINEL-TOKEN",
+        },
+    )
+
+    row = (await _events(owner_database, CONNECTION_CREATED))[0]
+    assert row["payload"] == {"entity": "connection", "id": str(connection.id)}
+    serialised = json.dumps(row, default=str)
+    assert "SENTINEL-HOST" not in serialised
+    assert "SENTINEL-TOKEN" not in serialised
+
+
+async def test_a_connection_update_writes_one_updated_event(
+    connections: ConnectionService, world: World, owner_database: Database
+) -> None:
+    connection = await _make_connection(connections, world)
+    after_create = await _next_seq(owner_database, world.project_id)
+
+    await connections.update(
+        world.principal, _context("r2"), world.project_id, connection.id, enabled=False
+    )
+
+    rows = await _events(owner_database, CONNECTION_UPDATED)
+    assert len(rows) == 1
+    _assert_shape(
+        rows[0],
+        event_type=CONNECTION_UPDATED,
+        project_id=world.project_id,
+        agent_id=connection.id,
+        seq=after_create,
+        entity="connection",
+    )
+
+
+async def test_an_empty_connection_update_appends_no_event_and_spends_no_number(
+    connections: ConnectionService, world: World, owner_database: Database
+) -> None:
+    """P12.2 again, on the second entity.
+
+    `ConnectionRepository.update` shares the agent repository's empty-values
+    early return, so the guard is the same one and this pins that it was
+    actually applied here rather than assumed to carry over.
+    """
+    connection = await _make_connection(connections, world)
+    after_create = await _next_seq(owner_database, world.project_id)
+
+    await connections.update(world.principal, _context("r2"), world.project_id, connection.id)
+
+    assert await _events(owner_database, CONNECTION_UPDATED) == []
+    assert await _next_seq(owner_database, world.project_id) == after_create
+
+
+async def test_updating_an_unknown_connection_spends_no_number(
+    connections: ConnectionService,
+    world: World,
+    owner_database: Database,
+    database: Database,
+    baseline: int,
+) -> None:
+    """The 404 comes from a read, so it is resolved before the cursor lock.
+
+    Watched rather than inferred. The unchanged cursor below would hold even
+    if the reservation came first, since the rollback would give the number
+    back - so it is the absent `FOR UPDATE` that distinguishes this from the
+    delete two tests down, which does reach the lock before it fails.
+    """
+    with _recording(database) as statements, pytest.raises(NotFoundError):
+        await connections.update(
+            world.principal, _context(), world.project_id, uuid.uuid4(), enabled=False
+        )
+
+    assert not any(_locked_the_cursor(s) for s in statements), (
+        "a caller refused by the read must not have taken this project's cursor lock"
+    )
+    assert await _events(owner_database, CONNECTION_UPDATED) == []
+    assert await _next_seq(owner_database, world.project_id) == baseline
+
+
+async def test_a_connection_delete_writes_one_deleted_event(
+    connections: ConnectionService, world: World, owner_database: Database
+) -> None:
+    connection = await _make_connection(connections, world)
+    after_create = await _next_seq(owner_database, world.project_id)
+
+    await connections.delete(world.principal, _context("r2"), world.project_id, connection.id)
+
+    rows = await _events(owner_database, CONNECTION_DELETED)
+    assert len(rows) == 1
+    _assert_shape(
+        rows[0],
+        event_type=CONNECTION_DELETED,
+        project_id=world.project_id,
+        agent_id=connection.id,
+        seq=after_create,
+        entity="connection",
+    )
+
+
+async def test_the_delete_event_outlives_the_connection_row(
+    connections: ConnectionService, world: World, owner_database: Database
+) -> None:
+    """The one event that must stand on its own, asserted as such.
+
+    Every other definition event describes a row a publisher can read back at
+    publish time. This one does not: the connection is gone. So the event has
+    to be replayable by itself - which the identity makes it - and that is also
+    why it must carry no more than the identity, since there would be nowhere
+    to redact anything from.
+
+    What makes that work is that the id travels in the payload: the resolved
+    reference columns are NULL for every definition event (P12.3), so this
+    row would survive the delete even if `events` did declare the foreign
+    keys it deliberately omits. The absent keys are what let an `agent_id`
+    outlive its agent; they are not what this test exercises.
+    """
+    connection = await _make_connection(connections, world)
+    await connections.delete(world.principal, _context("r2"), world.project_id, connection.id)
+
+    assert not await _connection_exists(owner_database, connection.id)
+
+    row = (await _events(owner_database, CONNECTION_DELETED))[0]
+    assert row["payload"] == {"entity": "connection", "id": str(connection.id)}
+    assert row["type"] == CONNECTION_DELETED
+    assert row["subject_ref"] == str(world.project_id)
+    # Replayable: the id in the payload still names the connection that went,
+    # and nothing about the row depends on that connection still existing.
+    assert uuid.UUID(row["payload"]["id"]) == connection.id
+
+
+async def test_deleting_an_unknown_connection_spends_no_number(
+    connections: ConnectionService,
+    world: World,
+    owner_database: Database,
+    database: Database,
+    baseline: int,
+) -> None:
+    """`connections.delete` is both the check and the mutation, like
+    `AgentService.restore` - so this 404 reaches the cursor lock before it
+    fails, and what must hold is that the rollback leaves no trace.
+
+    The cost is asserted rather than left in a comment: the lock *is* taken
+    for a connection that does not exist. That is the trade-off P13 accepted
+    instead of a read-then-write precheck, and a test that says so is what
+    stops it being re-discovered later as a surprise.
+    """
+    with _recording(database) as statements, pytest.raises(NotFoundError):
+        await connections.delete(world.principal, _context(), world.project_id, uuid.uuid4())
+
+    assert any(_locked_the_cursor(s) for s in statements), (
+        "the 404 is the DELETE itself, so the cursor lock is taken before it"
+    )
+    assert await _events(owner_database, CONNECTION_DELETED) == []
+    assert await _next_seq(owner_database, world.project_id) == baseline
+    assert await _audit_count(owner_database, "connection.delete") == 0
+
+
+async def test_a_member_may_not_edit_a_consequential_grant_and_takes_no_lock(
+    connections: ConnectionService, world: World, owner_database: Database, database: Database
+) -> None:
+    """The refusal the second authorization exists for, and its lock order.
+
+    An owner grants a consequential tool; a `member` then tries to switch it
+    off. `_elevation_for` is applied to the *stored* config as well as the
+    sent one, so the bar is `admin` even though this edit sends nothing
+    consequential - and `ConnectionService.update` claims such a caller never
+    takes this project's cursor lock. Watching the statements is what makes
+    that an assertion.
+    """
+    connection = await _make_connection(
+        connections,
+        world,
+        config={"tool_name": "send_slack_message", "side_effect": "consequential"},
+    )
+    after_create = await _next_seq(owner_database, world.project_id)
+
+    with _recording(database) as statements, pytest.raises(PermissionDeniedError):
+        await connections.update(
+            world.member(), _context("r2"), world.project_id, connection.id, enabled=False
+        )
+
+    assert not any(_locked_the_cursor(s) for s in statements), (
+        "a caller refused by the stored-grant check must not have taken the cursor lock"
+    )
+    assert await _events(owner_database, CONNECTION_UPDATED) == []
+    assert await _audit_count(owner_database, "connection.update") == 0
+    assert await _next_seq(owner_database, world.project_id) == after_create
+
+
+async def test_a_viewer_may_not_delete_a_connection_and_takes_no_lock(
+    connections: ConnectionService, world: World, owner_database: Database, database: Database
+) -> None:
+    """The delete refusal, which is an authorization one and so comes earlier.
+
+    `authorize` runs before the scope is even built, so unlike the 404 above
+    this refusal costs no lock at all - the two together say that *only* the
+    not-found case pays for the missing precheck.
+    """
+    connection = await _make_connection(connections, world)
+    after_create = await _next_seq(owner_database, world.project_id)
+
+    with _recording(database) as statements, pytest.raises(PermissionDeniedError):
+        await connections.delete(world.viewer(), _context("r2"), world.project_id, connection.id)
+
+    assert not any(_locked_the_cursor(s) for s in statements)
+    assert await _connection_exists(owner_database, connection.id)
+    assert await _events(owner_database, CONNECTION_DELETED) == []
+    assert await _audit_count(owner_database, "connection.delete") == 0
+    assert await _next_seq(owner_database, world.project_id) == after_create
+
+
+async def test_a_failing_append_rolls_back_the_connection_delete(
+    connections: ConnectionService,
+    world: World,
+    owner_database: Database,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The worst available failure, so it gets its own test.
+
+    If the delete committed and its event did not, a connection would be gone
+    with nothing anywhere recording that it ever went - no row to read, no
+    event to replay, and a grant silently removed from every client that still
+    believes it is there. The transaction is what prevents it.
+    """
+    connection = await _make_connection(connections, world)
+    after_create = await _next_seq(owner_database, world.project_id)
+
+    async def explode(*_: Any, **__: Any) -> None:
+        raise RuntimeError("the append failed")
+
+    monkeypatch.setattr(EventRepository, "append", explode)
+
+    with pytest.raises(RuntimeError):
+        await connections.delete(world.principal, _context("r2"), world.project_id, connection.id)
+
+    assert await _connection_exists(owner_database, connection.id)
+    assert await _events(owner_database, CONNECTION_DELETED) == []
+    assert await _next_seq(owner_database, world.project_id) == after_create
+    assert await _audit_count(owner_database, "connection.delete") == 0
+
+
+async def test_the_connection_lifecycle_writes_one_ordered_gapless_run(
+    connections: ConnectionService, world: World, owner_database: Database, baseline: int
+) -> None:
+    """Create, edit, delete: three events, consecutive and in order.
+
+    Asserted across the three producers at once, because a per-operation test
+    cannot see an ordering bug between them - and ordering is the whole of what
+    `resume` relies on.
+    """
+    connection = await _make_connection(connections, world)
+    await connections.update(
+        world.principal, _context("r2"), world.project_id, connection.id, enabled=False
+    )
+    await connections.delete(world.principal, _context("r3"), world.project_id, connection.id)
+
+    log = await _definition_log(owner_database, world.project_id)
+    assert log[-3:] == [
+        (baseline, CONNECTION_CREATED),
+        (baseline + 1, CONNECTION_UPDATED),
+        (baseline + 2, CONNECTION_DELETED),
+    ]
+
+
+async def test_the_cursor_lock_is_taken_before_the_connection_row_is_deleted(
+    connections: ConnectionService, world: World, database: Database
+) -> None:
+    """Lock order for the hard delete.
+
+    A DELETE takes `FOR UPDATE` strength on the row where an UPDATE of
+    non-key columns takes only `FOR NO KEY UPDATE`, so this is the strongest
+    row lock of the seven producers. Nothing references `connections.id` -
+    the edge is polymorphic, by migration 0007 - so there is no child insert
+    for it to conflict with *today*, and the reason to reserve the cursor
+    first is uniformity with the other six rather than an observed conflict:
+    the same side of the lock graph as ingest, whatever later points here.
+    """
+    connection = await _make_connection(connections, world)
+
+    with _recording(database) as statements:
+        await connections.delete(world.principal, _context("r2"), world.project_id, connection.id)
+
+    cursor_lock = _first(statements, _locked_the_cursor, "locked the project cursor")
+    deletion = _first(
+        statements, lambda s: s.startswith("DELETE FROM connections"), "deleted the connection"
+    )
+    assert cursor_lock < deletion, "the cursor must be locked before the connection row is deleted"

@@ -952,6 +952,12 @@ class ConnectionService:
                 Resource(workspace_id, conditions=conditions),
             )
             scope = TenantScope(workspace_id, project_id)
+
+            # Cursor first, after the authorization that may refuse this. The
+            # id arrives with the INSERT, so the reservation and the append sit
+            # either side of it - the same shape as `AgentService.create`.
+            seq = await _reserve_definition_seq(work, scope)
+
             connection = await work.connections(scope).create(
                 kind=kind,
                 source_kind=source_kind,
@@ -962,6 +968,14 @@ class ConnectionService:
                 requires_approval=requires_approval,
                 enabled=enabled,
                 created_by_user_id=principal.user_id,
+            )
+            await _append_definition_event(
+                work,
+                scope,
+                seq=seq,
+                entity="connection",
+                entity_id=connection.id,
+                operation="created",
             )
             await audit.record(
                 work,
@@ -1033,9 +1047,27 @@ class ConnectionService:
                     Resource(workspace_id, conditions=conditions),
                 )
 
+            # Cursor first, and after *both* authorization checks - the second
+            # one fires when the stored grant raises the bar, and a caller
+            # refused by it must not have taken this project's lock. `if sent`
+            # is P12.2: `ConnectionRepository.update` has the same empty-values
+            # early return as the agent's, so an empty request writes no row
+            # and therefore describes no change.
+            seq = await _reserve_definition_seq(work, scope) if sent else None
+
             connection = await connections.update(connection_id, **sent)
             if connection is None:  # pragma: no cover - the row was read above
                 raise NotFoundError("Connection not found", connection_id=str(connection_id))
+
+            if seq is not None:
+                await _append_definition_event(
+                    work,
+                    scope,
+                    seq=seq,
+                    entity="connection",
+                    entity_id=connection_id,
+                    operation="updated",
+                )
 
             await audit.record(
                 work,
@@ -1066,8 +1098,36 @@ class ConnectionService:
             workspace_id = await _workspace_of(work, project_id)
             authorize(principal, Action.CONNECTION_DELETE, Resource(workspace_id))
             scope = TenantScope(workspace_id, project_id)
+
+            # Cursor first, which here means before the only check there is:
+            # `connections.delete` is both the refusal and the mutation, so a
+            # 404 briefly holds this project's cursor lock until the rollback.
+            # P13 accepts that rather than adding a read-then-write precheck -
+            # the same trade-off as `AgentService.restore`.
+            seq = await _reserve_definition_seq(work, scope)
+
             if not await work.connections(scope).delete(connection_id):
                 raise NotFoundError("Connection not found", connection_id=str(connection_id))
+
+            # The one hard delete among the eleven, and the one event that
+            # must stand entirely on its own. The row it describes is already
+            # gone by the time this is written, so nothing can be read back
+            # from it later - which is why the payload is the identity and the
+            # operation and nothing else, and why `events` declares no foreign
+            # key on its reference columns ("this table outlives the rows it
+            # points at"). A snapshot here would be the only copy of a deleted
+            # connection's config living in an append-only log.
+            #
+            # Assembling the client-side tombstone from this is P10.2's, at the
+            # gateway, and is deliberately not attempted here.
+            await _append_definition_event(
+                work,
+                scope,
+                seq=seq,
+                entity="connection",
+                entity_id=connection_id,
+                operation="deleted",
+            )
             await audit.record(
                 work,
                 principal,
