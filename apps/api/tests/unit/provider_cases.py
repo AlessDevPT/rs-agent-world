@@ -29,10 +29,10 @@ import ipaddress
 import json
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Final
 
 from agentworld.infra import net, providers
-from agentworld.infra.providers import anthropic, registry
+from agentworld.infra.providers import anthropic, openai_compatible, registry
 
 
 @dataclass
@@ -225,9 +225,202 @@ ANTHROPIC = ProviderCase(
 )
 
 
+# ------------------------------------------------------------------- openai ---
+
+OPENAI_KEY = "sk-test-ZZnotarealkeyZZ"
+OPENAI_MODEL = "gpt-5-mini"
+
+#: Deliberately different from the other case's counts. If a shared test
+#: passed because it was reading the wrong case's expectations, equal numbers
+#: would hide it.
+OPENAI_INPUT_TOKENS = 21
+OPENAI_OUTPUT_TOKENS = 5
+
+
+def openai_answer(**overrides: Any) -> bytes:
+    document: dict[str, Any] = {
+        "id": "chatcmpl-01",
+        "object": "chat.completion",
+        "created": 1764200000,
+        "model": OPENAI_MODEL,
+        "choices": [
+            {
+                "index": 0,
+                "message": {"role": "assistant", "content": "Four."},
+                "finish_reason": "stop",
+            }
+        ],
+        "usage": {
+            "prompt_tokens": OPENAI_INPUT_TOKENS,
+            "completion_tokens": OPENAI_OUTPUT_TOKENS,
+            "total_tokens": OPENAI_INPUT_TOKENS + OPENAI_OUTPUT_TOKENS,
+        },
+    }
+    document.update(overrides)
+    return json.dumps(document).encode()
+
+
+def openai_choice(message: dict[str, Any], finish_reason: str | None) -> list[dict[str, Any]]:
+    """One choice, with `finish_reason` omitted entirely when it is None.
+
+    Omitted rather than null, because "the field is absent" is the case the
+    mapping has to answer for - a server that stops reporting it must not
+    produce a stop reason this vocabulary does not have.
+    """
+    choice: dict[str, Any] = {"index": 0, "message": message}
+    if finish_reason is not None:
+        choice["finish_reason"] = finish_reason
+    return [choice]
+
+
+def _openai_with_stop(raw: str | None) -> bytes:
+    return openai_answer(
+        choices=openai_choice({"role": "assistant", "content": "Four."}, raw),
+    )
+
+
+def _openai_tool_answer() -> bytes:
+    return openai_answer(
+        choices=openai_choice(
+            {
+                "role": "assistant",
+                "content": "Let me look.",
+                "tool_calls": [
+                    {
+                        "id": "call_01",
+                        "type": "function",
+                        "function": {
+                            "name": "web_search",
+                            # A JSON *string*, which is the one place the two
+                            # wire formats disagree where a caller could see
+                            # it. The conformance suite asserts they cannot.
+                            "arguments": '{"query": "weather"}',
+                        },
+                    }
+                ],
+            },
+            "tool_calls",
+        ),
+    )
+
+
+def _openai_body(choices: Any = None, usage: Any = None) -> bytes:
+    """A malformed-case body, assembled so each row isolates one fault."""
+    document: dict[str, Any] = {}
+    if choices is not None:
+        document["choices"] = choices
+    if usage is not None:
+        document["usage"] = usage
+    return json.dumps(document).encode()
+
+
+_OPENAI_GOOD_USAGE: Final = {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+_OPENAI_TEXT_MESSAGE: Final = {"role": "assistant", "content": "x"}
+
+
+def _openai_tool_body(arguments: Any) -> bytes:
+    """A tool call whose `arguments` is whatever the row is testing."""
+    return _openai_body(
+        choices=[
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "c",
+                            "type": "function",
+                            "function": {"name": "n", "arguments": arguments},
+                        }
+                    ],
+                },
+                "finish_reason": "tool_calls",
+            }
+        ],
+        usage=_OPENAI_GOOD_USAGE,
+    )
+
+
+OPENAI = ProviderCase(
+    slug=openai_compatible.SLUG,
+    model_id=OPENAI_MODEL,
+    api_key=OPENAI_KEY,
+    answer=openai_answer,
+    text="Four.",
+    input_tokens=OPENAI_INPUT_TOKENS,
+    output_tokens=OPENAI_OUTPUT_TOKENS,
+    tool_answer=_openai_tool_answer,
+    tool_text="Let me look.",
+    tool_calls=(("call_01", "web_search", {"query": "weather"}),),
+    answer_with_stop=_openai_with_stop,
+    #: No row maps to `STOPPED`: this wire has one `stop` for both a natural
+    #: ending and a stop sequence, so that member is unreachable here. The
+    #: gap is deliberate and visible, which is why these tables are per-case.
+    stop_reasons=(
+        ("stop", providers.StopReason.COMPLETED),
+        ("length", providers.StopReason.MAX_TOKENS),
+        ("tool_calls", providers.StopReason.TOOL_USE),
+        # A refusal, which the vocabulary has no member for.
+        ("content_filter", providers.StopReason.OTHER),
+        # Deprecated on the wire, and this adapter never reads the matching
+        # response field, so promising a tool call would be a lie.
+        ("function_call", providers.StopReason.OTHER),
+        ("something_new", providers.StopReason.OTHER),
+        (None, providers.StopReason.OTHER),
+    ),
+    #: No 529 - that is the other vendor's overload status. 503 is this
+    #: protocol's, and it is covered by the 5xx range rather than by a row of
+    #: its own in the adapter.
+    statuses=(
+        (400, providers.ProviderFailure.INVALID_REQUEST, False),
+        (401, providers.ProviderFailure.UNAUTHORIZED, False),
+        (403, providers.ProviderFailure.UNAUTHORIZED, False),
+        (404, providers.ProviderFailure.INVALID_REQUEST, False),
+        (413, providers.ProviderFailure.INVALID_REQUEST, False),
+        (422, providers.ProviderFailure.INVALID_REQUEST, False),
+        (429, providers.ProviderFailure.RATE_LIMITED, True),
+        (500, providers.ProviderFailure.UNAVAILABLE, True),
+        (503, providers.ProviderFailure.UNAVAILABLE, True),
+    ),
+    malformed=(
+        (b"not json at all", "not JSON"),
+        (b"[]", "not an object"),
+        (_openai_body(usage=_OPENAI_GOOD_USAGE), "choices is missing"),
+        (_openai_body(choices=[], usage=_OPENAI_GOOD_USAGE), "choices is empty"),
+        (_openai_body(choices=["nope"], usage=_OPENAI_GOOD_USAGE), "a choice is not"),
+        (_openai_body(choices=[{"index": 0}], usage=_OPENAI_GOOD_USAGE), "no message object"),
+        (_openai_body(choices=[{"message": _OPENAI_TEXT_MESSAGE}]), "usage is missing"),
+        (
+            _openai_body(choices=[{"message": _OPENAI_TEXT_MESSAGE}], usage={"prompt_tokens": 1}),
+            "token count",
+        ),
+        # Content parts, which this protocol allows in a *request* and not in
+        # a response. Coercing them with `str()` would record a Python repr
+        # as the model's answer, so they are refused instead.
+        (
+            _openai_body(
+                choices=[{"message": {"role": "assistant", "content": [{"text": "x"}]}}],
+                usage=_OPENAI_GOOD_USAGE,
+            ),
+            "content is not a string",
+        ),
+        (_openai_tool_body("{not json"), "arguments are not JSON"),
+        (_openai_tool_body("[1, 2]"), "not a JSON object"),
+        (_openai_tool_body(3), "are not a string"),
+        (
+            _openai_body(
+                choices=[{"message": {"role": "assistant", "tool_calls": "no"}}],
+                usage=_OPENAI_GOOD_USAGE,
+            ),
+            "tool_calls is not a list",
+        ),
+    ),
+)
+
+
 #: Every implementation this build serves. A provider is added here, and the
 #: conformance suite then holds it to the same properties as the first.
-CASES: tuple[ProviderCase, ...] = (ANTHROPIC,)
+CASES: tuple[ProviderCase, ...] = (ANTHROPIC, OPENAI)
 
 
 def case_id(case: ProviderCase) -> str:

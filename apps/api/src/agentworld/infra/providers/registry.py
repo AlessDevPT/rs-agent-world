@@ -18,12 +18,18 @@ from collections.abc import Callable, Mapping
 from typing import Final
 
 from agentworld.infra.net import GuardedClient
-from agentworld.infra.providers import anthropic
+from agentworld.infra.providers import anthropic, openai_compatible
 from agentworld.infra.providers.base import ModelProvider
 
 #: slug -> how to build it. One entry per implementation.
+#:
+#: One of these slugs names a company and the other names a protocol: the
+#: second serves every server speaking that protocol, and `base_url` on the
+#: profile decides which one a call reaches. A slug is still compared exactly
+#: by `_servable`, so the distinction costs nothing here.
 _BUILDERS: Final[Mapping[str, Callable[..., ModelProvider]]] = {
     anthropic.SLUG: anthropic.build,
+    openai_compatible.SLUG: openai_compatible.build,
 }
 
 
