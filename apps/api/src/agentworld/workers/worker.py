@@ -42,6 +42,21 @@ from starving the others. Nothing here coordinates with anything else.
 its docstring asks for one instance per process rather than per call. It is
 built once here and closed on the way out.
 
+**And it hosts the realtime publisher, on the `redis` bus** (P10.5). As its
+own task beside the dispatch loop rather than inside it, for two reasons that
+are really one: a thirty-second provider call must not delay a quarter-second
+publish, and - the limitation P10.5 asks to be written down - **the give-up
+bound above must not apply to publication.** Exiting after
+`WORKER_MAX_CONSECUTIVE_ERRORS` is right for dispatches, where a worker
+spinning against a database that refuses it should hand the problem to a
+supervisor; it is wrong for a publisher that has to keep trying through a
+Redis restart, and nothing is at risk in letting it: the publisher's position
+is in PostgreSQL, so an outage of any length costs latency and no data. So the
+publisher counts its own failures, logs them, and keeps going, and a failure
+there neither stops a dispatch nor exits this process. On the `inprocess` bus
+there is nothing here to publish *to* and the API process publishes for
+itself; `api/ws/publisher.py` has the whole argument.
+
 **Exit codes.** 0 when the work was done or there was none, 1 when a
 dispatch could not be performed in `--once`, and 1 from the loop after
 `WORKER_MAX_CONSECUTIVE_ERRORS` failures in a row - rather than spinning
@@ -56,7 +71,9 @@ import asyncio
 import contextlib
 from dataclasses import dataclass
 
+from agentworld.api.ws.publisher import RealtimePublisher, publishes_in_api, run_publisher
 from agentworld.infra.db import Database
+from agentworld.infra.event_bus import EventBus, build_event_bus
 from agentworld.infra.logging import configure_logging, get_logger
 from agentworld.infra.net import GuardedClient
 from agentworld.infra.secrets import EnvelopeSecretStore
@@ -139,15 +156,19 @@ async def run_forever(settings: Settings | None = None) -> int:
     resolved = settings or get_settings()
     database = Database(resolved.database_url)
     client = GuardedClient()
-    worker = _worker(UnitOfWorkFactory(database), client, resolved)
+    factory = UnitOfWorkFactory(database)
+    worker = _worker(factory, client, resolved)
     stopping = asyncio.Event()
     install_stop_handlers(stopping)
+
+    bus, publishing = _start_publisher(factory, resolved, stopping)
 
     log.info(
         "worker_starting",
         worker=worker.name,
         idle_sleep_seconds=resolved.worker_idle_sleep_seconds,
         lease_seconds=resolved.worker_lease_seconds,
+        publishing=publishing is not None,
     )
     consecutive_errors = 0
     try:
@@ -170,10 +191,41 @@ async def run_forever(settings: Settings | None = None) -> int:
             with contextlib.suppress(TimeoutError):
                 await asyncio.wait_for(stopping.wait(), timeout=resolved.worker_idle_sleep_seconds)
     finally:
+        stopping.set()
+        if publishing is not None:
+            publishing.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await publishing
+        if bus is not None:
+            await bus.aclose()
         await client.aclose()
         await database.dispose()
         log.info("worker_stopped", worker=worker.name)
     return 0
+
+
+def _start_publisher(
+    factory: UnitOfWorkFactory, settings: Settings, stopping: asyncio.Event
+) -> tuple[EventBus | None, asyncio.Task[None] | None]:
+    """The realtime publisher, when this process is the one that must host it.
+
+    Nothing on the `inprocess` bus: a message put on it would reach the
+    sockets of *this* process, which holds none. See the module docstring and
+    `api/ws/publisher.py`.
+    """
+    if publishes_in_api(settings.event_bus):
+        return None, None
+    bus = build_event_bus(settings.event_bus, redis_url=settings.redis_url)
+    publisher = RealtimePublisher(factory, bus, batch_rows=settings.realtime_publish_batch_rows)
+    task = asyncio.create_task(
+        run_publisher(
+            publisher,
+            interval_seconds=settings.realtime_publish_interval_seconds,
+            stop=stopping,
+        ),
+        name="realtime-publisher",
+    )
+    return bus, task
 
 
 async def _main(argv: list[str] | None = None) -> int:

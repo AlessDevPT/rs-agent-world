@@ -329,15 +329,16 @@ def test_an_approval_floor_is_never_below_the_action_itself(
 
 
 def test_the_matrix_is_the_size_the_proposal_says_it_is() -> None:
-    """78 actions: 77 from the proposal, plus one T6b added.
+    """83 actions: 77 from the proposal, plus six added while implementing.
 
     A count is a weak test of anything except itself - but this one is quoted
     in `05-PERMISSIONS.md` (the title of §6, and §§1 and 2) and in
     `00-GAP-ANALYSIS.md`, and a silent drift between the document a
     reviewer reads and the table the code enforces is exactly what an
-    access-control model cannot afford. Both documents now carry the 78th as
-    an implementation note rather than a rewritten total, which is why this
-    test asserts the two numbers separately.
+    access-control model cannot afford. Both documents carry the additions as
+    implementation notes rather than a rewritten total, which is why this
+    test asserts the two numbers separately: the proposal's 62 stay 62
+    however many the implementation has had to add beside them.
     """
     phase_one = {
         action
@@ -364,8 +365,15 @@ def test_the_matrix_is_the_size_the_proposal_says_it_is() -> None:
         # not given an action of its own, and it is a different table with a
         # different producer.
         Action.AGENT_READ_HISTORY,
+        # Step 3, the realtime spine. The proposal designed the stream and
+        # the ticket route in `03-API.md` §6 and `03-API-AND-FRONTEND.md` §4
+        # and enumerated no action for either, which is how R4 came to be
+        # phrased as "a *new* member of `Action`" rather than as a row to
+        # fill in. One action for the whole stream, not one per channel: see
+        # its own comment in `policy.py`.
+        Action.REALTIME_SUBSCRIBE,
     }
-    assert len(Action) == 82
+    assert len(Action) == 83
     assert len(Action) - len(phase_one) - len(added_after_the_proposal) == 62
 
 

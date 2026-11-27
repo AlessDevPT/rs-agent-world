@@ -292,6 +292,13 @@ ENDPOINTS = [
         MemberRole.ADMIN,
         {"outcome": "failed", "note": "Resolved while checking the role matrix."},
     ),
+    # ---- Phase 3 / the realtime spine -------------------------------------
+    # R4 and R2: the stream's authorization is an `Action` with a row here,
+    # and it is `viewer` because watching is reading - every channel carries
+    # entities a viewer can already read over REST. The socket itself has no
+    # row and cannot have one: a WebSocket route has no OpenAPI operation, so
+    # the ticket route is where the role is decided and where it is checked.
+    Endpoint("POST", "/v1/projects/{project}/ws-ticket", MemberRole.VIEWER),
 ]
 
 

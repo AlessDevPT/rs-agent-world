@@ -36,6 +36,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator, Collection
 from contextlib import asynccontextmanager
+from typing import Literal
 from uuid import UUID
 
 from sqlalchemy import text
@@ -49,6 +50,11 @@ from sqlalchemy.ext.asyncio import (
 #: The PostgreSQL run-time parameter the RLS policies read. A custom GUC must
 #: contain a dot, which is also why it reads as a namespace.
 TENANT_SETTING = "agentworld.workspace_ids"
+
+#: The isolation levels anything here asks for. A closed set rather than a
+#: free string: the only reason to raise the level is the snapshot's, and a
+#: typo in a connection option is silently ignored by the driver.
+IsolationLevel = Literal["READ COMMITTED", "REPEATABLE READ", "SERIALIZABLE"]
 
 _SET_TENANT = text(f"SELECT set_config('{TENANT_SETTING}', :workspace_ids, true)")
 _READ_TENANT = text(f"SELECT current_setting('{TENANT_SETTING}', true)")
@@ -76,10 +82,25 @@ class Database:
             expire_on_commit=False,
             autoflush=False,
         )
+        self._bound_engines: dict[IsolationLevel, AsyncEngine] = {}
 
     @property
     def engine(self) -> AsyncEngine:
         return self._engine
+
+    def _bound(self, isolation_level: IsolationLevel) -> AsyncEngine:
+        """The same pool, viewed through a fixed isolation level.
+
+        `execution_options` returns a new engine facade over the *same*
+        connection pool, so this costs no connection - but it does allocate,
+        and a snapshot runs on every socket that connects. Cached per level,
+        of which there are three.
+        """
+        bound = self._bound_engines.get(isolation_level)
+        if bound is None:
+            bound = self._engine.execution_options(isolation_level=isolation_level)
+            self._bound_engines[isolation_level] = bound
+        return bound
 
     async def dispose(self) -> None:
         await self._engine.dispose()
@@ -95,7 +116,10 @@ class Database:
 
     @asynccontextmanager
     async def session(
-        self, *, visible_workspaces: Collection[UUID] | None = None
+        self,
+        *,
+        visible_workspaces: Collection[UUID] | None = None,
+        isolation_level: IsolationLevel | None = None,
     ) -> AsyncIterator[AsyncSession]:
         """A transactional session that can see exactly these workspaces.
 
@@ -105,8 +129,18 @@ class Database:
         of it. The two queries that legitimately precede tenant resolution
         (a user's own memberships, a key looked up by its prefix) run against
         tables that carry no policy, and say so where they are written.
+
+        `isolation_level` is for the one caller that needs a *consistent* read
+        rather than a current one: the WebSocket snapshot, which has to report
+        a cursor and a set of entities that describe the same instant, or a
+        mutation landing mid-read appears both in the snapshot and in the
+        deltas that follow it. It is applied as a connection execution option
+        rather than with a `SET TRANSACTION` statement, because the level has
+        to be fixed before the transaction's first statement - and the first
+        statement here is the one that sets the tenant.
         """
-        async with self._sessionmaker() as session, session.begin():
+        bind = self._engine if isolation_level is None else self._bound(isolation_level)
+        async with self._sessionmaker(bind=bind) as session, session.begin():
             await session.execute(_SET_TENANT, {"workspace_ids": _render(visible_workspaces)})
             yield session
 

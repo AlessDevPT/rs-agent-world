@@ -13,6 +13,8 @@ whichever event loop happened to import it first.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
@@ -30,6 +32,7 @@ from agentworld.api.v1 import (
     ingest,
     me,
     projects,
+    realtime,
     review,
     self_,
     workflows,
@@ -37,9 +40,12 @@ from agentworld.api.v1 import (
 )
 from agentworld.api.v1.meta import API_VERSION
 from agentworld.api.v1.meta import router as meta_router
+from agentworld.api.ws.gateway import router as ws_router
+from agentworld.api.ws.publisher import RealtimePublisher, publishes_in_api, run_publisher
 from agentworld.infra.auth.provider import AuthProvider
 from agentworld.infra.auth.supabase import SupabaseAuthProvider
 from agentworld.infra.db import Database
+from agentworld.infra.event_bus import build_event_bus
 from agentworld.infra.logging import configure_logging, get_logger
 from agentworld.repositories.unit_of_work import UnitOfWorkFactory
 from agentworld.settings import Settings, get_settings
@@ -87,26 +93,60 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         database = Database(settings.database_url)
         auth_provider = _build_auth_provider(settings)
+        factory = UnitOfWorkFactory(database)
+        bus = build_event_bus(settings.event_bus, redis_url=settings.redis_url)
 
         app.state.settings = settings
         app.state.database = database
-        app.state.unit_of_work_factory = UnitOfWorkFactory(database)
+        app.state.unit_of_work_factory = factory
         app.state.auth_provider = auth_provider
+        app.state.event_bus = bus
+
+        # The publisher runs here only when the bus does not cross processes.
+        # On `inprocess` a worker publishing into its own copy would reach
+        # nobody, so the process holding the sockets has to publish for
+        # itself; on `redis` the worker hosts it (P10.5) and a second
+        # publisher would only duplicate sends. `api/ws/publisher.py` has the
+        # full argument, including why this loop has no give-up bound.
+        publisher = RealtimePublisher(factory, bus, batch_rows=settings.realtime_publish_batch_rows)
+        app.state.realtime_publisher = publisher
+        stop = asyncio.Event()
+        app.state.realtime_publisher_stop = stop
+        publishing: asyncio.Task[None] | None = None
+        if publishes_in_api(settings.event_bus) and settings.realtime_publish_in_api:
+            publishing = asyncio.create_task(
+                run_publisher(
+                    publisher,
+                    interval_seconds=settings.realtime_publish_interval_seconds,
+                    stop=stop,
+                ),
+                name="realtime-publisher",
+            )
 
         log.info(
             "api_starting",
             environment=settings.environment,
             event_bus=settings.event_bus,
+            publishing_in_api=publishing is not None,
             version=API_VERSION,
             auth_configured=auth_provider is not None,
         )
         try:
             yield
         finally:
-            # Ordered: stop accepting work, then release the pool. Phase 4
-            # closes the event bus between the two.
+            # Ordered: stop publishing, stop accepting work, release the bus,
+            # then the pool. The bus goes before the pool because closing it
+            # can await a reader task that is holding nothing, while a
+            # disposed pool under a live publisher would log errors on the
+            # way out.
+            stop.set()
+            if publishing is not None:
+                publishing.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await publishing
             if auth_provider is not None:
                 await auth_provider.close()
+            await bus.aclose()
             await database.dispose()
             log.info("api_stopped")
 
@@ -153,6 +193,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(executions.workflow_router)
     app.include_router(executions.router)
     app.include_router(review.router)
+    app.include_router(realtime.router)
+    # The gateway. Not in the OpenAPI schema - a WebSocket route has no
+    # operation to describe - so `test_role_matrix.py`'s coverage guard
+    # cannot see it, and the ticket route above is the one that carries
+    # the role-matrix row (R2).
+    app.include_router(ws_router)
 
     return app
 

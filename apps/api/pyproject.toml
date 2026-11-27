@@ -23,6 +23,11 @@ dependencies = [
     "cryptography>=43.0.0",
     "argon2-cffi>=23.1.0",
     "httpx>=0.27.0",
+    # The `redis` event bus (P4). Imported by `infra/event_bus.py` alone:
+    # the domain contract below forbids the name outright, and the
+    # gateway is written against the `EventBus` protocol so it cannot
+    # tell which implementation it has.
+    "redis>=5.2.0",
 ]
 
 # The two background processes. Neither may run inside the API: both compete
@@ -40,6 +45,11 @@ dev = [
     "ruff>=0.7.0",
     "mypy>=1.13.0",
     "import-linter>=2.1",
+    # The WebSocket client the two-process fan-out test drives (R13).
+    # `uvicorn[standard]` already brings the server half in; this is the
+    # client, and naming it here is what stops a transitive extra from
+    # deciding whether that test can run at all.
+    "websockets>=13.0",
 ]
 
 [build-system]

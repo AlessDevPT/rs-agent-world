@@ -24,7 +24,7 @@ from uuid import UUID
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from agentworld.infra.db import Database
+from agentworld.infra.db import Database, IsolationLevel
 from agentworld.repositories.api_keys import ApiKeyRepository, ApiKeyUnscopedRepository
 from agentworld.repositories.audit import AuditLogRepository
 from agentworld.repositories.base import TenantScope
@@ -44,6 +44,12 @@ from agentworld.repositories.dispatches import (
 from agentworld.repositories.events import EventRepository, TelemetryRepository
 from agentworld.repositories.executions import DispatchRepository, ExecutionRepository
 from agentworld.repositories.projects import ProjectLookupRepository, ProjectRepository
+from agentworld.repositories.realtime import (
+    EventReadRepository,
+    ProjectPublicationRepository,
+    PublicationCursorRepository,
+    WsTicketRepository,
+)
 from agentworld.repositories.users import (
     MemberListRepository,
     MembershipRepository,
@@ -159,6 +165,24 @@ class UnitOfWork:
     def dispatch_reads(self, scope: TenantScope) -> DispatchReadRepository:
         return DispatchReadRepository(self._session, scope)
 
+    # ---- Phase 3: the realtime spine --------------------------------------
+
+    def ws_tickets(self, scope: TenantScope) -> WsTicketRepository:
+        """Minting and spending WebSocket tickets. Needs `scope.project_id`."""
+        return WsTicketRepository(self._session, scope)
+
+    def publication_cursor(self, scope: TenantScope) -> PublicationCursorRepository:
+        """How far the publisher has got in one project (P10.4)."""
+        return PublicationCursorRepository(self._session, scope)
+
+    def publication_sweep(self, scope: TenantScope) -> ProjectPublicationRepository:
+        """Which projects in this workspace have unpublished events."""
+        return ProjectPublicationRepository(self._session, scope)
+
+    def event_reads(self, scope: TenantScope) -> EventReadRepository:
+        """Reading events back for a replay. The write path is `events()`."""
+        return EventReadRepository(self._session, scope)
+
 
 class UnitOfWorkFactory:
     """Opens units of work against one database."""
@@ -168,7 +192,10 @@ class UnitOfWorkFactory:
 
     @asynccontextmanager
     async def begin(
-        self, *, visible_workspaces: Collection[UUID] | None = None
+        self,
+        *,
+        visible_workspaces: Collection[UUID] | None = None,
+        isolation_level: IsolationLevel | None = None,
     ) -> AsyncIterator[UnitOfWork]:
         """Open a transaction that can see exactly these workspaces.
 
@@ -181,5 +208,7 @@ class UnitOfWorkFactory:
         tenant-scoped table (resolving a principal, verifying a key) use that
         deliberately.
         """
-        async with self._database.session(visible_workspaces=visible_workspaces) as session:
+        async with self._database.session(
+            visible_workspaces=visible_workspaces, isolation_level=isolation_level
+        ) as session:
             yield UnitOfWork(session)

@@ -1637,6 +1637,77 @@ class ProjectEventCursor(Base):
     )
 
 
+# ------------------------------------------------- Phase 3: the realtime spine ---
+
+
+class WsTicket(Base):
+    """A one-minute, single-use ticket for one project's WebSocket.
+
+    A browser cannot set a header on a WebSocket and a token in a query
+    string reaches access logs, so the client exchanges its JWT for this
+    (`03-API.md` §6). Single-use is the `consumed_at` column plus the
+    conditional UPDATE that sets it: every gateway process sees the same row,
+    which process memory could not promise. Migration 0027 has the rest,
+    including why the ticket string carries its workspace id.
+    """
+
+    __tablename__ = "ws_tickets"
+
+    id: Mapped[UUID] = _uuid_pk()
+    workspace_id: Mapped[UUID] = mapped_column(sa.Uuid, nullable=False)
+    project_id: Mapped[UUID] = mapped_column(sa.Uuid, nullable=False)
+    user_id: Mapped[UUID] = mapped_column(
+        sa.Uuid, sa.ForeignKey("users.id", ondelete="CASCADE"), nullable=False
+    )
+    #: SHA-256 of the secret half, hex. The only copy of it that is stored.
+    secret_digest: Mapped[str] = mapped_column(sa.Text, nullable=False)
+    expires_at: Mapped[dt.datetime] = mapped_column(nullable=False)
+    consumed_at: Mapped[dt.datetime | None] = mapped_column(nullable=True)
+    created_at: Mapped[dt.datetime] = _created_at()
+
+    __table_args__ = (
+        _project_fk("ws_tickets"),
+        sa.ForeignKeyConstraint(
+            ["workspace_id"],
+            ["workspaces.id"],
+            name="ws_tickets_workspace_id_fkey",
+            ondelete="CASCADE",
+        ),
+        sa.Index("ws_tickets_expiry_idx", "expires_at"),
+    )
+
+
+class EventPublicationCursor(Base):
+    """How far the realtime publisher has got, per project (P10.4).
+
+    Server-side bookkeeping and **not a second public cursor**: no client ever
+    sees this number. Its own table rather than a column on
+    `project_event_cursors` because that row is the project's ingest lock, and
+    a publisher must not be able to queue behind - or in front of - the
+    writers it reads from. Migration 0027 has the reasoning.
+    """
+
+    __tablename__ = "event_publication_cursors"
+
+    workspace_id: Mapped[UUID] = mapped_column(sa.Uuid, nullable=False)
+    project_id: Mapped[UUID] = mapped_column(sa.Uuid, primary_key=True)
+    #: The highest `events.seq` whose frames have reached the bus. Zero means
+    #: nothing has been published, which is below the first event's seq of 1.
+    published_seq: Mapped[int] = mapped_column(sa.BigInteger, nullable=False, server_default="0")
+    updated_at: Mapped[dt.datetime] = _created_at()
+
+    __table_args__ = (
+        _project_fk("event_publication_cursors"),
+        sa.ForeignKeyConstraint(
+            ["workspace_id"],
+            ["workspaces.id"],
+            name="event_publication_cursors_workspace_id_fkey",
+            ondelete="CASCADE",
+        ),
+        sa.CheckConstraint("published_seq >= 0", name="published_seq_is_not_negative"),
+    )
+
+
 # ---------------------------------------------------- Phase 2: presentation ---
 #
 # Where a building sits, how big it is, what it looks like, how a road is
@@ -1870,6 +1941,10 @@ RLS_PROTECTED_TABLES: tuple[str, ...] = (
     "world_routes",
     # 0015
     "project_event_cursors",
+    # 0027 - a ticket names a project, and the publisher's position says what
+    # a tenant has been doing. Both are tenant data; neither is exempt.
+    "ws_tickets",
+    "event_publication_cursors",
 )
 
 #: Monthly partitions are named `<table>_y2026m11`, created by

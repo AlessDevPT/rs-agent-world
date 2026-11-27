@@ -70,6 +70,15 @@ def _base_settings() -> Settings:
         api_key_pepper=PEPPER,
         database_url=_swap_database(configured.database_url, TEST_DATABASE),
         migration_database_url=_swap_database(configured.effective_migration_url, TEST_DATABASE),
+        event_bus="inprocess",
+        # No publisher loop in the API process by default. Two reasons, and
+        # the second is the one that matters: a background timer would open
+        # connections and read `events` underneath every test in this package
+        # including the ones that truncate it, and a test that asserts what
+        # *one* publication pass does cannot say so while a timer is doing
+        # passes of its own. The realtime tests that want the loop build
+        # their own app with it on, so the wiring is still covered.
+        realtime_publish_in_api=False,
     )
 
 

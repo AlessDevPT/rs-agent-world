@@ -25,9 +25,10 @@ jobs:
       # database doing anything.
       DATABASE_URL: postgresql+asyncpg://agentworld_app:app@localhost:5432/agentworld
       MIGRATION_DATABASE_URL: postgresql+asyncpg://agentworld:dev@localhost:5432/agentworld
-      # Without this the integration tests skip when Postgres is missing,
-      # which is right for a contributor with no Docker and a silent hole in
-      # CI. Here, a skip is a failure.
+      REDIS_URL: redis://localhost:6379/0
+      # Without this the integration tests skip when Postgres or Redis is
+      # missing, which is right for a contributor with no Docker and a silent
+      # hole in CI. Here, a skip is a failure.
       AGENTWORLD_REQUIRE_INTEGRATION: "1"
     steps:
       - uses: actions/checkout@v4
@@ -36,8 +37,18 @@ jobs:
       # that creates the application role runs exactly as it does locally.
       # A service container cannot mount it, which would mean CI and a
       # developer's machine differed on the one thing these tests check.
-      - name: Start Postgres
-        run: docker compose -f infra/compose/docker-compose.yml up -d --wait postgres
+      #
+      # Redis is started here as well as in the `compose` job below, and that
+      # is the point rather than duplication: R13 - two gateway processes on
+      # the `redis` bus seeing identical frames - is the acceptance criterion
+      # `inprocess` cannot satisfy (P4), and until this line it had nowhere to
+      # run. `AGENTWORLD_REQUIRE_INTEGRATION=1` turns a skipped integration
+      # test into a failure, so a Redis-dependent test with no Redis would
+      # fail the job rather than quietly prove nothing - which is why the
+      # service belongs in the job that runs the suite and not only in the one
+      # that checks the stack starts.
+      - name: Start Postgres and Redis
+        run: docker compose -f infra/compose/docker-compose.yml up -d --wait postgres redis
 
       - uses: actions/setup-python@v5
         with:
@@ -79,7 +90,7 @@ jobs:
         working-directory: apps/api
         run: pytest --cov --cov-report=term-missing
 
-      - name: Stop Postgres
+      - name: Stop Postgres and Redis
         if: always()
         run: docker compose -f infra/compose/docker-compose.yml down -v
 

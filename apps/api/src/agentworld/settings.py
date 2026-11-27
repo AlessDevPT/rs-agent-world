@@ -67,7 +67,46 @@ class Settings(BaseSettings):
     credential_active_kek_id: str = ""
 
     default_heartbeat_ttl_seconds: int = Field(default=60, ge=5, le=3600)
+    #: How far back a `resume` cursor may reach. The operational definition of
+    #: R11's replay window, which until now had none: `events` is partitioned
+    #: monthly and nothing prunes a partition, so no cursor was unreachable and
+    #: `resync_required` could not occur. A cursor more than this many events
+    #: behind the project's latest is answered with `resync_required` and
+    #: nothing else. Counted in events rather than in time because the cursor
+    #: is an event number, so a count is the only bound the gateway can check
+    #: without a second query, and it bounds the work a replay can ask of the
+    #: database - which is the thing the window exists to bound.
     ws_replay_window_events: int = Field(default=10_000, ge=100)
+    #: How long a WebSocket ticket is valid. 60 seconds, from `03-API.md` §6:
+    #: long enough for a browser to open a socket, short enough that a ticket
+    #: in an access log is spent before anyone reads it.
+    ws_ticket_ttl_seconds: int = Field(default=60, ge=5, le=600)
+    #: The per-connection bound from `01-ARCHITECTURE.md` §5.2. A consumer that
+    #: stops reading reaches this and is closed with `resync_required` rather
+    #: than growing the server's memory (R12). The bound is on frames rather
+    #: than bytes because a frame is the unit the gateway can drop without
+    #: leaving a client half-informed - and once one is dropped the only
+    #: honest answer is a fresh snapshot, so the depth only has to be large
+    #: enough to absorb an ordinary burst.
+    ws_outbound_queue_frames: int = Field(default=256, ge=1, le=100_000)
+    #: How often the publisher looks for committed event rows it has not
+    #: published. The floor on delta latency, and the reason it is this short
+    #: where the worker's idle sleep is seconds: a viewer watching an island
+    #: notices a quarter-second, and the query is one indexed read per project
+    #: with unpublished rows rather than one per workspace.
+    realtime_publish_interval_seconds: float = Field(default=0.25, gt=0, le=60)
+    #: Whether the API process runs the publisher loop in its lifespan. True
+    #: is the deployment answer for the `inprocess` bus, where no other
+    #: process can reach the sockets this one holds; on `redis` the worker
+    #: hosts it either way and this is ignored. False is for a test that wants
+    #: to drive `publish_once()` itself and assert what one pass does, which a
+    #: timer in the background makes impossible to state.
+    realtime_publish_in_api: bool = True
+    #: Event rows turned into frames in one pass, per project. Bounds the work
+    #: of one turn, not the backlog: a project behind by more than this is
+    #: caught up over several passes, in cursor order, with progress recorded
+    #: after each one.
+    realtime_publish_batch_rows: int = Field(default=200, ge=1, le=5_000)
     ingest_max_batch_events: int = Field(default=500, ge=1, le=5_000)
     ingest_max_future_skew_seconds: int = Field(default=300, ge=0)
 

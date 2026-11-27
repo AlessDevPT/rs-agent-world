@@ -12,7 +12,16 @@ from agentworld.settings import Settings
 
 @pytest.fixture
 def settings() -> Settings:
-    return Settings(environment="test", log_format="json", event_bus="inprocess")
+    # `realtime_publish_in_api=False` for the same reason the integration
+    # package turns it off: the deployment default starts a publisher loop in
+    # the lifespan, and a unit test that only wanted a route table would then
+    # be polling a database it has no business touching.
+    return Settings(
+        environment="test",
+        log_format="json",
+        event_bus="inprocess",
+        realtime_publish_in_api=False,
+    )
 
 
 @pytest.fixture

@@ -42,6 +42,7 @@ from agentworld.services.executions import ExecutionService
 from agentworld.services.identity import IdentityService, resolve_principal
 from agentworld.services.ingest import IngestService
 from agentworld.services.projects import ProjectService
+from agentworld.services.realtime import RealtimeTicketService
 from agentworld.services.review import ReviewService
 from agentworld.services.workspaces import WorkspaceService
 from agentworld.settings import Settings
@@ -283,6 +284,18 @@ def get_review_service(factory: FactoryDep) -> ReviewService:
     return ReviewService(factory, executions=ExecutionService(factory))
 
 
+def get_realtime_ticket_service(
+    factory: FactoryDep, settings: SettingsDep
+) -> RealtimeTicketService:
+    """Minting WebSocket tickets. The TTL is an operator's call.
+
+    The gateway builds its own rather than taking this one: a WebSocket route
+    has no request-scoped dependency graph to hang a service on, and it reads
+    the same setting.
+    """
+    return RealtimeTicketService(factory, ttl_seconds=settings.ws_ticket_ttl_seconds)
+
+
 def get_credential_service(factory: FactoryDep, settings: SettingsDep) -> CredentialService:
     """The keyring comes from settings, which refused to boot without it.
 
@@ -306,3 +319,4 @@ CredentialServiceDep = Annotated[CredentialService, Depends(get_credential_servi
 ExecutionServiceDep = Annotated[ExecutionService, Depends(get_execution_service)]
 AgentTestServiceDep = Annotated[AgentTestService, Depends(get_agent_test_service)]
 ReviewServiceDep = Annotated[ReviewService, Depends(get_review_service)]
+RealtimeTicketServiceDep = Annotated[RealtimeTicketService, Depends(get_realtime_ticket_service)]

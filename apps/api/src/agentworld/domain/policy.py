@@ -163,6 +163,19 @@ class Action(StrEnum):
     BUILDER_USE = "builder.use"
     BUILDER_APPLY = "builder.apply"
 
+    # ---- Phase 3: the realtime spine --------------------------------------
+    #
+    #: Opening a project's live stream: minting the WebSocket ticket that
+    #: `03-API.md` §6 requires, and with it the snapshot and the deltas that
+    #: follow. One action rather than one per channel, because every channel
+    #: carries entities whose own read action is already `viewer` - a stream
+    #: that told a viewer less than `GET` does would be a second, weaker
+    #: copy of the read model, and one that told them more would be a hole
+    #: in it. The deltas stay within it: a definition frame carries what the
+    #: REST route returns, and the raw activity feed excludes definition
+    #: events entirely (P10.3).
+    REALTIME_SUBSCRIBE = "realtime.subscribe"
+
 
 #: The access-control model, transcribed from the role table in
 #: `docs/03-API.md` section 3.2. Read it as "this action needs at least this
@@ -282,6 +295,9 @@ MINIMUM_ROLE: dict[Action, MemberRole] = {
     # The floor. `builder.apply` additionally requires every action in the
     # plan it is applying, which the builder service checks one by one.
     Action.BUILDER_APPLY: MemberRole.MEMBER,
+    # Watching is reading. `viewer` is the floor R4 asks for, and the stream
+    # may never carry more than the role's existing reads already do.
+    Action.REALTIME_SUBSCRIBE: MemberRole.VIEWER,
 }
 
 

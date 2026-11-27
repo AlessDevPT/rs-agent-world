@@ -74,6 +74,11 @@ FOREIGN_REQUESTS = [
     ("POST", "/v1/workspaces/{workspace}/api-keys", {"name": "Intruding Key", "scope": "control"}),
     ("POST", "/v1/api-keys/{key}/revoke", None),
     ("DELETE", "/v1/api-keys/{key}", None),
+    # R3, asserted here rather than in a test of its own: a ticket for
+    # another tenant's project must 404 like every other id, and putting the
+    # row in this sweep is what stops the next route added beside it from
+    # being the one that does not.
+    ("POST", "/v1/projects/{project}/ws-ticket", None),
 ]
 
 
