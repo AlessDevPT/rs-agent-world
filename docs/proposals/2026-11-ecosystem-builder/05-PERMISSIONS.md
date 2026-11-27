@@ -311,6 +311,15 @@ of it.
 > tables with different producers - history is folded from what an agent says about
 > itself, runs carry what it did - so one action for both would mean nobody could be
 > granted one without the other.
+>
+> **Implementation note, step 3 — the realtime spine.** The 83rd is `realtime.subscribe`
+> at `viewer`: minting the WebSocket ticket `docs/03-API.md` §6 requires, and with it the
+> snapshot and the deltas that follow. This document designed the stream and enumerated no
+> action for it, which is why R4 in `04-ROADMAP-AND-MVP.md` is phrased as "a **new**
+> member of `Action`" rather than as a row to fill in. **One action for the whole stream,
+> not one per channel**, because every channel carries entities whose own read action is
+> already `viewer`: a stream that told a viewer less than `GET` does would be a second,
+> weaker copy of the read model, and one that told them more would be a hole in it.
 
 Phase 1 already built the two mechanisms, and they generalise without change:
 

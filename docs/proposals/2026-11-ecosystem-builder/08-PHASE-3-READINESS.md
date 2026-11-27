@@ -400,11 +400,11 @@ Four rules hold the shape:
    authority for execution **and** definition deltas: a definition change carries a number
    from that same sequence, is recorded durably in the transaction that makes it, and is
    published only after that transaction commits. A lightweight transactional outbox is an
-   allowed mechanism and **nothing of the kind exists today** - this is the design the
-   gateway will be built to, not a feature it has. The criteria that measure it, **R8 and
-   R10 in `04-ROADMAP-AND-MVP.md`, stay open**, and the alternatives are closed: no
-   separate definition cursor, and no carrying the last-seen execution cursor without
-   persisting the change it points at.
+   allowed mechanism, and **what was built is P10's Option A**: the committed `events` row
+   is itself that row, so no second table holds a payload. The criteria that measure it,
+   **R8 and R10 in `04-ROADMAP-AND-MVP.md`, pass as of 2026-11-26** with named tests, and
+   the alternatives stay closed: no separate definition cursor, and no carrying the
+   last-seen execution cursor without persisting the change it points at.
 
    **How, settled on 2026-11-20 (P10).** The committed `events` row is itself the durable
    publication record - Option A, so no second table holds the payload. The persisted type
@@ -416,7 +416,12 @@ Four rules hold the shape:
    reaches a `viewer` through history; publisher progress is database-backed per project
    with Redis as transport only; and the existing worker hosts the publisher unless its
    give-up bound proves wrong for one, in which case the limitation is to be written down
-   and the hosting left unresolved.
+   and the hosting left unresolved. **It did prove wrong, and the limitation is written
+   down**: the publisher runs as its own task in the worker and that bound does not apply
+   to it, because a publisher has to survive a Redis restart that a dispatch loop should
+   rightly give up on. On the `inprocess` bus the API process publishes for itself, since
+   a worker publishing into its own copy of that bus would reach no socket. See
+   [`21-M5-REALTIME-SPINE.md`](21-M5-REALTIME-SPINE.md) §2.1.
 
    **Which types, settled on 2026-11-25 (P11).** Eleven, enumerated there:
    `definition.agent.{created,updated,archived,restored}`,

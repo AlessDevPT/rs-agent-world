@@ -2,9 +2,11 @@
 
 > **Revision 4, 2026-11-01 — approved, and being implemented.**
 >
-> **Status, 2026-11-17.** Phase 2 is complete. Phase 3's Track A is nearly complete — T0–T6d
-> have landed, with the OpenAI-compatible provider, the event bus and the WebSocket gateway
-> still open. Phase 3's Track B, the island skeleton and the minimal pages, **has not
+> **Status, 2026-11-26.** Phase 2 is complete. Phase 3's Track A is nearly complete — T0–T6d
+> have landed, and so has the realtime spine: the event bus, `ws-ticket` and the WebSocket
+> gateway, with R1-R14 passing (see
+> [21-M5-REALTIME-SPINE.md](21-M5-REALTIME-SPINE.md)). The OpenAI-compatible provider,
+> T7a's turn loop and T8's `on_failure` are still open. Phase 3's Track B, the island skeleton and the minimal pages, **has not
 > started**: `apps/web/world/` holds a README and no code. Parts of Phase 4's Track A landed
 > early, which that phase's section now records. What is built, what is not and what comes
 > next are in [`docs/STATUS.md`](../../STATUS.md), written from the

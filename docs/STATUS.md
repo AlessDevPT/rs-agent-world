@@ -27,7 +27,7 @@
 | **Phase 0** Foundations | ✅ complete | monorepo, compose stack, CI, green from a fresh clone |
 | **Phase 1** Tenancy and auth | ✅ complete | Supabase JWT, workspaces, members, roles, API keys, RLS |
 | **Phase 2** Core model and protocol | ✅ complete | 30 tables, 26 migrations, event sourcing, replay, outbox. 13 of 14 ledger criteria met, the 14th untestable until Phase 7 |
-| **Phase 3** Execution core + island skeleton | 🟡 **Track A mostly done, Track B not started** | Phase 3 is T0–T8 + T13. **13 of 38 ledger boxes ticked** after the 2026-11-20 reconciliation. Open: the event bus and WebSocket gateway (R1-R14, the largest), T13's second provider and its conformance suite, T7a's turn loop, T8's `on_failure = 'fail'`, all four island boxes, and the live provider call |
+| **Phase 3** Execution core + island skeleton | 🟡 **Track A mostly done, Track B not started** | Phase 3 is T0–T8 + T13. **27 of 38 ledger boxes ticked**: the 13 of the 2026-11-20 reconciliation plus R1-R14, the realtime spine, on 2026-11-26. Open: T13's second provider and its conformance suite, T7a's turn loop, T8's `on_failure = 'fail'`, all four island boxes, the `world/nodes` read API, and the live provider call |
 | **Phase 3a** Approvals, MCP tools, dispatchable agents | ⬜ not started | until it lands, consequential actions are refused at publish rather than gated |
 | **Phase 4** Vertical slice → M1 | 🟡 **partly built early** | multi-step, delegation, `agent.test` and `execution.cancel` all exist; its real remainder is the island's I2 and the builder prototype |
 | **Phases 5–11** | ⬜ not started | real workflows, approvals/tools/integrations, external agents, full workspace, full island, complete builder, hardening |
@@ -122,21 +122,25 @@ every loop a developer needs (`npm run dev`, `test`, `lint`, `typecheck`, `verif
 
 ## 3. What is not done
 
-### 3.1 Phase 3, Track A — four items
+### 3.1 Phase 3, Track A — three items
 
-> **Re-characterised 2026-11-20.** The previous edition listed four items as though they
-> were comparable. They are not: one is a week of work with no code and, until
-> 2026-11-20, no acceptance criteria either; one is two days; and T8 turned out to be
-> seven-ninths done once it was measured against its own criteria. Sizes below are the
-> point of the list.
+> **Re-characterised 2026-11-20**, and the first item closed on **2026-11-26**. The
+> edition before that listed four items as though they were comparable. They are not: one
+> was a week of work with no code and, until 2026-11-20, no acceptance criteria either;
+> one is two days; and T8 turned out to be seven-ninths done once it was measured against
+> its own criteria. Sizes below are the point of the list.
 
-1. **The event bus and the WebSocket gateway — the whole of it, and the largest item.**
-   `api/ws/__init__.py` is still a one-line placeholder. No
-   `POST /v1/projects/{id}/ws-ticket`, no snapshot, no deltas, no cursors, no `resume`,
-   no `resync_required`. `EventBusKind` exists in `settings.py` and nothing reads it.
-   **It now has acceptance criteria** — R1-R14 in `04-ROADMAP-AND-MVP.md`, written
-   2026-11-20, because it had none before and so was the one open item that could not be
-   ticked. Its acceptance run uses the `redis` bus (P4).
+1. ~~**The event bus and the WebSocket gateway.**~~ **Done, 2026-11-26.**
+   `infra/event_bus.py` holds `InProcessEventBus` and `RedisEventBus`; `api/ws/` holds the
+   gateway, the frame builder and the publisher; `POST /v1/projects/{id}/ws-ticket` mints
+   a 60-second single-use ticket at `viewer` through the new
+   `Action.REALTIME_SUBSCRIBE`. **R1-R14 all pass**, each with a named test, including R13
+   on two `uvicorn` processes over the `redis` bus (P4) - which the `api` CI job now
+   starts Redis for. The four questions the approved design left open - where the
+   publisher runs (P10.5), R11's operational replay window, where R13 runs in CI, and the
+   snapshot's isolation level - are answered in
+   `docs/proposals/2026-11-ecosystem-builder/21-M5-REALTIME-SPINE.md`. **It does not close
+   the phase**: the three items below and steps 7-9 remain.
 2. **The OpenAI-compatible provider (T13) — about two days, plus a suite to extract.**
    `infra/providers/` holds `anthropic.py` and nothing else. The shared conformance suite
    its criterion names **does not exist**: "conformance" appears in the plan documents and
@@ -246,12 +250,12 @@ agent branch, the unasserted bearer token, the `{}` passed as `nextConfig`, and 
 |---|---|---|---|
 | **1** | Settle the realtime architecture decisions | done — P3-P8 | the seven questions the gateway cannot be written without are answered and recorded |
 | **2** | Write the gateway's acceptance criteria | done — R1-R14 | the largest open item in the phase can be ticked at all |
-| **3** | The realtime spine: event bus, `ws-ticket`, gateway | ~1 week | R1-R14 pass, including R13 on two processes over the `redis` bus |
+| **3** | The realtime spine: event bus, `ws-ticket`, gateway | done — 2026-11-26 | R1-R14 pass, including R13 on two processes over the `redis` bus |
 | **4** | T13: extract the conformance suite, add the OpenAI-compatible provider *(independent — can run beside 3)* | ~2 days + the suite | both providers pass one parametrised suite; the adapter adds no import outside `infra/providers/` |
 | **5** | T7a: the turn loop, `max_turns`, the wall clock, metric emission | ~1 week | a step takes several turns under a budget and a wall clock, and token counts reach `metric_samples` through `metric.recorded` |
 | **6** | T8: `on_failure = 'fail'` | ~½ session | a dead dispatch applies `fail`, asserted; `continue` and `route` are Phase 5's |
 | **7** | The `world/nodes` read API | ~1 session | placements and the layout are readable at `viewer`, and `test_world_separation.py` still passes |
-| **8** | Island skeleton I1 | ~1 week | the four island boxes pass: real agents from `world_nodes`, status equal to the REST view and arriving as a delta, `offline` shuttered, and `world/phaser/` deletable with both suites green. **Needs 3 and 7** |
+| **8** | Island skeleton I1 | ~1 week | the four island boxes pass: real agents from `world_nodes`, status equal to the REST view and arriving as a delta, `offline` shuttered, and `world/phaser/` deletable with both suites green. **Needed 3, which is done; still needs 7** |
 | **9** | The live provider smoke run | minutes, once a key exists | `scripts/live_provider_smoke.py` passes against the real API. Needs an `ANTHROPIC_API_KEY`, not code |
 | **10** | Reconcile the ledger and declare Phase 3 closed | ~½ session | all 38 boxes are ticked or recorded as wrong, with a named test each |
 
@@ -260,6 +264,8 @@ specified to come from live deltas, and building the island first builds that fe
 T13 is independent of everything. Step 9 needs a person with a key and can happen at any
 point. **The spine alone does not close the phase** — steps 3 and 4 still leave the four
 island boxes and the live call open, which is what the previous edition of §6 got wrong.
+Step 3 landing on 2026-11-26 is that sentence being right rather than wrong: the largest
+open item in the phase is closed and six steps are still open behind it.
 
 ### After that
 
@@ -289,16 +295,19 @@ island boxes and the live call open, which is what the previous edition of §6 g
 
 Phase 3 is T0–T8 and T13. Its ledger carries **38 boxes** after the 2026-11-20
 reconciliation — the original 17, plus R1-R14 for the gateway, six for T7a/T8/T13, and
-one tightening the island's status claim. **13 are ticked.**
+one tightening the island's status claim. **27 are ticked**: 13 at that
+reconciliation, and R1-R14 on 2026-11-26 when the realtime spine landed.
 
-**Closing the phase means closing all 25 open boxes**, and three of the four that were
-open before this reconciliation are Track B. The previous edition of this section said
+**Closing the phase means closing the 11 that remain**, and four of them are Track B. The previous edition of this section said
 *"to declare Phase 3 complete: N2 → N3 → N4, then N1"*, which was wrong: completing all
 four of those leaves the island boxes untouched, so the ledger still could not be ticked.
 The sequence in §5 is the corrected one.
 
-**The spine is necessary and not sufficient.** Steps 3 and 4 leave the island and the live
-call open. Step 8 cannot start before steps 3 and 7.
+**The spine is necessary and not sufficient**, and 2026-11-26 is where that sentence
+earned itself: the largest open item in the phase is closed and eleven boxes are still
+open behind it. Step 4 leaves T13, steps 5 and 6 leave T7a and T8, step 8 - the island -
+needed step 3 and still needs step 7's `world/nodes` read API, and step 9 needs a person
+with an API key.
 
 **No criterion carries into Phase 4 (P8).** Four of Phase 4's own acceptance criteria
 depend on live deltas — *"every status change arriving over the WebSocket from a real

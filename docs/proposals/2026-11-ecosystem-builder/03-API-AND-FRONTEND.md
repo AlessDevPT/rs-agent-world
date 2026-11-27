@@ -326,15 +326,32 @@ table, so without that exclusion configuration history would reach every `viewer
 the feed. A definition change reaches a client as a definition delta on its own channel,
 or not at all.
 
-**The protocol above is approved; the persistence behind it is not built.** A definition
-change has to be recorded durably in the same transaction as the mutation and published
-only after that transaction commits, or `resume` cannot replay it - a crash between the
+**The protocol above is approved and implemented, 2026-11-26.** A definition change is
+recorded durably in the same transaction as the mutation and published only after that
+transaction commits, because otherwise `resume` cannot replay it - a crash between the
 commit and the publish would drop a delta that nothing had recorded. Publication is
 **at-least-once**: a duplicate after a crash is expected, and a client suppresses it by
 discarding any frame whose `cursor` it has already applied. Nothing here claims
 exactly-once delivery. See P9 and P10 in
 [`07-DECISION-RECORD.md`](07-DECISION-RECORD.md) §6, and R7, R8, R10, R11 and R13 in
 [`04-ROADMAP-AND-MVP.md`](04-ROADMAP-AND-MVP.md).
+
+**Four things the implementation settled that this section does not specify**, recorded in
+[`21-M5-REALTIME-SPINE.md`](21-M5-REALTIME-SPINE.md) rather than left to be inferred from
+the code. The connection carries an optional `cursor` query parameter, which is the
+connect-time form of the `resume` frame - the frame is honoured too, but a socket cannot
+decline the snapshot that `docs/03-API.md` §6 sends immediately on connect, and a client
+that has a cursor does not want one. There is a channel per key of the snapshot's `data`
+plus `events`, which adds `connections` and `integrations` to the six named above - with
+two qualifications that document records rather than glosses: `step.updated` rides
+`executions` although no snapshot key describes steps, and `integrations`, `approvals` and
+`world` are advertised channels that no frame carries yet. The server sends **no**
+unsolicited *frame*, so there is no heartbeat frame - §6's frame list has no
+server→client `ping` either, and its "server pings every 30s" guarantee is the transport
+keepalive, which uvicorn performs. And a refused
+ticket is answered with the documented `{ "type": "error", "code": … }` frame before the
+socket closes - which is what R1's "before a single frame is sent" protects, since no
+frame of *state* precedes it and a bare close leaves a browser nothing to show.
 
 ## 5. The world: Build Mode and Live Mode
 

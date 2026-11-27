@@ -340,15 +340,18 @@ The first phase where something runs, and the first where something is visible.
   `POST /v1/projects/{project_id}/dispatches/{dispatch_id}/resolve`, which were not in
   this plan - the `needs_review` state T6 created has to have an authorized way out, or
   an execution that reaches it is stuck for ever.
-- **Open, not started.** `infra/event_bus.py` + the WebSocket gateway: snapshot,
-  deltas, cursors, `resume`, `resync_required`. `api/ws/__init__.py` is an empty
-  placeholder package, there is no `ws-ticket` endpoint and no event bus. This is the
-  largest piece of Phase 3 still outstanding, and the island's statuses are specified
-  to come from it. **Its acceptance criteria are R1-R14 below**, added 2026-11-20; the
-  frames they assert are `03-API-AND-FRONTEND.md` §4, and the seven decisions behind
-  them are P3-P8 in `07-DECISION-RECORD.md` §6. The acceptance run uses the **`redis`**
-  bus (P4): `inprocess` cannot satisfy R13, which is the criterion that proves the bus
-  is a bus.
+- **Done, 2026-11-26.** `infra/event_bus.py` + the WebSocket gateway: snapshot, deltas,
+  cursors, `resume`, `resync_required`. `api/ws/` holds the gateway, the frame builder
+  and the publisher; `POST /v1/projects/{id}/ws-ticket` mints a 60-second single-use
+  ticket at `viewer`. This was the largest piece of Phase 3 outstanding and the island's
+  statuses are specified to come from it, so the four island boxes are no longer blocked
+  on it. **Its acceptance criteria are R1-R14 below**, added 2026-11-20 and **all passing
+  with a named test each**; the frames they assert are `03-API-AND-FRONTEND.md` §4, and
+  the seven decisions behind them are P3-P8 in `07-DECISION-RECORD.md` §6. The acceptance
+  run uses the **`redis`** bus (P4): `inprocess` cannot satisfy R13, which is the
+  criterion that proves the bus is a bus, and the `api` CI job now starts Redis for it.
+  What the implementation had to settle beyond those decisions is in
+  [`21-M5-REALTIME-SPINE.md`](21-M5-REALTIME-SPINE.md).
 - **Open, partly.** **T7a — the managed agent turn.** `services/dispatch.py` performs one
   model call per step and says so; the loop, `max_turns`, the wall clock and the
   `metric.recorded` emission are this phase's. The three tool criteria that used to sit
@@ -440,8 +443,10 @@ The first phase where something runs, and the first where something is visible.
       asserted by a source search over `apps/web/world/`, the same shape as
       `test_no_vendor_is_named_outside_the_provider_package`.
       **Open.** Track B has not started: `apps/web/world/` holds a README and no code.
-      Needs the realtime spine (R1-R14) and a `world/nodes` read API, which does not
-      exist - no route under `api/` matches `world`.
+      The realtime spine (R1-R14) it needs **landed on 2026-11-26**, including the
+      `agents` channel its statuses arrive on; what it still needs is the `world/nodes`
+      read API, which does not exist - no route under `api/` matches `world`, and the
+      snapshot's `world` key is present and empty for that reason.
 - [ ] Each rendered status **equals** the status the REST view reports for that agent, and
       a change arrives as a delta with no reload.
       **Open. Added 2026-11-20.** The box above says "with their real statuses", which a
@@ -507,26 +512,81 @@ The first phase where something runs, and the first where something is visible.
 > than inventing one, and the decisions they encode are P3-P8 in
 > `07-DECISION-RECORD.md` §6. The superseded `05-ROADMAP.md` Phase 4 was read as history
 > while writing them, not as authority.
+>
+> **All fourteen pass as of 2026-11-26**, with the named test on each box. The spine is
+> `infra/event_bus.py`, `api/ws/` and `POST /v1/projects/{id}/ws-ticket`; the four
+> questions the approved design left to the implementation - where the publisher runs
+> (P10.5), R11's operational window, where R13 runs in CI, and the snapshot's isolation
+> level - are answered in [`21-M5-REALTIME-SPINE.md`](21-M5-REALTIME-SPINE.md). **This
+> closes step 3 of `docs/STATUS.md` and does not close Phase 3**: steps 4-9 remain.
 
-- [ ] **R1 — No ticket, no stream.** A connection with no ticket, a malformed ticket, or a
-      ticket minted for another project is refused before a single frame is sent.
-- [ ] **R2 — Tickets are single-use and expire.** The same ticket twice is refused the
+- [x] **R1 — No ticket, no stream.** A connection with no ticket, a malformed ticket, or a
+      ticket minted for another project is refused before a single frame **of state** is
+      sent: the socket carries exactly one frame, the generic
+      `{"type": "error", "code": "invalid_ticket"}`, and then closes.
+      **Amended 2026-11-26, not reimplemented.** The original read "before a single frame
+      is sent", which only a bare close can satisfy - and a bare close gives a browser an
+      `onerror` and nothing to show a person, while `03-API.md` §6 documents an `error`
+      frame for exactly this refusal. What the criterion protects is intact and is what
+      the amended wording says: no frame of state precedes the refusal, nothing is read
+      from the database, and the project's existence is not confirmed. **One code for
+      every cause** - unknown, malformed, foreign, expired, spent, wrong secret - because
+      a specific code would confirm that a ticket existed and whether it had been used;
+      `03-API.md` §6's `ticket_expired` illustrates the frame's shape, not its codes.
+      **Passes.** `tests/integration/test_realtime_gateway.py`: `test_r1_a_connection_with_no_ticket_is_refused`,
+      `test_r1_a_malformed_ticket_is_refused` (five shapes),
+      `test_r1_a_ticket_for_another_project_is_refused` and
+      `test_r1_no_frame_of_state_precedes_the_refusal` - the last one asserting the order,
+      since a gateway that sent a snapshot and then noticed would already have leaked the
+      project's contents.
+- [x] **R2 — Tickets are single-use and expire.** The same ticket twice is refused the
       second time; a ticket older than its TTL is refused. The issuing route carries a
       role-matrix row like every other route.
-- [ ] **R3 — Project-scoped and tenant-isolated.** A ticket for project A never yields a
+      **Passes.** `tests/integration/test_realtime_gateway.py`: `test_r2_a_ticket_is_single_use`,
+      `test_r2_an_expired_ticket_is_refused`,
+      `test_r2_an_expired_ticket_is_not_marked_consumed`,
+      `test_r2_only_the_digest_of_a_ticket_is_stored` and
+      `test_r2_a_real_id_with_the_wrong_secret_is_refused`. Single-use is a conditional
+      `UPDATE ... WHERE consumed_at IS NULL RETURNING` on `ws_tickets`, so it holds across
+      processes and across a race - `tests/integration/test_realtime_fanout.py`'s
+      `test_r13_a_ticket_minted_in_one_process_is_spent_in_another` is that half. The
+      issuing route's role-matrix row is in `test_role_matrix.py`.
+- [x] **R3 — Project-scoped and tenant-isolated.** A ticket for project A never yields a
       frame naming project B, and a non-member is refused. Asserted inside the existing
       `test_tenant_isolation.py` sweep rather than in a test of its own, so a new table or
       route cannot miss it.
-- [ ] **R4 — Authorization is an `Action`, not an ad-hoc check.** A new member of
+      **Passes.** The foreign-id row is in `test_tenant_isolation.py`'s
+      `FOREIGN_REQUESTS` sweep, as this box asks. The stream itself, which that sweep
+      cannot reach, is `tests/integration/test_realtime_gateway.py`:
+      `test_r3_a_ticket_never_yields_another_projects_frames` and
+      `test_r3_a_non_member_cannot_mint_a_ticket`.
+- [x] **R4 — Authorization is an `Action`, not an ad-hoc check.** A new member of
       `domain/policy.py`'s `Action` with a `ROLE_FLOOR` entry at `viewer` and a row in
       `test_role_matrix.py` — that test fails on an action with no row, which is the point
       of putting it there.
-- [ ] **R5 — The first frame is a `snapshot` carrying a cursor.** Type `snapshot`, an
+      **Passes.** `Action.REALTIME_SUBSCRIBE` with a `MINIMUM_ROLE` entry at
+      `viewer`, and the row in `test_role_matrix.py`. `tests/unit/test_policy.py`'s
+      totality test covers the new member automatically. The socket has no row and cannot
+      have one - a WebSocket route has no OpenAPI operation for that file's coverage guard
+      to see - so the ticket route is where the role is decided and checked.
+- [x] **R5 — The first frame is a `snapshot` carrying a cursor.** Type `snapshot`, an
       integer `cursor`, and the documented `data` keys.
-- [ ] **R6 — Snapshot-then-delta loses nothing and repeats nothing.** Mutate during the
+      **Passes.** `tests/integration/test_realtime_gateway.py`:
+      `test_r5_the_first_frame_is_a_snapshot_with_a_cursor` and
+      `test_r5_the_snapshot_cursor_is_the_projects_latest_seq`. `integrations` and
+      `approvals` are present and empty because neither table exists yet, and `world` is
+      empty because the `world/nodes` read API is step 7 and owns that view model.
+- [x] **R6 — Snapshot-then-delta loses nothing and repeats nothing.** Mutate during the
       handshake; the entity appears **exactly once** across the snapshot and the deltas
       that follow it.
-- [ ] **R7 — Deltas are whole entities, never patches.** Every delta payload validates
+      **Passes.** `tests/integration/test_realtime_gateway.py`, four tests.
+      `test_r6_a_snapshot_transaction_cannot_see_a_mutation_made_during_it` is the property
+      the others rest on: the snapshot runs at `REPEATABLE READ`, so its cursor and its
+      entities describe one instant. Then
+      `test_r6_an_entity_mutated_before_the_handshake_is_in_the_snapshot_only`,
+      `test_r6_an_entity_mutated_after_the_handshake_arrives_exactly_once` and
+      `test_r6_a_duplicate_publication_produces_no_duplicate_frame`.
+- [x] **R7 — Deltas are whole entities, never patches.** Every delta payload validates
       against the same view model the REST route returns, so an ordering bug cannot
       produce a half-applied entity. **Deletion is the one exception, and it is explicit:**
       a tombstone carries project, entity type, entity id and the cursor, and nothing else
@@ -534,7 +594,13 @@ The first phase where something runs, and the first where something is visible.
       an update that cleared them. **Only `definition.connection.deleted` produces one
       (P11.4):** agents and workflows are archived rather than deleted and stay readable by
       id, so an archive is an `.updated` frame.
-- [ ] **R8 — Definition deltas come from the services that write definitions, and
+      **Passes.** `tests/integration/test_realtime_gateway.py`:
+      `test_r7_a_definition_delta_validates_against_the_rest_view`,
+      `test_r7_a_workflow_delta_validates_against_the_rest_view`,
+      `test_r7_a_connection_delta_validates_against_the_rest_view` - which asserts the
+      tombstone carries project, entity type and id and *nothing else* - and
+      `test_r7_an_archive_is_an_update_and_not_a_tombstone`.
+- [x] **R8 — Definition deltas come from the services that write definitions, and
       durably.** A `PATCH` on an agent produces `agent.updated`, carrying a cursor from the
       shared per-project `events.seq` (P9). The change is recorded durably in the **same
       transaction** as the mutation and published only after that transaction commits, so a
@@ -562,19 +628,49 @@ The first phase where something runs, and the first where something is visible.
       in sync. **The same exclusion covers publishing one** (P13 §5, amended 2026-11-26):
       `ExecutionService.publish_test_harness` emits nothing, for that same reason. The
       harness is still published and still executed; only the event is withheld.
-      **The producers are implemented; this box stays open on publication.** The eleven
-      types are registered and refused to ingest, and as of 2026-11-26 **all fourteen
-      approved P13 producers emit** - each appending its `events` row in the **same
-      transaction** as the mutation, which is the durability half of this criterion and the
-      half that could be built without a gateway. What is still missing is the rest of the
-      sentence above: a delta **published after that transaction commits**. That needs
-      `infra/event_bus.py` and the WebSocket gateway, neither of which exists, so this box
-      stays open. **R10 stays open for its own reason**, now a narrower one than before: the
-      rows a `resume` would replay are being written for every definition change, and there
-      is still nothing that can replay them. Producer writes alone do not close either box.
-- [ ] **R9 — Execution deltas are folded from the log.** An ingested event produces
+      **The producers landed first, and this box stayed open on publication until the
+      spine did.** The eleven types are registered and refused to ingest, and as of
+      2026-11-26 all fourteen approved P13 producers emit - each appending its `events` row
+      in the **same transaction** as the mutation, which is the durability half of this
+      criterion and the half that could be built without a gateway. What was missing was
+      the rest of the sentence above, a delta **published after that transaction commits**,
+      and `infra/event_bus.py` and the gateway now provide it. R10 was open for its own
+      narrower reason - the rows were being written and nothing could replay them - and the
+      replay path closes that. Producer writes alone closed neither box.
+      **Passes as of 2026-11-26.** Publication now exists:
+      `api/ws/publisher.py` reads committed rows from a per-project position in
+      `event_publication_cursors` (P10.4), builds the frames and hands them to the bus -
+      after the mutation's transaction has committed, never inside it. `tests/integration/test_realtime_gateway.py`:
+      `test_r8_a_patch_on_an_agent_produces_agent_updated_with_a_shared_cursor`, which
+      reads the frame's cursor back off the `events` row;
+      `test_r8_nothing_is_published_for_a_mutation_that_rolled_back` - a `restore` that
+      404s after reserving the cursor, which is exactly what a fire-and-forget publish
+      inside the transaction would have announced - and
+      `test_r8_the_publisher_reads_committed_rows_rather_than_being_told`.
+- [x] **R9 — Execution deltas are folded from the log.** An ingested event produces
       `execution.updated` and `step.updated`, with a cursor that is monotonic per project.
-- [ ] **R10 — `resume` replays exactly what was missed.** Disconnect, mutate N times,
+      **Passes.** `tests/integration/test_realtime_resume.py`:
+      `test_r9_a_run_produces_execution_and_step_deltas_from_the_log`,
+      `test_r9_a_raw_event_frame_accompanies_an_execution_delta`,
+      `test_r9_a_definition_event_never_reaches_the_event_channel` (P10.3) and
+      `test_r9_a_channel_can_be_unsubscribed_and_subscribed_again`. Those deltas come from
+      `POST /workflows/{id}/run` and `advance_once` rather than from hand-written rows.
+      **The ingest half is this box's own wording**, and is
+      `test_realtime_gateway.py`'s
+      `test_an_ingested_event_produces_an_agent_delta_and_a_raw_event`: a heartbeat posted
+      to `POST /v1/ingest/events` folds into `agents`, so the row yields `agent.updated`
+      beside the raw `event` on one cursor - which is also the branch the island's
+      "status equal to the REST view and arriving as a delta" box depends on.
+      **Further evidence, added 2026-11-26 without changing this criterion:**
+      `test_realtime_event_payloads.py` pins what the raw channel may carry. A review
+      found that a step event's payload - the unnarrowed source of the `output` and
+      `error` that `api/v1/executions.py` narrows on purpose - was reaching this
+      `viewer`-readable channel, which is in the default subscription set. It is now
+      withheld, the frame says so with `payload_withheld`, and the authorized entity
+      still arrives on `step.updated`. R9's wording is unchanged; this closes a hole
+      beside it rather than in it, and is recorded as item 11 of
+      [`21-M5-REALTIME-SPINE.md`](21-M5-REALTIME-SPINE.md) §0.
+- [x] **R10 — `resume` replays exactly what was missed.** Disconnect, mutate N times,
       resume from the old cursor: exactly N deltas, in order, no gap and no repeat — with
       the N split across definition and execution changes, since both share one cursor
       domain (P9), and a definition change replayed from the `events` row that recorded it.
@@ -582,26 +678,64 @@ The first phase where something runs, and the first where something is visible.
       duplicate publish after a crash is expected, and the assertion is that a client
       applying frames in `cursor` order produces no duplicate *logical* update, because it
       discards any cursor it has already applied.
-- [ ] **R11 — Beyond the window, `resync_required`.** A cursor older than the replay
+      **Passes as of 2026-11-26.** `tests/integration/test_realtime_resume.py`:
+      `test_r10_resume_replays_exactly_what_was_missed`, with N split across a definition
+      change and an execution change and the cursor set asserted against the `events` rows
+      the disconnect missed; `test_r10_a_resume_frame_replays_on_a_live_socket`; and
+      `test_r10_resume_repeats_nothing_already_delivered`. The at-least-once half is
+      `tests/integration/test_realtime_gateway.py`'s `test_r6_a_duplicate_publication_produces_no_duplicate_frame`.
+- [x] **R11 — Beyond the window, `resync_required`.** A cursor older than the replay
       window is answered with `resync_required` and nothing else, and the client's only
       next move is a fresh snapshot.
-      **The window has no operational definition yet:** `events` is partitioned monthly and
-      **nothing prunes a partition**, so no cursor is currently unreachable. Testing this
-      needs either a configurable window or a dropped partition in the test. Open, and not
-      closed by P9 or P10.
-- [ ] **R12 — A slow consumer is dropped, not buffered without bound.** A consumer that
+      **The window had no operational definition** when this box was written: `events` is
+      partitioned monthly and **nothing prunes a partition**, so no cursor was unreachable
+      and this could not occur. It has one now - see below - and both routes the box named
+      are taken, the configurable window and a dropped partition in a test.
+      **Passes, and the window now has an operational definition.** Two
+      conditions, both checked: `WS_REPLAY_WINDOW_EVENTS` bounds how far back a cursor may
+      ask, and the oldest retained row bounds how far back the rows actually go - the half
+      a dropped partition changes. `tests/integration/test_realtime_resume.py`:
+      `test_r11_a_cursor_beyond_the_window_gets_resync_required_and_nothing_else`,
+      `test_r11_a_cursor_just_inside_the_window_is_served`,
+      `test_r11_a_cursor_whose_rows_were_pruned_gets_resync_required` and
+      `test_r11_a_cursor_ahead_of_the_project_gets_resync_required`. The setting's `ge=100`
+      floor was **not** relaxed to shorten the test; it writes 101 events instead.
+- [x] **R12 — A slow consumer is dropped, not buffered without bound.** A consumer that
       never reads reaches the configured queue bound and is closed with
       `resync_required`; server memory stays bounded while it happens.
-- [ ] **R13 — Fan-out crosses processes.** Two gateway instances on the `redis` bus, one
+      **Passes.** `tests/integration/test_realtime_resume.py`:
+      `test_r12_a_consumer_that_cannot_keep_up_is_dropped_with_resync_required` and
+      `test_r12_the_subscription_never_holds_more_than_its_bound`, which is the memory
+      half. Provoked by a bound of one frame and a burst published in a single pass,
+      because the test transport's own send buffer is unbounded - a test that merely
+      stopped reading could never reach the condition.
+- [x] **R13 — Fan-out crosses processes.** Two gateway instances on the `redis` bus, one
       mutation, both sockets receiving identical frames with identical cursors. This is
       the criterion `inprocess` cannot satisfy, and the reason P4 chose `redis` for the
       acceptance run.
-      **One CI fact to settle first:** Redis is in `infra/compose/docker-compose.yml`, but
-      the `api` job starts Postgres only, so a Redis-dependent test cannot run there until
-      that job starts it. The `compose` job already starts the whole stack.
-- [ ] **R14 — No fabricated state.** With no activity there is no synthetic heartbeat,
+      **One CI fact had to be settled first:** Redis was in
+      `infra/compose/docker-compose.yml` while the `api` job started Postgres only, so a
+      Redis-dependent test had nowhere to run. Settled below.
+      **Passes, and the CI fact is settled.** Redis now starts in the `api`
+      job beside Postgres, so the test lives in the suite that
+      `AGENTWORLD_REQUIRE_INTEGRATION=1` governs - the `compose` job runs no pytest, so a
+      test there would sit outside that rule and could skip unnoticed. `tests/integration/test_realtime_fanout.py`:
+      `test_r13_two_gateway_processes_receive_identical_frames` starts two real `uvicorn`
+      processes on the `redis` bus and asserts the frames are *equal*, not merely both
+      present - the publisher builds each frame once, so two gateways cannot disagree
+      about one. Pointing that publisher at an unreachable Redis fails the test, which is
+      how the bus was confirmed to be the path rather than an incidental dependency.
+- [x] **R14 — No fabricated state.** With no activity there is no synthetic heartbeat,
       status or delta; every delta traces to a write or to a folded event. The same rule
       the island's "no mock data path" box states, asserted one layer lower.
+      **Passes.** `tests/integration/test_realtime_gateway.py`:
+      `test_r14_with_no_activity_the_server_sends_nothing` - three pong fences of silence -
+      and `test_r14_every_delta_traces_to_a_committed_event_row`. The server sends no
+      unsolicited frame at all, which is the sense in which `03-API.md` §6's 30-second
+      server ping is not implemented: there is no heartbeat **frame**, and §6's own frame
+      list has no server→client `ping` either. The transport keepalive that line describes
+      is still in force - uvicorn pings every 20s by default - and is not a frame, so R14
+      is untouched by it. Corrected 2026-11-26, having been stated too broadly.
 
 **Acceptance criteria — T7a, T8 and T13**
 

@@ -431,19 +431,22 @@ which this adds a third, that a criterion nobody wrote cannot fail.
 
 ### P9 in full — the definition-delta cursor
 
-**Approved, not implemented.** Nothing in the repository allocates a cursor for a
-definition change, records one durably, or publishes one. `infra/event_bus.py` does not
-exist, `api/ws/__init__.py` is a one-line docstring, and the `redis` dependency is
-declared in `pyproject.toml` and never imported. This decision fixes the design that R8
-and R10 will be measured against; **both criteria stay open** until an implementation and
-its acceptance evidence exist. A settled design is not evidence, and neither is approval.
+**Implemented, 2026-11-26. Both criteria pass.** When this was written nothing in the
+repository allocated a cursor for a definition change, recorded one durably, or published
+one: `infra/event_bus.py` did not exist and `api/ws/__init__.py` was a one-line docstring.
+The producers landed on 2026-11-25 (M3, M4) and the spine on 2026-11-26 - the bus, the
+`ws-ticket` endpoint, the gateway and the publisher - so R8 and R10 are ticked in
+`04-ROADMAP-AND-MVP.md` with named tests. A settled design was not evidence and neither
+was approval, which is why this paragraph said so until there were tests to name.
 
-**The mechanism is open, within one constraint.** A lightweight transactional outbox - a
+**The mechanism was open, within one constraint.** A lightweight transactional outbox - a
 row written in the same transaction as the mutation, claimed and published after commit -
-is an allowed implementation, and the obvious one, since `services/executions.py` already
-proves the pattern for dispatches. It is **not** a required table design and this decision
-creates nothing. What is required is the property: the delta is durable before it is
+was an allowed implementation, and the obvious one, since `services/executions.py` already
+proves the pattern for dispatches. It was **not** a required table design and this decision
+created nothing. What was required is the property: the delta is durable before it is
 published, and published only after the transaction that produced it has committed.
+**What was built is P10's Option A** - the committed `events` row *is* the outbox row, so
+no second table holds a payload, and `event_publication_cursors` holds only a position.
 
 **The accepted cost, stated plainly.** Allocating from `ProjectEventCursor` means taking
 the same per-project cursor lock `repositories/events.py` takes for ingest, held
@@ -462,10 +465,12 @@ cursor claims to point at.
 
 ### P10 in full — the five implementation decisions
 
-**Approved architecture. None of it is implemented.** No `definition.*` type is
-registered, nothing allocates a cursor for a definition change, no publisher exists,
-`infra/event_bus.py` does not exist, and the declared `redis` dependency is still never
-imported. R8 and R10 stay open, and nothing below ticks a box.
+**Implemented, 2026-11-26.** When this was written no `definition.*` type was registered,
+nothing allocated a cursor for a definition change, and no publisher existed. All five
+decisions below are now in the code, R8 and R10 pass, and P10.5 - the one that was
+deliberately conditional - is resolved in
+[`21-M5-REALTIME-SPINE.md`](21-M5-REALTIME-SPINE.md) §2.1, along with the limitation it
+asked to have written down if the worker turned out not to suit.
 
 **P10.1 — the persisted namespace is `definition.*`, registered, and
 `CONTROL_PLANE`.** Every persisted definition-event type is declared in the taxonomy with
@@ -520,6 +525,18 @@ is right for dispatches and may be wrong for a publisher that must keep trying t
 Redis outage - then the concrete limitation is to be written down and the hosting left
 **explicitly unresolved**, rather than a third process being invented to avoid saying so.
 
+**Resolved 2026-11-26, and the conditional half came true.** The worker hosts the
+publisher on the `redis` bus, as its own task beside the dispatch loop - and
+`WORKER_MAX_CONSECUTIVE_ERRORS` is deliberately **not** applied to it, which is the
+limitation this paragraph asked for. Exiting after N failures is right for dispatches and
+wrong for a publisher that must survive a Redis restart, and nothing is risked by letting
+it keep trying: its position is in PostgreSQL, so an outage costs latency and no data. No
+third process was invented. The one addition the decision did not anticipate is that on
+the **`inprocess`** bus the API process must publish for itself, because a worker
+publishing into its own copy of that bus would reach no socket at all; `publishes_in_api`
+is the single place that decides, and both halves are asserted. See
+[`21-M5-REALTIME-SPINE.md`](21-M5-REALTIME-SPINE.md) §2.1.
+
 ### What P10 does not claim
 
 Four audit findings survive this decision unchanged, and none of them is closed by it:
@@ -531,10 +548,17 @@ Four audit findings survive this decision unchanged, and none of them is closed 
   the same execution. P9 and P10 do not solve it. What P10 does require is that a
   definition mutation take the cursor lock **first**, matching ingest, so definition writes
   do not join the reverse-order set.
-- **Nothing prunes event partitions**, and there is no operational replay-window policy, so
-  "beyond the replay window" has no definition today. **R11 stays open.**
-- **Redis is in the Compose stack, but the `api` CI job starts Postgres only.** The
-  Redis-dependent acceptance tests cannot run there until that job starts it.
+- **Nothing prunes event partitions**, and there was no operational replay-window policy,
+  so "beyond the replay window" had no definition. **Closed 2026-11-26**, by the two-part
+  definition in [`21-M5-REALTIME-SPINE.md`](21-M5-REALTIME-SPINE.md) §2.2:
+  `WS_REPLAY_WINDOW_EVENTS` bounds how far back a cursor may ask, and the oldest retained
+  row bounds how far back the rows go. Partition pruning is still unbuilt, and the second
+  condition is what makes its arrival a configuration change rather than a protocol one.
+  **R11 passes.**
+- **Redis was in the Compose stack while the `api` CI job started Postgres only**, so the
+  Redis-dependent acceptance tests had nowhere to run. **Closed 2026-11-26**: that job
+  now starts Redis too, which is the job `AGENTWORLD_REQUIRE_INTEGRATION=1` governs - the
+  `compose` job runs no pytest, so a test placed there could skip unnoticed.
 - **Publication is at-least-once, and exactly-once is not claimed.** A duplicate publish is
   expected after a crash between publishing and recording progress. Clients stay correct
   because every frame carries a monotonic `seq`: one that has applied `seq = N` discards
