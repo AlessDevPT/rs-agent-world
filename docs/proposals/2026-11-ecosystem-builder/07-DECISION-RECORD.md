@@ -379,6 +379,14 @@ document exists to make.
 
 ## 6. Phase 3 ledger reconciliation (2026-11-20)
 
+> **"M2", "M3" and "M4" in this section are definition-event implementation stages, not
+> roadmap milestones.** The stages: **M2**, the definition event taxonomy (`230b9b4`);
+> **M3**, the first producer (`deeb86c`); **M4**, the remaining producers (ending
+> `d70eb5d`); **M5**, the realtime spine (`3746e8e`). The roadmap's M-numbers are
+> phase-based and authoritative in [`04-ROADMAP-AND-MVP.md`](04-ROADMAP-AND-MVP.md),
+> where M2 is Phase 6, M3 Phase 7, M4 Phase 9 and M5 Phase 10. The collision is
+> accidental; the stage labels stay because commits and filenames carry them.
+
 Thirteen decisions. P1-P8 were taken after a read-only audit found that Phase 3's scope sentence
 (`04-ROADMAP-AND-MVP.md` §2, "this phase is T0–T8 and T13"), its build list, its
 acceptance ledger and the T-criteria in `08-PHASE-3-READINESS.md` did not agree with each
@@ -568,9 +576,15 @@ Four audit findings survive this decision unchanged, and none of them is closed 
 
 ### P11 in full — the definition event types
 
-**Approved, not implemented. M2 is not complete.** No type below is registered, nothing
-emits one, and R8 and R10 stay open. What P11 settles is the protocol surface M2 needs in
-order to be a mechanical change rather than an architectural one.
+**Implemented, 2026-11-25 (`230b9b4`).** When this was written no type below was
+registered, nothing emitted one, and R8 and R10 were open. All eleven are now in
+`domain/protocol/taxonomy.py` carrying the conventions this decision set, and carrying
+them unchanged: `producer=Producer.CONTROL_PLANE`, `folds_into=()`, subject
+`SubjectKind.PROJECT`, entity type and id in the payload. Each of the eleven has a
+producer behind it - the fourteen call sites of P13, complete at `d70eb5d` - and R8 and
+R10 are ticked against the spine. What P11 settled is the protocol surface M2 needed in
+order to be a mechanical change rather than an architectural one, and that held: no type
+was added, renamed or retyped on the way in.
 
 **1. The eleven types, and the operations that produce them.** Taken from the definition
 services as they stand, not invented: `services/definitions.py` holds sixteen write
@@ -662,10 +676,20 @@ representation or the frame mapping.
 
 ### P12 in full — the definition event envelope
 
-**Approved, not implemented. M3 has not started.** P11 settled the type, the producer, the
-folding, the subject and the payload. The M3 audit found it had not settled `dedup_key`,
-which `EventEnvelope` requires as a plain `str` and the `events` table declares `CITEXT NOT
-NULL` - so M3 could not append a row without either inventing a convention or stopping.
+**Implemented, 2026-11-25 (`deeb86c`), and unchanged since.** When this was written M3
+had not started. The convention is now one line in `services/definitions.py` -
+`f"def:{entity}:{entity_id}:{operation}:{seq}"` - shared by all fourteen producers.
+**P12.2 holds as its own body states it** - an *empty* request reserves no number and
+appends no event - pinned by `test_an_empty_patch_appends_no_event_and_spends_no_sequence_number`
+and its connection and workflow counterparts. The broader reading its heading invites does
+not hold and was never implemented: `sent` filters only `UNSET`, so a request that resends
+a field's current value is a write and does emit. That is true by construction rather than
+by test, and no test pins it. P12.3's NULL reference columns are asserted beside them.
+
+P11 settled the type, the producer, the folding, the subject and the payload. The M3
+audit found it had not settled `dedup_key`, which `EventEnvelope` requires as a plain
+`str` and the `events` table declares `CITEXT NOT NULL` - so M3 could not append a row
+without either inventing a convention or stopping.
 
 **1. The key: `def:{entity}:{entity_id}:{operation}:{seq}`.** For the first writer that is
 `def:agent:{agent_id}:updated:{seq}`, and the pattern generalises to the other ten so that
@@ -741,12 +765,14 @@ worker, and deserves its own scope.
 
 **Implemented, 2026-11-26.** All fourteen producers are wired, tested and committed:
 `AgentService.update` with the step this record calls M3 (`deeb86c`), and the other
-thirteen with M4, in the four commits ending `d70eb5d`. **R8 and R10 stay unchecked even so**, and the reason is
-worth stating precisely, because "the producers are done" is not the same claim as "the
-criterion is met". What is implemented is the *durable record* - each change appends its
-`events` row inside the transaction that makes the change. What R8 also asks for is
-publication after that transaction commits, and what R10 asks for is replay; both belong
-to the event bus and the WebSocket gateway, and neither exists.
+thirteen with M4, in the four commits ending `d70eb5d`. **R8 and R10 were not ticked for
+that**, and the reason is worth keeping, because "the producers are done" was never the
+same claim as "the criterion is met". What these fourteen implement is the *durable
+record* - each change appends its `events` row inside the transaction that makes the
+change. What R8 also asks for is publication after that transaction commits, and what R10
+asks for is replay; both belong to the event bus and the WebSocket gateway, and both
+arrived with the spine (`3746e8e`), where the two boxes were ticked (`03940a2`) and not
+before.
 
 P11 counted "sixteen write operations across four services" in `services/definitions.py`.
 That count is right about that file. The audit of the remaining writers enumerated every

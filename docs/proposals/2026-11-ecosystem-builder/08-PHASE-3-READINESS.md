@@ -446,9 +446,10 @@ Four rules hold the shape:
 
    **What is implemented, as against approved.** The eleven types are registered and
    refused to ingest, and as of 2026-11-26 **all fourteen approved producers emit**, each
-   appending its `events` row inside its own mutation's transaction. **R8 and R10 stay
-   open even so**: the durable record is written, while publication after commit, the
-   client frame and replay belong to the event bus and the gateway, which do not exist.
+   appending its `events` row inside its own mutation's transaction. **R8 and R10 were not
+   ticked for that alone**: the producers write the durable record, while publication after
+   commit, the client frame and replay belong to the event bus and the gateway, which
+   arrived with the spine (`3746e8e`), where both boxes were ticked (`03940a2`).
    One producer carries a condition - `publish_test_harness` writes no event (P13 §5,
    amended 2026-11-26), for the listing reason stated above, and the harness is still
    published and executed. P13's table remains where producer states are told apart - an
