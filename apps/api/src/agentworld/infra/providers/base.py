@@ -37,9 +37,17 @@ from typing import Any, Protocol
 class Role(StrEnum):
     """Who said a message.
 
+    Two members, because these are the roles both wire formats spell the
+    same way: an adapter puts `role.value` on the wire unchanged. A provider
+    whose own vocabulary is wider is that adapter's problem rather than the
+    caller's.
+
     There is no `system` member: a system prompt is not a turn in the
-    conversation, and the two providers this phase implements both carry it
-    out of band. `CompletionRequest.system` is where it goes.
+    conversation, so it is `CompletionRequest.system` - a field - and each
+    adapter renders it however its API asks. Those renderings differ, which
+    is the point of the field: `anthropic.py` sends a top-level `system`,
+    while `openai_compatible.py` prepends a message with role `system`. A
+    caller composing `messages` itself would have had to know which.
     """
 
     USER = "user"

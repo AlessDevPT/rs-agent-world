@@ -22,15 +22,17 @@ from pathlib import Path
 
 import pytest
 
+from agentworld.infra import providers
+
 SOURCE_ROOT = Path(__file__).resolve().parents[2] / "src" / "agentworld"
 
 #: The one package allowed to know a vendor exists.
 EXEMPT = SOURCE_ROOT / "infra" / "providers"
 
-#: Matched case-insensitively, on a word boundary so that an unrelated
-#: substring in an ordinary word is not a finding. `claude` and `gpt` are
-#: here as well as the company names: a model id in a constant is the same
-#: leak as a company name, and arguably the more tempting one.
+#: Matched case-insensitively, bounded so that an unrelated substring in an
+#: ordinary word is not a finding. `claude` and `gpt` are here as well as the
+#: company names: a model id in a constant is the same leak as a company
+#: name, and arguably the more tempting one.
 VENDORS: tuple[str, ...] = (
     "anthropic",
     "openai",
@@ -48,7 +50,23 @@ VENDORS: tuple[str, ...] = (
     "gpt-5",
 )
 
-_PATTERN = re.compile("|".join(rf"\b{re.escape(name)}\b" for name in VENDORS), re.IGNORECASE)
+#: Not `\b`, and the asymmetry that forced it is worth stating: `_` is a word
+#: character, so `\banthropic\b` matches `providers.anthropic` while
+#: `\bopenai\b` does **not** match `providers.openai_compatible`; and a
+#: camelCase hump is no boundary either, so `OpenAICompatibleProvider` was
+#: missed as well. The second adapter would have been the one vendor nobody
+#: was checking for.
+#:
+#: So: a name may not be preceded by an alphanumeric, and may not be followed
+#: by a *lowercase* one. `_`, `-`, `.`, a quote and an uppercase hump are all
+#: boundaries; a trailing lowercase letter is not, which is what keeps
+#: `llamas` and `coherent` from firing. The case-insensitivity is scoped to
+#: the name with `(?i:...)` precisely so the lookahead stays case-sensitive -
+#: `re.IGNORECASE` on the whole pattern would make `[a-z0-9]` match `C` and
+#: `OpenAICompatible` would slip through again.
+_PATTERN = re.compile(
+    "|".join(rf"(?<![A-Za-z0-9])(?i:{re.escape(name)})(?![a-z0-9])" for name in VENDORS)
+)
 
 
 def _searchable() -> list[Path]:
@@ -85,8 +103,8 @@ def test_the_pattern_would_actually_catch_one() -> None:
     """Non-vacuity, inline.
 
     The test above passes if the regex is broken, if `VENDORS` is emptied,
-    or if the word-boundary anchors stop matching. This is cheaper than
-    planting a file and deleting it.
+    or if the boundary anchors stop matching. This is cheaper than planting
+    a file and deleting it.
     """
     assert _PATTERN.search('BASE_URL = "https://api.anthropic.com"') is not None
     assert _PATTERN.search("# Anthropic needs this header") is not None
@@ -94,6 +112,43 @@ def test_the_pattern_would_actually_catch_one() -> None:
     assert _PATTERN.search("from openai import AsyncOpenAI") is not None
     # And would not fire on ordinary prose that merely contains a substring.
     assert _PATTERN.search("the llamas were unimpressed") is None
+    assert _PATTERN.search("a coherent answer is not a Cohere answer") is not None
+    assert _PATTERN.search("a coherent answer") is None
+
+
+def test_both_adapters_are_equally_catchable() -> None:
+    """Every adapter in the package is covered, not just the first one.
+
+    `infra/providers/` is exempt, so these spellings are legitimate inside
+    it and a leak anywhere else. The second adapter's module and class names
+    embed the vendor behind an underscore and a camelCase hump, which is the
+    shape `\\b` could not see - so each form is asserted rather than assumed
+    to follow from the first.
+    """
+    for line in (
+        "from agentworld.infra.providers.anthropic import AnthropicProvider",
+        "from agentworld.infra.providers.openai_compatible import OpenAICompatibleProvider",
+        "from .openai_compatible import OpenAICompatibleProvider",
+        'if profile.provider_slug == "openai_compatible":',
+        "provider = OpenAICompatibleProvider(client, api_key=key)",
+    ):
+        assert _PATTERN.search(line) is not None, f"not caught: {line}"
+
+
+def test_every_servable_slug_is_a_name_this_checks_for() -> None:
+    """A third provider must not land as a vendor nobody is checking for.
+
+    The names above are literals, which is right for a non-vacuity check and
+    wrong for a complete one: adding `vertex.py` would leave `VENDORS` with
+    no entry for it and this whole file silently narrower. So the registry
+    is asked what this build can serve, and every slug must be a name the
+    pattern matches - which fails here, at the point of adding a provider,
+    rather than later at the point of a leak.
+    """
+    slugs = sorted(providers.available())
+    assert slugs, "the registry serves nothing, so this proves nothing"
+    unseen = [slug for slug in slugs if _PATTERN.search(slug) is None]
+    assert unseen == [], f"servable but unchecked - add to VENDORS: {unseen}"
 
 
 @pytest.mark.parametrize("name", VENDORS)

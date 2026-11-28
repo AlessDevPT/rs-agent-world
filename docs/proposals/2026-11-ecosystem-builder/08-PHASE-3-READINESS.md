@@ -824,10 +824,40 @@ Resolve, validate **every** resolved address, pin the connection to it, no redir
 
 ### T13 — The second provider
 
+> **All three met 2026-11-28**, each naming its test, as T8's do above. The adapter is
+> `infra/providers/openai_compatible.py`; its slug is `openai`, and the slug names a
+> company while the filename names the protocol, which the module docstring explains.
+> **Two things these ticks do not claim.** No call has reached a real OpenAI-compatible
+> server, so the live-provider criterion in T7a above stays open and now covers two
+> providers. And a **self-hosted** server is still unreachable in deployment:
+> `EgressPolicy()` blocks loopback and RFC 1918, and `workers/worker.py` builds its client
+> with the defaults and no setting for `allowed_networks`. The adapter accepts any
+> `base_url`; the egress policy decides which ones a worker can reach, and today that
+> excludes a server on the same machine or LAN.
+
 **Acceptance**
-- [ ] The OpenAI-compatible provider passes the **same** conformance suite as Anthropic.
-- [ ] Adding it changed only `infra/providers/` and a registry entry — asserted by diff.
-- [ ] Switching a model profile between providers needs no workflow change.
+- [x] The OpenAI-compatible provider passes the **same** conformance suite as Anthropic.
+      **Met.** `tests/unit/test_provider_conformance.py`, parametrised over
+      `provider_cases.CASES`, which is `(ANTHROPIC, OPENAI)` - one suite over both, not
+      two suites. The suite was extracted from `test_providers.py` first (`dabdc34`), so
+      "the same suite" is the same file rather than a copy. Each provider's wire shape is
+      asserted beside it: `test_providers.py` and `test_openai_compatible.py`.
+- [x] Adding it changed only `infra/providers/` and a registry entry — asserted by diff.
+      **Met, and the diff says so.** `f94a984` touches four files; its only non-test files
+      are `infra/providers/openai_compatible.py` (new) and `infra/providers/registry.py`
+      (one `_BUILDERS` entry and the import). The other two are tests. The structural
+      checks are what keep it true rather than the diff: the `Provider SDKs stay inside
+      infra/providers` and `Outbound HTTP goes through infra/net` contracts, plus the
+      vendor-name search in `tests/unit/test_vendor_containment.py` - widened 2026-11-28,
+      because `\b` could not see `openai_compatible` while it could see `anthropic`.
+- [x] Switching a model profile between providers needs no workflow change.
+      **Met.** `tests/integration/test_provider_interchange.py`:
+      `test_one_published_workflow_runs_through_both_providers` publishes one workflow,
+      runs it through the Anthropic adapter, changes one field - the agent's
+      `model_profile_id` - and runs the same published version through the other, with
+      both legs going through the real worker, the real credential decryption and a real
+      socket. Both executions report the same `workflow_version_id`, and the workflow has
+      exactly one published version. No republish, no second workflow, no second agent.
 
 ### T14 — Adversarial and integration tests
 

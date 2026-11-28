@@ -741,6 +741,17 @@ The first phase where something runs, and the first where something is visible.
 
 > **Added 2026-11-20.** T7a's first criterion is the live-provider box at the top of this
 > list and is not repeated. T13 had no box in this ledger at all.
+>
+> **T13's three pass as of 2026-11-28.** `infra/providers/openai_compatible.py` is the
+> second adapter, `registry.py` its one new entry, and those two files are the whole of
+> the production change (`f94a984`). **What this does not close, stated so it is not read
+> into the ticks:** no call has ever gone through this adapter to a real
+> OpenAI-compatible server - the live-provider box at the top of this list is still open
+> and now covers two providers rather than one - and a **self-hosted** server remains
+> unreachable in deployment, because `EgressPolicy()` blocks loopback and RFC 1918 and
+> nothing configures otherwise. The conformance suite reaches a real socket, so what is
+> proved is the wire contract and the dispatch path, not interoperability with any
+> particular server's reading of the API.
 
 - [ ] **`max_turns` and the wall clock both terminate the turn loop** (T7a). Neither
       exists today: no `max_turns`, `wall_clock` or `turn_limit` anywhere in `apps/api/`.
@@ -750,16 +761,30 @@ The first phase where something runs, and the first where something is visible.
 - [ ] **A dead dispatch applies `on_failure = 'fail'`** (T8). `step_failed` is already
       emitted; the column has had a check constraint and no reader since T0. `continue`
       and `route` are Phase 5's, per P6.
-- [ ] **Both providers pass one shared conformance suite** (T13), parametrised over the
+- [x] **Both providers pass one shared conformance suite** (T13), parametrised over the
       provider builder, with the Anthropic wire-shape test left beside the adapter it
-      describes. No such suite exists yet — "conformance" appears in these documents and
-      nowhere in `apps/api/tests/unit/test_providers.py`.
-- [ ] **The OpenAI-compatible adapter adds no import outside `infra/providers/`** (T13),
+      describes.
+      **Met 2026-11-28.** `tests/unit/test_provider_conformance.py` names no vendor and is
+      parametrised over `provider_cases.CASES`, which now holds both; each provider's wire
+      shape stays beside it, in `test_providers.py` and `test_openai_compatible.py`. The
+      suite was extracted first (`dabdc34`) so that the second adapter arrived as a case
+      rather than as a file of new tests.
+- [x] **The OpenAI-compatible adapter adds no import outside `infra/providers/`** (T13),
       discharged by the two existing import-linter contracts and the vendor-name source
       search rather than by reading a diff, which is what `08-PHASE-3-READINESS.md`'s
       "asserted by diff" was a proxy for.
-- [ ] **Switching a model profile between providers needs no workflow change** (T13) —
+      **Met 2026-11-28.** Both contracts pass in the `api` CI job, and no vendor SDK is
+      installed - the adapter speaks the API over `infra/net.GuardedClient`. The source
+      search was widened the same day to see the new adapter's own spellings: `\b` treats
+      `_` as a word character, so it had been matching `providers.anthropic` while missing
+      `providers.openai_compatible`.
+- [x] **Switching a model profile between providers needs no workflow change** (T13) —
       asserted by running one published workflow against both.
+      **Met 2026-11-28.** `tests/integration/test_provider_interchange.py` publishes one
+      workflow, runs it, re-points the agent's `model_profile_id` and runs it again; both
+      executions report the same `workflow_version_id` and the workflow has exactly one
+      published version. It works because a published `workflow_steps` row pins `agent_id`
+      and carries no profile, so the provider is resolved at dispatch time.
 
 ---
 

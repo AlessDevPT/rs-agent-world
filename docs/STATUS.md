@@ -27,7 +27,7 @@
 | **Phase 0** Foundations | ✅ complete | monorepo, compose stack, CI, green from a fresh clone |
 | **Phase 1** Tenancy and auth | ✅ complete | Supabase JWT, workspaces, members, roles, API keys, RLS |
 | **Phase 2** Core model and protocol | ✅ complete | 30 tables, 26 migrations, event sourcing, replay, outbox. 13 of 14 ledger criteria met, the 14th untestable until Phase 7 |
-| **Phase 3** Execution core + island skeleton | 🟡 **Track A mostly done, Track B not started** | Phase 3 is T0–T8 + T13. **27 of 38 ledger boxes ticked**: the 13 of the 2026-11-20 reconciliation plus R1-R14, the realtime spine, on 2026-11-26. Open: T13's second provider and its conformance suite, T7a's turn loop, T8's `on_failure = 'fail'`, all four island boxes, the `world/nodes` read API, and the live provider call |
+| **Phase 3** Execution core + island skeleton | 🟡 **Track A mostly done, Track B not started** | Phase 3 is T0–T8 + T13. **30 of 38 ledger boxes ticked**: the 13 of the 2026-11-20 reconciliation, R1-R14 with the realtime spine on 2026-11-26, and T13's three on 2026-11-28. Open: T7a's turn loop, T8's `on_failure = 'fail'`, all four island boxes, the `world/nodes` read API, and the live provider call — which T13 did not close and now covers two providers |
 | **Phase 3a** Approvals, MCP tools, dispatchable agents | ⬜ not started | until it lands, consequential actions are refused at publish rather than gated |
 | **Phase 4** Vertical slice → M1 | 🟡 **partly built early** | multi-step, delegation, `agent.test` and `execution.cancel` all exist; its real remainder is the island's I2 and the builder prototype |
 | **Phases 5–11** | ⬜ not started | real workflows, approvals/tools/integrations, external agents, full workspace, full island, complete builder, hardening |
@@ -122,13 +122,13 @@ every loop a developer needs (`npm run dev`, `test`, `lint`, `typecheck`, `verif
 
 ## 3. What is not done
 
-### 3.1 Phase 3, Track A — three items
+### 3.1 Phase 3, Track A — two items
 
-> **Re-characterised 2026-11-20**, and the first item closed on **2026-11-26**. The
-> edition before that listed four items as though they were comparable. They are not: one
-> was a week of work with no code and, until 2026-11-20, no acceptance criteria either;
-> one is two days; and T8 turned out to be seven-ninths done once it was measured against
-> its own criteria. Sizes below are the point of the list.
+> **Re-characterised 2026-11-20**; the first item closed on **2026-11-26** and the second
+> on **2026-11-28**. The edition before that listed four items as though they were
+> comparable. They are not: one was a week of work with no code and, until 2026-11-20, no
+> acceptance criteria either; one is two days; and T8 turned out to be seven-ninths done
+> once it was measured against its own criteria. Sizes below are the point of the list.
 
 1. ~~**The event bus and the WebSocket gateway.**~~ **Done, 2026-11-26.**
    `infra/event_bus.py` holds `InProcessEventBus` and `RedisEventBus`; `api/ws/` holds the
@@ -140,13 +140,18 @@ every loop a developer needs (`npm run dev`, `test`, `lint`, `typecheck`, `verif
    publisher runs (P10.5), R11's operational replay window, where R13 runs in CI, and the
    snapshot's isolation level - are answered in
    `docs/proposals/2026-11-ecosystem-builder/21-M5-REALTIME-SPINE.md`. **It does not close
-   the phase**: the three items below and steps 7-9 remain.
-2. **The OpenAI-compatible provider (T13) — about two days, plus a suite to extract.**
-   `infra/providers/` holds `anthropic.py` and nothing else. The shared conformance suite
-   its criterion names **does not exist**: "conformance" appears in the plan documents and
-   nowhere in `tests/unit/test_providers.py`. Fourteen of that file's tests are
-   contract-level and belong in it; the Anthropic wire-shape test stays beside its
-   adapter. T13 now has ledger boxes, which it also lacked.
+   the phase**: the two items below and steps 7-9 remain.
+2. ~~**The OpenAI-compatible provider (T13).**~~ **Done, 2026-11-28.**
+   `infra/providers/` holds `base.py`, `anthropic.py`, `openai_compatible.py` and
+   `registry.py`, and `registry.available()` serves `anthropic` and `openai`. The shared
+   conformance suite exists: `tests/unit/test_provider_conformance.py`, parametrised over
+   `provider_cases.CASES`, extracted from `test_providers.py` first so the second adapter
+   could arrive as a case rather than as a file of new tests — which is what it did, in
+   one new adapter plus one registry entry. Each provider's wire shape stays beside it.
+   **T13's three ledger boxes are ticked; the live call is not one of them.** Nothing has
+   reached a real OpenAI-compatible server, and a self-hosted one is unreachable in
+   deployment while `EgressPolicy()` blocks loopback and RFC 1918 with nothing configuring
+   otherwise (`workers/worker.py` says so itself).
 3. **T7a, the managed-agent turn loop — in scope and untouched.** One model call per step
    is what exists; `services/dispatch.py` says so itself. No `max_turns`, no wall clock,
    and no token counts or durations reaching `metric_samples` — though `metric.recorded`
@@ -251,12 +256,12 @@ agent branch, the unasserted bearer token, the `{}` passed as `nextConfig`, and 
 | **1** | Settle the realtime architecture decisions | done — P3-P8 | the seven questions the gateway cannot be written without are answered and recorded |
 | **2** | Write the gateway's acceptance criteria | done — R1-R14 | the largest open item in the phase can be ticked at all |
 | **3** | The realtime spine: event bus, `ws-ticket`, gateway | done — 2026-11-26 | R1-R14 pass, including R13 on two processes over the `redis` bus |
-| **4** | T13: extract the conformance suite, add the OpenAI-compatible provider *(independent — can run beside 3)* | ~2 days + the suite | both providers pass one parametrised suite; the adapter adds no import outside `infra/providers/` |
+| **4** | T13: extract the conformance suite, add the OpenAI-compatible provider | done — 2026-11-28 | its three boxes are ticked, each naming its test: one parametrised suite over both, no import outside `infra/providers/`, and one published workflow run through both. **The live call is step 9's, not this step's** |
 | **5** | T7a: the turn loop, `max_turns`, the wall clock, metric emission | ~1 week | a step takes several turns under a budget and a wall clock, and token counts reach `metric_samples` through `metric.recorded` |
 | **6** | T8: `on_failure = 'fail'` | ~½ session | a dead dispatch applies `fail`, asserted; `continue` and `route` are Phase 5's |
 | **7** | The `world/nodes` read API | ~1 session | placements and the layout are readable at `viewer`, and `test_world_separation.py` still passes |
 | **8** | Island skeleton I1 | ~1 week | the four island boxes pass: real agents from `world_nodes`, status equal to the REST view and arriving as a delta, `offline` shuttered, and `world/phaser/` deletable with both suites green. **Needed 3, which is done; still needs 7** |
-| **9** | The live provider smoke run | minutes, once a key exists | `scripts/live_provider_smoke.py` passes against the real API. Needs an `ANTHROPIC_API_KEY`, not code |
+| **9** | The live provider smoke run | minutes, once a key exists | `scripts/live_provider_smoke.py` passes against the real API. Needs an `ANTHROPIC_API_KEY`, not code. **Two providers now, and the script covers one**: it builds `anthropic.SLUG`, so a live call through the OpenAI-compatible adapter needs a key *and* a few lines. A self-hosted target needs more than a key — `EgressPolicy()` blocks loopback and RFC 1918 and has no setting wired to allow them |
 | **10** | Reconcile the ledger and declare Phase 3 closed | ~½ session | all 38 boxes are ticked or recorded as wrong, with a named test each |
 
 **Why this order.** The spine comes before the island because the island's statuses are
@@ -295,19 +300,20 @@ open item in the phase is closed and six steps are still open behind it.
 
 Phase 3 is T0–T8 and T13. Its ledger carries **38 boxes** after the 2026-11-20
 reconciliation — the original 17, plus R1-R14 for the gateway, six for T7a/T8/T13, and
-one tightening the island's status claim. **27 are ticked**: 13 at that
-reconciliation, and R1-R14 on 2026-11-26 when the realtime spine landed.
+one tightening the island's status claim. **30 are ticked**: 13 at that
+reconciliation, R1-R14 on 2026-11-26 when the realtime spine landed, and T13's three on
+2026-11-28 when the second provider did.
 
-**Closing the phase means closing the 11 that remain**, and four of them are Track B. The previous edition of this section said
+**Closing the phase means closing the 8 that remain**, and four of them are Track B. The previous edition of this section said
 *"to declare Phase 3 complete: N2 → N3 → N4, then N1"*, which was wrong: completing all
 four of those leaves the island boxes untouched, so the ledger still could not be ticked.
 The sequence in §5 is the corrected one.
 
 **The spine is necessary and not sufficient**, and 2026-11-26 is where that sentence
-earned itself: the largest open item in the phase is closed and eleven boxes are still
-open behind it. Step 4 leaves T13, steps 5 and 6 leave T7a and T8, step 8 - the island -
-needed step 3 and still needs step 7's `world/nodes` read API, and step 9 needs a person
-with an API key.
+earned itself: the largest open item in the phase closed and eleven boxes were still open
+behind it. Step 4 closed T13's three on 2026-11-28 and left eight; steps 5 and 6 leave T7a
+and T8, step 8 - the island - needed step 3 and still needs step 7's `world/nodes` read
+API, and step 9 needs a person with an API key.
 
 **No criterion carries into Phase 4 (P8).** Four of Phase 4's own acceptance criteria
 depend on live deltas — *"every status change arriving over the WebSocket from a real

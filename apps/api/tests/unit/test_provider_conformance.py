@@ -10,10 +10,11 @@ only know one vendor's.
 
 T13's criterion is this suite: *"Both providers pass one shared conformance
 suite, parametrised over the provider builder, with the Anthropic
-wire-shape test left beside the adapter it describes."* With one case in
-`CASES` it does not yet discharge that criterion - it is the half that can
-be built before a second adapter exists, and the second adapter's work is
-then a case rather than a file of new tests.
+wire-shape test left beside the adapter it describes."* `CASES` now holds
+both, so this file discharges it: the second adapter arrived as a case
+rather than as a file of new tests, and each provider's wire shape is
+pinned beside it - `test_providers.py` for Anthropic,
+`test_openai_compatible.py` for the other.
 
 The requests go through the real `GuardedClient` to a real socket; see
 `provider_cases` for why that is not a mocked transport.
